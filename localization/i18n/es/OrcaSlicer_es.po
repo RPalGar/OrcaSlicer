@@ -36342,3 +36342,79 @@ msgstr ""
 
 #~ msgid "preparing, export 3MF failed!"
 #~ msgstr "Preparando; ¡Error al exportar 3MF!"
+
+# AI Translated
+msgid "The path needs at least two points."
+msgstr "La ruta necesita al menos dos puntos."
+
+# AI Translated
+msgid "The path must not end where it starts. Use the loop mode for closed paths."
+msgstr "La ruta no debe terminar donde empieza. Usa el modo de lazo para rutas cerradas."
+
+# AI Translated
+msgid "The loop needs at least three points."
+msgstr "El lazo necesita al menos tres puntos."
+
+# AI Translated
+msgid "The loop is degenerate (it encloses no area)."
+msgstr "El lazo es degenerado (no encierra ninguna superficie)."
+
+# AI Translated
+msgid "The loop folds back on itself seen from its mean plane. Place the points more evenly around the part."
+msgstr "El lazo se dobla sobre sí mismo visto desde su plano medio. Reparte los puntos de forma más uniforme alrededor de la pieza."
+
+# AI Translated
+msgid "The path did not split the object. Make sure it crosses the object completely."
+msgstr "La ruta no ha dividido el objeto. Asegúrate de que lo atraviesa por completo."
+
+# AI Translated
+msgid "The loop did not detach anything. Make sure it goes all the way around the part."
+msgstr "El lazo no ha separado nada. Asegúrate de que rodea la pieza por completo."
+
+# AI Translated
+msgid "Cut along path"
+msgstr "Cortar por ruta"
+
+# AI Translated
+msgid "Path from view"
+msgstr "Ruta desde la vista"
+
+# AI Translated
+msgid "Closed loop on surface"
+msgstr "Lazo cerrado sobre la superficie"
+
+# AI Translated
+msgid "Click points on the object along the line where it should be split. The path is extended past the object and cut straight through it in the direction you were looking when you placed the first point."
+msgstr "Haz clic en puntos del objeto a lo largo de la línea por donde quieres dividirlo. La ruta se prolonga más allá del objeto y lo atraviesa en línea recta en la dirección en la que mirabas al colocar el primer punto."
+
+# AI Translated
+msgid "Click points on the surface all the way around the part to detach (e.g. an arm). The loop closes itself; a curved cap spanning it separates only that part."
+msgstr "Haz clic en puntos de la superficie alrededor de toda la parte que quieres separar (por ejemplo, un brazo). El lazo se cierra solo; una tapa curva que lo rellena separa únicamente esa parte."
+
+# AI Translated
+msgid "Right click removes the last point. Drag on empty space, or Ctrl + drag, to rotate the view."
+msgstr "Clic derecho elimina el último punto. Arrastra sobre el espacio vacío, o Ctrl + arrastrar, para girar la vista."
+
+# AI Translated
+msgid "Clearance (mm)"
+msgstr "Holgura (mm)"
+
+# AI Translated
+msgid "Cap margin (mm)"
+msgstr "Margen de la tapa (mm)"
+
+# AI Translated
+msgid "Points"
+msgstr "Puntos"
+
+# AI Translated
+msgid "Undo point"
+msgstr "Deshacer punto"
+
+# AI Translated
+msgid "piece"
+msgstr "pieza"
+
+# AI Translated
+msgid "rest"
+msgstr "resto"

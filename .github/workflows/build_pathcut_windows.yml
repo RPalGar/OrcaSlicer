@@ -1,0 +1,21 @@
+name: Build Windows (path cut)
+
+# Windows-only build of the path cut feature branch. Builds the dependencies on the first run
+# (cached afterwards) and uploads the installer and portable zip as workflow artifacts.
+on:
+  push:
+    branches:
+      - feature/path-cut
+  workflow_dispatch:
+
+jobs:
+  build_windows:
+    name: Build Windows x64
+    uses: ./.github/workflows/build_check_cache.yml
+    with:
+      os: windows-latest
+      arch: x64
+      compiler: clang
+      build-deps-only: false
+      force-build: false
+    secrets: inherit
