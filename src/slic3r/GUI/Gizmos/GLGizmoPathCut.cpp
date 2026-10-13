@@ -17,7 +17,6 @@
 #include "libslic3r/AABBMesh.hpp"
 #include "libslic3r/BoundingBox.hpp"
 #include "libslic3r/Geometry.hpp"
-#include "libslic3r/MeshBoolean.hpp"
 #include "libslic3r/Model.hpp"
 #include "libslic3r/PathCutGeometry.hpp"
 #include "libslic3r/TriangleMesh.hpp"
@@ -29,6 +28,7 @@
 #include <algorithm>
 #include <chrono>
 #include <exception>
+#include <functional>
 #include <limits>
 #include <memory>
 #include <string>
@@ -49,6 +49,11 @@ static const ColorRGBA POINT_COLOR = {1.f, 0.55f, 0.f, 1.f};
     L("The loop folds back on itself seen from its mean plane. Place the points more evenly around the part."),
     L("The path did not split the object. Make sure it crosses the object completely."),
     L("The loop did not detach anything. Make sure it goes all the way around the part."),
+    L("The loop is too irregular. Place the points more evenly around the part."),
+    L("The loop does not go all the way around the part. Place the points around it, or lower the cap margin."),
+    L("The model has holes along the cut, so the cut faces cannot be closed. Repair the model first."),
+    L("The cap spanning the loop runs into another part of the model. Place the loop where the part is free all around."),
+    L("The object was changed while it was being cut. Cut it again."),
 };
 
 GLGizmoPathCut::GLGizmoPathCut(GLCanvas3D &parent, const std::string &icon_filename, unsigned int sprite_id)
@@ -120,8 +125,8 @@ bool GLGizmoPathCut::raycast(const Vec2d &mouse_pos, Vec3d &hit_world) const
 
 bool GLGizmoPathCut::on_mouse(const wxMouseEvent &mouse_event)
 {
-    if (m_busy)
-        return false; // no picking while a cut is running
+    if (m_busy) // the scene is frozen while a cut runs (zooming is fine)
+        return mouse_event.GetWheelRotation() == 0;
     const Vec2d mouse_pos(mouse_event.GetX(), mouse_event.GetY());
     if (mouse_event.LeftDown() && !mouse_event.CmdDown()) {
         Vec3d hit;
@@ -229,6 +234,7 @@ void GLGizmoPathCut::on_render_input_window(float x, float y, float bottom_limit
 
     const float input_w = ImGui::CalcTextSize("000.00").x * 2.5f;
 
+    m_imgui->disabled_begin(m_busy);
     if (m_imgui->bbl_radio_button(_u8L("Path from view").c_str(), m_mode == Mode::ViewPath) && m_mode != Mode::ViewPath) {
         m_mode = Mode::ViewPath;
         reset_path();
@@ -259,7 +265,7 @@ void GLGizmoPathCut::on_render_input_window(float x, float y, float bottom_limit
     m_kerf = std::clamp(m_kerf, 0.02f, 2.f);
     if (m_mode == Mode::Loop) {
         ImGui::AlignTextToFramePadding();
-        m_imgui->text(_u8L("Cap margin (mm)"));
+        m_imgui->text(_u8L("Min. cap margin (mm)"));
         ImGui::SameLine(input_w * 1.6f);
         ImGui::InputFloat("##pathcut_margin", &m_margin, 0.1f, 0.5f, "%.1f");
         m_margin = std::clamp(m_margin, 0.2f, 10.f);
@@ -279,6 +285,12 @@ void GLGizmoPathCut::on_render_input_window(float x, float y, float bottom_limit
     ImGui::SameLine();
     if (m_imgui->button(_L("Perform cut"), ImVec2(0, 0), m_points.size() >= min_pts && !m_busy))
         wxGetApp().CallAfter([this]() { perform_cut(); });
+    m_imgui->disabled_end();
+    if (m_busy) {
+        ImGui::SameLine();
+        if (m_imgui->button(_L("Cancel")))
+            wxGetApp().plater()->get_ui_job_worker().cancel();
+    }
 
     if (!m_message.empty()) {
         ImGui::PushTextWrapPos(ImGui::GetFontSize() * 26.f);
@@ -292,33 +304,6 @@ void GLGizmoPathCut::on_render_input_window(float x, float y, float bottom_limit
 
     GizmoImguiEnd();
     ImGuiWrapper::pop_toolbar_style();
-}
-
-// MCUT is used alone: the CGAL fallback can run for minutes on meshes with hundreds of thousands
-// of triangles. CGAL is only tried for small meshes, and only when MCUT throws.
-static indexed_triangle_set mesh_minus(const indexed_triangle_set &src, const indexed_triangle_set &cutter)
-{
-    std::vector<TriangleMesh> res;
-    bool                      mcut_threw = false;
-    try {
-        MeshBoolean::mcut::make_boolean(TriangleMesh(src), TriangleMesh(cutter), res, "A_NOT_B");
-    } catch (const std::exception &e) {
-        BOOST_LOG_TRIVIAL(warning) << "PathCut: MCUT failed: " << e.what();
-        res.clear();
-        mcut_threw = true;
-    }
-    if (!res.empty())
-        return std::move(res.front().its);
-    if (mcut_threw && src.indices.size() < 100000) {
-        try {
-            TriangleMesh a(src);
-            MeshBoolean::cgal::minus(a, TriangleMesh(cutter));
-            return std::move(a.its);
-        } catch (const std::exception &e) {
-            BOOST_LOG_TRIVIAL(warning) << "PathCut: CGAL failed: " << e.what();
-        }
-    }
-    return {};
 }
 
 // Moves the piece (single instance) to the free spot of the current plate nearest to `rest`,
@@ -427,7 +412,7 @@ void GLGizmoPathCut::perform_cut()
     m_message_is_error = false;
     m_parent.set_as_dirty();
 
-    // Runs on the UI job worker thread (large stack, the UI stays responsive).
+    // Runs on the UI job worker thread, so the UI stays responsive and the job can be cancelled.
     auto process = [st](Job::Ctl &ctl) {
         using clk = std::chrono::steady_clock;
         auto t0   = clk::now();
@@ -437,8 +422,10 @@ void GLGizmoPathCut::perform_cut()
                                     << std::chrono::duration_cast<std::chrono::milliseconds>(now - t0).count() << " ms";
             t0 = now;
         };
+        const std::string status = _u8L("Cutting along path");
+        auto canceled = [&ctl]() { return ctl.was_canceled(); };
         BOOST_LOG_TRIVIAL(info) << "PathCut: " << st->src.indices.size() << " triangles";
-        ctl.update_status(0, _u8L("Cutting along path"));
+        ctl.update_status(5, status);
         PathCut::make_edge_manifold(st->src);
         lap("make_edge_manifold");
         PathCut::V3 mn = PathCut::V3::Constant(std::numeric_limits<double>::max()), mx = -mn;
@@ -446,18 +433,19 @@ void GLGizmoPathCut::perform_cut()
             mn = mn.cwiseMin(PathCut::V3(v.cast<double>()));
             mx = mx.cwiseMax(PathCut::V3(v.cast<double>()));
         }
-        ctl.update_status(20, _u8L("Cutting along path"));
+        ctl.update_status(20, status);
+        PathCut::CutResult             res;
+        std::function<int(const PathCut::V3 &)> side;
+        PathCut::ViewCutter            vc;
+        PathCut::LoopCutter            lc;
         if (st->mode == Mode::ViewPath) {
-            PathCut::ViewCutter vc = PathCut::make_view_cutter(st->pts, st->view_dir, mn, mx, st->kerf);
+            vc = PathCut::make_view_cutter(st->pts, st->view_dir, mn, mx, st->kerf);
             if (!vc.valid()) {
                 st->error = vc.error;
                 return;
             }
-            lap("cutter");
-            indexed_triangle_set res = mesh_minus(st->src, vc.mesh);
-            lap("boolean");
-            ctl.update_status(80, _u8L("Cutting along path"));
-            st->grouped = PathCut::group_components(its_split(res), [&vc](const PathCut::V3 &p) { return vc.side(p); }, false);
+            res  = PathCut::cut_with_slab(std::move(st->src), vc, false, 0.5, canceled);
+            side = [&vc](const PathCut::V3 &p) { return vc.side(p); };
         } else {
             AABBMesh aabb(st->src);
             auto     snap = [&aabb](const PathCut::V3 &p) -> PathCut::V3 {
@@ -466,23 +454,35 @@ void GLGizmoPathCut::perform_cut()
                 aabb.squared_distance(Vec3d(p), idx, c);
                 return c;
             };
-            PathCut::LoopCutter lc = PathCut::make_loop_cutter(st->pts, st->kerf, st->margin, snap);
+            lc = PathCut::make_loop_cutter(st->pts, st->kerf, st->margin, snap);
             if (!lc.valid()) {
                 st->error = lc.error;
                 return;
             }
-            lap("cutter");
-            indexed_triangle_set res = mesh_minus(st->src, lc.mesh);
-            lap("boolean");
-            ctl.update_status(80, _u8L("Cutting along path"));
-            st->grouped = PathCut::group_components(its_split(res), [&lc](const PathCut::V3 &p) { return lc.side(p); }, true);
+            if (!PathCut::fit_loop_margin(st->src, lc)) {
+                st->error = "The cap spanning the loop runs into another part of the model. Place the loop where the part is free all around.";
+                return;
+            }
+            BOOST_LOG_TRIVIAL(info) << "PathCut: cap margin " << lc.margin << " mm";
+            res  = PathCut::cut_with_slab(std::move(st->src), lc, true, 0.5, canceled);
+            side = [&lc](const PathCut::V3 &p) { return lc.side(p); };
         }
+        lap("cut");
+        if (ctl.was_canceled())
+            return;
+        if (!res.error.empty()) {
+            st->error = res.error;
+            return;
+        }
+        ctl.update_status(80, status);
+        st->grouped = PathCut::group_components(its_split(res.mesh), side, st->mode == Mode::Loop);
         lap("grouping");
-        ctl.update_status(100, _u8L("Cutting along path"));
+        ctl.update_status(100, status);
     };
 
     // Back on the UI thread.
-    auto finalize = [this, st, obj_idx, inst_idx, mo, offset](bool canceled, std::exception_ptr &eptr) {
+    const Transform3d inst_matrix = mi->get_matrix();
+    auto finalize = [this, st, obj_idx, inst_idx, mo, offset, inst_matrix](bool canceled, std::exception_ptr &eptr) {
         m_busy = false;
         std::string error = st->error;
         if (eptr) {
@@ -513,9 +513,11 @@ void GLGizmoPathCut::perform_cut()
         // The object may have been deleted or replaced while the job was running.
         Plater *plater = wxGetApp().plater();
         if (obj_idx >= int(plater->model().objects.size()) || plater->model().objects[obj_idx] != mo ||
-            inst_idx >= int(mo->instances.size())) {
-            m_message.clear();
+            inst_idx >= int(mo->instances.size()) || !mo->instances[inst_idx]->get_matrix().isApprox(inst_matrix)) {
+            m_message          = _u8L("The object was changed while it was being cut. Cut it again.");
+            m_message_is_error = true;
             reset_path();
+            m_parent.set_as_dirty();
             return;
         }
         const ModelVolume *first_part = nullptr;

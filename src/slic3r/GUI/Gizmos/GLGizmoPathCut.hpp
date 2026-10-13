@@ -17,7 +17,7 @@ namespace GUI {
 //    view direction and splits the whole object (e.g. separate a head along the hair line).
 //  * Loop: pick points around a limb on its surface; a curved cap spanning the loop detaches only
 //    that region (e.g. an arm or a leg), following a non-planar loop.
-// The geometry lives in libslic3r/PathCutGeometry.hpp; the boolean uses MCUT and runs as a background job.
+// The geometry and the cut itself live in libslic3r/PathCutGeometry.hpp; the cut runs as a background job.
 class GLGizmoPathCut : public GLGizmoBase
 {
 public:
@@ -48,7 +48,7 @@ private:
     std::vector<Vec3d> m_points;                 // picked points, world coordinates
     Vec3d              m_view_dir{Vec3d::UnitY()}; // locked at the first point (view path mode)
     float              m_kerf{0.2f};             // clearance between parts [mm]
-    float              m_margin{1.5f};           // how far the loop cap reaches past the surface [mm]
+    float              m_margin{1.5f};           // minimum reach of the loop cap past the loop, widened as needed [mm]
     std::string        m_message;
     bool               m_message_is_error{false};
     const ModelObject *m_object{nullptr};        // object the points were picked on

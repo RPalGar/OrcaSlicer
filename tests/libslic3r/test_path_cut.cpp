@@ -1,7 +1,6 @@
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/matchers/catch_matchers_floating_point.hpp>
 
-#include <libslic3r/MeshBoolean.hpp>
 #include <libslic3r/PathCutGeometry.hpp>
 #include <libslic3r/TriangleMesh.hpp>
 
@@ -14,14 +13,8 @@ using Catch::Matchers::WithinAbs;
 
 namespace {
 
-indexed_triangle_set cut(const indexed_triangle_set &src, const indexed_triangle_set &cutter)
-{
-    std::vector<TriangleMesh> res;
-    MeshBoolean::mcut::make_boolean(TriangleMesh(src), TriangleMesh(cutter), res, "A_NOT_B");
-    return res.empty() ? indexed_triangle_set() : res.front().its;
-}
-
-size_t max_faces_per_edge(const indexed_triangle_set &its)
+// Number of edges used by exactly one face (0 for a closed mesh) and the largest number of faces on one edge.
+void edge_counts(const indexed_triangle_set &its, size_t &open, size_t &max_faces)
 {
     std::map<std::pair<int, int>, size_t> count;
     for (const auto &f : its.indices)
@@ -29,14 +22,27 @@ size_t max_faces_per_edge(const indexed_triangle_set &its)
             const int a = f[e], b = f[(e + 1) % 3];
             ++count[{std::min(a, b), std::max(a, b)}];
         }
-    size_t mx = 0;
-    for (const auto &[edge, n] : count) mx = std::max(mx, n);
-    return mx;
+    open = max_faces = 0;
+    for (const auto &[edge, n] : count) {
+        if (n == 1) ++open;
+        max_faces = std::max(max_faces, n);
+    }
+}
+
+void require_closed_parts(const std::vector<indexed_triangle_set> &parts)
+{
+    for (const auto &p : parts) {
+        size_t open, max_faces;
+        edge_counts(p, open, max_faces);
+        CHECK(open == 0);
+        CHECK(max_faces == 2);
+        CHECK(its_volume(p) > 0.);
+    }
 }
 
 } // namespace
 
-TEST_CASE("A wavy path picked from the front splits a cube into two parts", "[PathCut]")
+TEST_CASE("A wavy path picked from the front splits a cube into two closed parts", "[PathCut]")
 {
     // 20 mm cube, path drawn looking along +Y, zig-zagging across X at mid height.
     const indexed_triangle_set cube = its_make_cube(20., 20., 20.);
@@ -46,14 +52,17 @@ TEST_CASE("A wavy path picked from the front splits a cube into two parts", "[Pa
     const PathCut::ViewCutter vc = PathCut::make_view_cutter(pts, PathCut::V3::UnitY(), PathCut::V3::Zero(), PathCut::V3::Constant(20.), kerf);
     REQUIRE(vc.valid());
 
-    const auto parts = its_split(cut(cube, vc.mesh));
+    const PathCut::CutResult res = PathCut::cut_with_slab(cube, vc, false);
+    REQUIRE(res.error.empty());
+    const auto parts = its_split(res.mesh);
     REQUIRE(parts.size() == 2);
+    require_closed_parts(parts);
 
     const PathCut::Grouped g = PathCut::group_components(parts, [&vc](const PathCut::V3 &p) { return vc.side(p); }, false);
     CHECK(g.n_a == 1);
     CHECK(g.n_b == 1);
-    // The two halves add up to the cube minus a wall roughly kerf thick (the path is longer than 20 mm).
-    const double total = std::abs(its_volume(g.side_a)) + std::abs(its_volume(g.side_b));
+    // The two halves add up to the cube minus a wall kerf thick, 20 mm deep, as long as the path inside the cube.
+    const double total = its_volume(g.side_a) + its_volume(g.side_b);
     CHECK(total < 8000.);
     CHECK(total > 8000. - kerf * 20. * 40.);
 }
@@ -68,19 +77,42 @@ TEST_CASE("A tilted loop around a cylinder detaches its end", "[PathCut]")
         const double a = 2. * PI * i / 12.;
         loop.emplace_back(r * std::cos(a), r * std::sin(a), 15. + 2. * std::cos(a));
     }
-    const PathCut::LoopCutter lc = PathCut::make_loop_cutter(loop, kerf, 1.5, [](const PathCut::V3 &p) { return p; });
+    PathCut::LoopCutter lc = PathCut::make_loop_cutter(loop, kerf, 1.5, [](const PathCut::V3 &p) { return p; });
     REQUIRE(lc.valid());
+    REQUIRE(PathCut::fit_loop_margin(cyl, lc));
 
-    const auto parts = its_split(cut(cyl, lc.mesh));
+    const PathCut::CutResult res = PathCut::cut_with_slab(cyl, lc, true);
+    REQUIRE(res.error.empty());
+    const auto parts = its_split(res.mesh);
     REQUIRE(parts.size() == 2);
+    require_closed_parts(parts);
 
     const PathCut::Grouped g = PathCut::group_components(parts, [&lc](const PathCut::V3 &p) { return lc.side(p); }, true);
     REQUIRE(g.n_a == 1);
     REQUIRE(g.n_b == 1);
     // Each side holds about half the cylinder.
     const double half = PI * r * r * 15.;
-    CHECK_THAT(std::abs(its_volume(g.side_a)), WithinAbs(half, 0.1 * half));
-    CHECK_THAT(std::abs(its_volume(g.side_b)), WithinAbs(half, 0.1 * half));
+    CHECK_THAT(its_volume(g.side_a), WithinAbs(half, 0.1 * half));
+    CHECK_THAT(its_volume(g.side_b), WithinAbs(half, 0.1 * half));
+}
+
+TEST_CASE("A loop that misses part of the cross-section is reported instead of cutting halfway", "[PathCut]")
+{
+    // Loop around one leg of a U made of two boxes joined at the bottom, but with a cap so wide it
+    // reaches the other leg: the cap rim runs through it.
+    indexed_triangle_set u = its_make_cube(4., 4., 20.);
+    indexed_triangle_set leg2 = its_make_cube(4., 4., 20.);
+    its_translate(leg2, Vec3f(6.f, 0.f, 0.f));
+    its_merge(u, leg2);
+    std::vector<PathCut::V3> loop;
+    for (int i = 0; i < 8; ++i) {
+        const double a = 2. * PI * i / 8.;
+        loop.emplace_back(2. + 2.9 * std::cos(a), 2. + 2.9 * std::sin(a), 10.);
+    }
+    PathCut::LoopCutter lc = PathCut::make_loop_cutter(loop, 0.2, 5., [](const PathCut::V3 &p) { return p; });
+    REQUIRE(lc.valid());
+    const PathCut::CutResult res = PathCut::cut_with_slab(u, lc, true);
+    CHECK_FALSE(res.error.empty());
 }
 
 TEST_CASE("A loop that folds back on itself is rejected", "[PathCut]")
@@ -103,8 +135,11 @@ TEST_CASE("Zero-thickness sheets glued to a mesh are removed before cutting", "[
     const auto f = its.indices.front();
     its.indices.emplace_back(f[0], f[1], f[2]);
     its.indices.emplace_back(f[0], f[2], f[1]);
-    REQUIRE(max_faces_per_edge(its) > 2);
+    size_t open, max_faces;
+    edge_counts(its, open, max_faces);
+    REQUIRE(max_faces > 2);
 
     CHECK(PathCut::make_edge_manifold(its) > 0);
-    CHECK(max_faces_per_edge(its) == 2);
+    edge_counts(its, open, max_faces);
+    CHECK(max_faces == 2);
 }
