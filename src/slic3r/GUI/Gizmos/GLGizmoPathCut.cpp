@@ -27,6 +27,7 @@
 #include <imgui/imgui.h>
 
 #include <algorithm>
+#include <chrono>
 #include <exception>
 #include <limits>
 #include <memory>
@@ -428,8 +429,18 @@ void GLGizmoPathCut::perform_cut()
 
     // Runs on the UI job worker thread (large stack, the UI stays responsive).
     auto process = [st](Job::Ctl &ctl) {
+        using clk = std::chrono::steady_clock;
+        auto t0   = clk::now();
+        auto lap  = [&t0](const char *what) {
+            const auto now = clk::now();
+            BOOST_LOG_TRIVIAL(info) << "PathCut: " << what << " "
+                                    << std::chrono::duration_cast<std::chrono::milliseconds>(now - t0).count() << " ms";
+            t0 = now;
+        };
+        BOOST_LOG_TRIVIAL(info) << "PathCut: " << st->src.indices.size() << " triangles";
         ctl.update_status(0, _u8L("Cutting along path"));
         PathCut::make_edge_manifold(st->src);
+        lap("make_edge_manifold");
         PathCut::V3 mn = PathCut::V3::Constant(std::numeric_limits<double>::max()), mx = -mn;
         for (const auto &v : st->src.vertices) {
             mn = mn.cwiseMin(PathCut::V3(v.cast<double>()));
@@ -442,7 +453,9 @@ void GLGizmoPathCut::perform_cut()
                 st->error = vc.error;
                 return;
             }
+            lap("cutter");
             indexed_triangle_set res = mesh_minus(st->src, vc.mesh);
+            lap("boolean");
             ctl.update_status(80, _u8L("Cutting along path"));
             st->grouped = PathCut::group_components(its_split(res), [&vc](const PathCut::V3 &p) { return vc.side(p); }, false);
         } else {
@@ -458,10 +471,13 @@ void GLGizmoPathCut::perform_cut()
                 st->error = lc.error;
                 return;
             }
+            lap("cutter");
             indexed_triangle_set res = mesh_minus(st->src, lc.mesh);
+            lap("boolean");
             ctl.update_status(80, _u8L("Cutting along path"));
             st->grouped = PathCut::group_components(its_split(res), [&lc](const PathCut::V3 &p) { return lc.side(p); }, true);
         }
+        lap("grouping");
         ctl.update_status(100, _u8L("Cutting along path"));
     };
 
@@ -544,8 +560,12 @@ void GLGizmoPathCut::perform_cut()
 
         m_message.clear();
         m_parent.reset_all_gizmos();
+        const auto t0 = std::chrono::steady_clock::now();
         Plater::TakeSnapshot snapshot(plater, _u8L("Cut along path"));
         plater->apply_cut_object_to_model(size_t(obj_idx), tmp.objects);
+        BOOST_LOG_TRIVIAL(info) << "PathCut: apply to model "
+                                << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count()
+                                << " ms";
     };
 
     queue_job(plater->get_ui_job_worker(), std::move(process), std::move(finalize));
