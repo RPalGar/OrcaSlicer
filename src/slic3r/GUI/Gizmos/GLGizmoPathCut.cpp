@@ -8,12 +8,14 @@
 #include "slic3r/GUI/I18N.hpp"
 #include "slic3r/GUI/ImGuiWrapper.hpp"
 #include "slic3r/GUI/MeshUtils.hpp"
+#include "slic3r/GUI/PartPlate.hpp"
 #include "slic3r/GUI/Plater.hpp"
 #include "slic3r/GUI/Selection.hpp"
 #include "slic3r/GUI/Jobs/Job.hpp"
 #include "slic3r/GUI/Jobs/Worker.hpp"
 
 #include "libslic3r/AABBMesh.hpp"
+#include "libslic3r/BoundingBox.hpp"
 #include "libslic3r/Geometry.hpp"
 #include "libslic3r/MeshBoolean.hpp"
 #include "libslic3r/Model.hpp"
@@ -318,6 +320,58 @@ static indexed_triangle_set mesh_minus(const indexed_triangle_set &src, const in
     return {};
 }
 
+// Moves the piece (single instance) to the free spot of the current plate nearest to `rest`,
+// keeping a gap to the rest and to every other object except `replaced` (the object being cut).
+// Falls back to just beside the rest when the plate has no room.
+static void place_piece(ModelObject &piece, const BoundingBoxf3 &rest, const ModelObject *replaced)
+{
+    constexpr double gap = 5.;
+    Plater          *plater = wxGetApp().plater();
+
+    std::vector<BoundingBoxf3> obstacles{rest};
+    for (const ModelObject *o : plater->model().objects)
+        if (o != replaced)
+            for (size_t i = 0; i < o->instances.size(); ++i)
+                obstacles.emplace_back(o->instance_bounding_box(i));
+
+    ModelInstance      *pi   = piece.instances[0];
+    const BoundingBoxf3 bb   = piece.instance_bounding_box(0);
+    const Vec2d         size = (bb.max - bb.min).head<2>();
+    const BoundingBoxf3 bed  = plater->get_partplate_list().get_curr_plate()->get_build_volume();
+
+    auto is_free = [&](const Vec2d &min) {
+        const Vec2d max = min + size;
+        if (min.x() < bed.min.x() || min.y() < bed.min.y() || max.x() > bed.max.x() || max.y() > bed.max.y())
+            return false;
+        for (const BoundingBoxf3 &o : obstacles)
+            if (min.x() < o.max.x() + gap && max.x() > o.min.x() - gap && min.y() < o.max.y() + gap && max.y() > o.min.y() - gap)
+                return false;
+        return true;
+    };
+
+    const Vec2d target(rest.max.x() + gap, rest.min.y()); // default: right of the rest
+    Vec2d       best     = target;
+    double      best_d2  = std::numeric_limits<double>::max();
+    constexpr double step = 2.;
+    const Vec3d rc       = rest.center();
+    const bool  on_plate = rc.x() >= bed.min.x() && rc.x() <= bed.max.x() && rc.y() >= bed.min.y() && rc.y() <= bed.max.y();
+    // Objects on another plate keep the default placement.
+    if (on_plate) {
+        for (double x = bed.min.x(); x + size.x() <= bed.max.x(); x += step)
+            for (double y = bed.min.y(); y + size.y() <= bed.max.y(); y += step) {
+                const Vec2d  c(x, y);
+                const double d2 = (c - target).squaredNorm();
+                if (d2 < best_d2 && is_free(c)) {
+                    best    = c;
+                    best_d2 = d2;
+                }
+            }
+    }
+    const Vec2d delta = best - bb.min.head<2>();
+    pi->set_offset(pi->get_offset() + Vec3d(delta.x(), delta.y(), 0.));
+    piece.invalidate_bounding_box();
+}
+
 void GLGizmoPathCut::perform_cut()
 {
     if (m_busy)
@@ -481,14 +535,10 @@ void GLGizmoPathCut::perform_cut()
             no->invalidate_bounding_box();
             no->ensure_on_bed();
         }
-        // Both pieces now rest on the bed; move the detached one beside the rest so they don't overlap.
-        if (tmp.objects.size() == 2) {
-            const BoundingBoxf3 piece = tmp.objects[0]->instance_bounding_box(0);
-            const BoundingBoxf3 rest  = tmp.objects[1]->instance_bounding_box(0);
-            ModelInstance      *pi    = tmp.objects[0]->instances[0];
-            pi->set_offset(pi->get_offset() + Vec3d(rest.max.x() - piece.min.x() + 5., 0., 0.));
-            tmp.objects[0]->invalidate_bounding_box();
-        }
+        // Both pieces now rest on the bed; put the detached one in the free spot of the current plate
+        // closest to the rest, so it doesn't overlap the rest or any other object.
+        if (tmp.objects.size() == 2)
+            place_piece(*tmp.objects[0], tmp.objects[1]->instance_bounding_box(0), mo);
         if (grouped.n_small > 0)
             BOOST_LOG_TRIVIAL(info) << "PathCut: " << grouped.n_small << " tiny fragments kept with their side";
 
