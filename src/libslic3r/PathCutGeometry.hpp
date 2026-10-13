@@ -631,41 +631,75 @@ inline size_t make_edge_manifold(indexed_triangle_set &its)
             its.indices.resize(w);
         }
     }
-    // 2) edges shared by more than two faces: keep one (a,b)/(b,a) pair, detach the rest.
+    // 2) Edges shared by more than two faces: around each of their vertices, the faces form fans
+    //    connected through ordinary (two-face) edges, e.g. two cubes touching along an edge give two
+    //    fans at each end. Every fan but the first gets its own copy of the vertex, which separates the
+    //    sheets without opening any of them.
     std::vector<std::pair<uint64_t, uint32_t>> edges;
     edges.reserve(its.indices.size() * 3);
     for (size_t i = 0; i < its.indices.size(); ++i)
         for (int e = 0; e < 3; ++e)
             edges.emplace_back(edge_key(its.indices[i][e], its.indices[i][(e + 1) % 3]), uint32_t(i));
     tbb::parallel_sort(edges.begin(), edges.end());
+    auto faces_on_edge = [&edges](uint64_t k) {
+        const auto lo = std::lower_bound(edges.begin(), edges.end(), std::make_pair(k, uint32_t(0)));
+        size_t     n  = 0;
+        for (auto it = lo; it != edges.end() && it->first == k; ++it) ++n;
+        return n;
+    };
+    std::vector<int> pinched;
     for (size_t i = 0; i < edges.size();) {
         size_t j = i + 1;
         while (j < edges.size() && edges[j].first == edges[i].first) ++j;
         if (j - i > 2) {
             ++fixes;
-            const int a = int(edges[i].first >> 32), b = int(edges[i].first & 0xffffffffu);
-            auto dir = [&](size_t f) { // +1 if face walks edge as (a,b)
-                for (int e = 0; e < 3; ++e)
-                    if (its.indices[f][e] == a && its.indices[f][(e + 1) % 3] == b) return 1;
-                return -1;
-            };
-            const size_t keep0 = edges[i].second;
-            size_t       keep1 = keep0;
-            for (size_t k = i + 1; k < j; ++k)
-                if (dir(edges[k].second) != dir(keep0)) { keep1 = edges[k].second; break; }
-            for (size_t k = i; k < j; ++k) {
-                const size_t f = edges[k].second;
-                if (f == keep0 || f == keep1) continue;
-                for (int e = 0; e < 3; ++e) {
-                    int &vi = its.indices[f][e];
-                    if (vi == a || vi == b) {
-                        its.vertices.push_back(its.vertices[vi]);
-                        vi = int(its.vertices.size()) - 1;
-                    }
-                }
-            }
+            pinched.push_back(int(edges[i].first >> 32));
+            pinched.push_back(int(edges[i].first & 0xffffffffu));
         }
         i = j;
+    }
+    if (pinched.empty())
+        return fixes;
+    std::sort(pinched.begin(), pinched.end());
+    pinched.erase(std::unique(pinched.begin(), pinched.end()), pinched.end());
+    const int        nv0 = int(its.vertices.size());
+    std::vector<int> copy_of; // original vertex of each copy made below
+    auto original = [&](int w) { return w < nv0 ? w : copy_of[size_t(w - nv0)]; };
+    std::unordered_map<int, std::vector<uint32_t>> around; // pinched vertex -> its faces
+    for (int v : pinched) around[v];
+    for (size_t f = 0; f < its.indices.size(); ++f)
+        for (int e = 0; e < 3; ++e) {
+            auto it = around.find(its.indices[f][e]);
+            if (it != around.end()) it->second.push_back(uint32_t(f));
+        }
+    for (int v : pinched) {
+        const std::vector<uint32_t> &fs = around[v];
+        std::vector<int>             fan(fs.size());
+        for (size_t i = 0; i < fs.size(); ++i) fan[i] = int(i);
+        auto find = [&fan](int x) { while (fan[x] != x) x = fan[x] = fan[fan[x]]; return x; };
+        // Faces around v sharing an ordinary edge (v, w) belong to the same fan (w may already be a copy
+        // made for an earlier pinched vertex: look the edge up by the original indices).
+        for (size_t i = 0; i < fs.size(); ++i)
+            for (size_t k = i + 1; k < fs.size(); ++k) {
+                const auto &A = its.indices[fs[i]], &B = its.indices[fs[k]];
+                for (int ea = 0; ea < 3; ++ea) {
+                    const int w = A[ea];
+                    if (w == v || (B[0] != w && B[1] != w && B[2] != w)) continue;
+                    if (faces_on_edge(edge_key(v, original(w))) == 2) fan[find(int(i))] = find(int(k));
+                }
+            }
+        std::unordered_map<int, int> copy; // fan root -> vertex index used by that fan
+        for (size_t i = 0; i < fs.size(); ++i) {
+            const int root = find(int(i));
+            auto [it, first] = copy.emplace(root, v);
+            if (first && copy.size() > 1) {
+                it->second = int(its.vertices.size());
+                its.vertices.push_back(its.vertices[v]);
+                copy_of.push_back(v);
+            }
+            for (int e = 0; e < 3; ++e)
+                if (its.indices[fs[i]][e] == v) its.indices[fs[i]][e] = it->second;
+        }
     }
     return fixes;
 }
@@ -817,10 +851,11 @@ CutResult cut_with_slab(indexed_triangle_set its, const Cutter &cutter, bool bou
         }
         emax = std::sqrt(emax);
         if (emax <= refine) return -1;
-        double near = std::numeric_limits<double>::max();
+        // (not called `near`: windows.h defines that as a macro)
+        double closest = std::numeric_limits<double>::max();
         for (int e = 0; e < 3; ++e)
-            near = std::min(near, std::max(std::abs(f[t[e]]) - hk, out[t[e]]));
-        return near < 2. * emax ? ei : -1;
+            closest = std::min(closest, std::max(std::abs(f[t[e]]) - hk, out[t[e]]));
+        return closest < 2. * emax ? ei : -1;
     };
     std::vector<size_t> cand;
     for (size_t i = 0; i < its.indices.size(); ++i)
@@ -918,6 +953,7 @@ CutResult cut_with_slab(indexed_triangle_set its, const Cutter &cutter, bool bou
     std::vector<std::pair<int, int>> cap_edges[2]; // directed so the caps get the right winding
     std::vector<size_t>              inactive_touching;
     std::unordered_map<uint64_t, size_t> cut_owner;
+    std::unordered_map<uint64_t, int>    removed; // bounded cut only, values unused
     for (size_t ti = 0; ti < its.indices.size(); ++ti) {
         const auto &t = its.indices[ti];
         if (!active(t)) {
@@ -925,6 +961,11 @@ CutResult cut_with_slab(indexed_triangle_set its, const Cutter &cutter, bool bou
             inactive_touching.push_back(ti);
             continue;
         }
+        if (bounded) // edges with both ends inside the slab disappear; an inactive neighbour must not use them
+            for (int e = 0; e < 3; ++e) {
+                const int a = t[e], b = t[(e + 1) % 3];
+                if (std::abs(f[a]) < hk && std::abs(f[b]) < hk) removed.emplace(edge_key(a, b), 0);
+            }
         for (int level : {1, -1}) {
             const bool k0 = g(t[0], level) > 0., k1 = g(t[1], level) > 0., k2 = g(t[2], level) > 0.;
             if (!k0 && !k1 && !k2) continue;
@@ -957,8 +998,8 @@ CutResult cut_with_slab(indexed_triangle_set its, const Cutter &cutter, bool bou
         for (size_t ti : inactive_touching) {
             const auto &t = its.indices[ti];
             for (int e = 0; e < 3; ++e)
-                for (auto &m : cross)
-                    if (m.count(edge_key(t[e], t[(e + 1) % 3]))) {
+                for (auto *m : {&cross[0], &cross[1], &removed})
+                    if (m->count(edge_key(t[e], t[(e + 1) % 3]))) {
                         res.error = "The loop does not go all the way around the part. Place the points around it, or lower the cap margin.";
                         return res;
                     }
@@ -1045,8 +1086,12 @@ CutResult cut_with_slab(indexed_triangle_set its, const Cutter &cutter, bool bou
             std::vector<stl_triangle_vertex_indices> cap;
             for (size_t k = 0; k + 2 < tri.size(); k += 3) {
                 int a = ids[tri[k]], b = ids[tri[k + 1]], c = ids[tri[k + 2]];
-                const V2 &pa = uv[a], &pb = uv[b], &pc = uv[c];
-                if (((pb - pa).x() * (pc - pa).y() - (pb - pa).y() * (pc - pa).x()) * sign < 0.) std::swap(b, c);
+                const V2    &pa = uv[a], &pb = uv[b], &pc = uv[c];
+                const double cr = ((pb - pa).x() * (pc - pa).y() - (pb - pa).y() * (pc - pa).x()) * sign;
+                // Earcut emits zero-area triangles along straight runs of the ring, sometimes walking
+                // ring edges backwards; leave those out, the gap closing below covers the spot.
+                if (cr == 0.) continue;
+                if (cr < 0.) std::swap(b, c);
                 cap.emplace_back(a, b, c);
             }
             // The triangulation is flat in the chart but the level set may be curved in 3D (a bent wall,
@@ -1110,8 +1155,8 @@ CutResult cut_with_slab(indexed_triangle_set its, const Cutter &cutter, bool bou
             // Slice the cap along the kink lines of the level set, so every piece lies where the level set
             // is planar (or nearly). A slice through a boundary edge also splits the clipped triangle
             // that owns it (see below), keeping the mesh watertight.
-            for (const auto &[p0, dir] : cutter.kinks(level, 0.5 * sag_tol)) {
-                const V2 nrm(-dir.y(), dir.x());
+            for (const auto &kink : cutter.kinks(level, 0.5 * sag_tol)) {
+                const V2 p0 = kink.first, nrm(-kink.second.y(), kink.second.x());
                 auto dist = [&](int v) { const double d = (uv[v] - p0).dot(nrm); return std::abs(d) < 1e-5 ? 0. : d; };
                 std::unordered_map<uint64_t, int> xing;
                 auto cross_at = [&](int a, int b) {

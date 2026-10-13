@@ -98,8 +98,8 @@ TEST_CASE("A tilted loop around a cylinder detaches its end", "[PathCut]")
 
 TEST_CASE("A loop that misses part of the cross-section is reported instead of cutting halfway", "[PathCut]")
 {
-    // Loop around one leg of a U made of two boxes joined at the bottom, but with a cap so wide it
-    // reaches the other leg: the cap rim runs through it.
+    // Loop around one of two boxes standing side by side, with a cap so wide it reaches the other
+    // box: the cap rim runs through it.
     indexed_triangle_set u = its_make_cube(4., 4., 20.);
     indexed_triangle_set leg2 = its_make_cube(4., 4., 20.);
     its_translate(leg2, Vec3f(6.f, 0.f, 0.f));
@@ -126,6 +126,22 @@ TEST_CASE("A loop that folds back on itself is rejected", "[PathCut]")
     const PathCut::LoopCutter lc = PathCut::make_loop_cutter(loop, 0.2, 1.5, [](const PathCut::V3 &p) { return p; });
     CHECK_FALSE(lc.valid());
     CHECK_FALSE(lc.error.empty());
+}
+
+TEST_CASE("Two cubes touching along an edge are separated without opening either", "[PathCut]")
+{
+    indexed_triangle_set a = its_make_cube(10., 10., 10.), b = its_make_cube(10., 10., 10.);
+    its_translate(b, Vec3f(10.f, 0.f, 10.f));
+    its_merge(a, b);
+    its_merge_vertices(a); // the edge x = 10, z = 10 is now shared by four faces
+    size_t open, max_faces;
+    edge_counts(a, open, max_faces);
+    REQUIRE(max_faces == 4);
+
+    CHECK(PathCut::make_edge_manifold(a) > 0);
+    edge_counts(a, open, max_faces);
+    CHECK(open == 0);
+    CHECK(max_faces == 2);
 }
 
 TEST_CASE("Zero-thickness sheets glued to a mesh are removed before cutting", "[PathCut]")

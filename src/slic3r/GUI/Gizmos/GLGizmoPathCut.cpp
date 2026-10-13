@@ -31,6 +31,7 @@
 #include <functional>
 #include <limits>
 #include <memory>
+#include <utility>
 #include <string>
 #include <vector>
 
@@ -54,6 +55,7 @@ static const ColorRGBA POINT_COLOR = {1.f, 0.55f, 0.f, 1.f};
     L("The model has holes along the cut, so the cut faces cannot be closed. Repair the model first."),
     L("The cap spanning the loop runs into another part of the model. Place the loop where the part is free all around."),
     L("The object was changed while it was being cut. Cut it again."),
+    L("The cut failed. Try a simpler path or a lower resolution model."),
 };
 
 GLGizmoPathCut::GLGizmoPathCut(GLCanvas3D &parent, const std::string &icon_filename, unsigned int sprite_id)
@@ -227,6 +229,11 @@ void GLGizmoPathCut::on_render()
 
 void GLGizmoPathCut::on_render_input_window(float x, float y, float bottom_limit)
 {
+    // A job dropped from the queue (another tool cleared it) never reports back.
+    if (m_busy && wxGetApp().plater()->get_ui_job_worker().is_idle()) {
+        m_busy = false;
+        m_message.clear();
+    }
     const float scale = m_parent.get_scale();
     ImGuiWrapper::push_toolbar_style(scale);
     GizmoImguiSetNextWIndowPos(x, y, ImGuiCond_Always, 0.0f, 0.0f);
@@ -271,21 +278,23 @@ void GLGizmoPathCut::on_render_input_window(float x, float y, float bottom_limit
         m_margin = std::clamp(m_margin, 0.2f, 10.f);
     }
     ImGui::PopItemWidth();
+    m_imgui->disabled_end();
 
     m_imgui->text(_u8L("Points") + ": " + std::to_string(m_points.size()));
 
+    // (button() disables itself, so these take !m_busy as their enable flag rather than nesting
+    // inside the disabled block above)
     const size_t min_pts = m_mode == Mode::Loop ? 3 : 2;
-    if (m_imgui->button(_L("Undo point"), ImVec2(0, 0), !m_points.empty())) {
+    if (m_imgui->button(_L("Undo point"), ImVec2(0, 0), !m_points.empty() && !m_busy)) {
         m_points.pop_back();
         m_preview_dirty = true;
     }
     ImGui::SameLine();
-    if (m_imgui->button(_L("Clear"), ImVec2(0, 0), !m_points.empty()))
+    if (m_imgui->button(_L("Clear"), ImVec2(0, 0), !m_points.empty() && !m_busy))
         reset_path();
     ImGui::SameLine();
     if (m_imgui->button(_L("Perform cut"), ImVec2(0, 0), m_points.size() >= min_pts && !m_busy))
         wxGetApp().CallAfter([this]() { perform_cut(); });
-    m_imgui->disabled_end();
     if (m_busy) {
         ImGui::SameLine();
         if (m_imgui->button(_L("Cancel")))
@@ -481,8 +490,12 @@ void GLGizmoPathCut::perform_cut()
     };
 
     // Back on the UI thread.
-    const Transform3d inst_matrix = mi->get_matrix();
-    auto finalize = [this, st, obj_idx, inst_idx, mo, offset, inst_matrix](bool canceled, std::exception_ptr &eptr) {
+    // What the cut was computed from, to detect edits made while it runs.
+    const Transform3d                             inst_matrix = mi->get_matrix();
+    std::vector<std::pair<size_t, Transform3d>> volumes_before;
+    for (const ModelVolume *v : mo->volumes)
+        volumes_before.emplace_back(v->id().id, v->get_matrix());
+    auto finalize = [this, st, obj_idx, inst_idx, mo, offset, inst_matrix, volumes_before](bool canceled, std::exception_ptr &eptr) {
         m_busy = false;
         std::string error = st->error;
         if (eptr) {
@@ -490,6 +503,9 @@ void GLGizmoPathCut::perform_cut()
                 std::rethrow_exception(eptr);
             } catch (const std::exception &e) {
                 BOOST_LOG_TRIVIAL(error) << "PathCut: " << e.what();
+                error = "The cut failed. Try a simpler path or a lower resolution model.";
+            } catch (...) {
+                BOOST_LOG_TRIVIAL(error) << "PathCut: unknown exception";
                 error = "The cut failed. Try a simpler path or a lower resolution model.";
             }
             eptr = nullptr; // handled here, don't let the worker show a generic error
@@ -513,7 +529,14 @@ void GLGizmoPathCut::perform_cut()
         // The object may have been deleted or replaced while the job was running.
         Plater *plater = wxGetApp().plater();
         if (obj_idx >= int(plater->model().objects.size()) || plater->model().objects[obj_idx] != mo ||
-            inst_idx >= int(mo->instances.size()) || !mo->instances[inst_idx]->get_matrix().isApprox(inst_matrix)) {
+            inst_idx >= int(mo->instances.size()) || !mo->instances[inst_idx]->get_matrix().isApprox(inst_matrix) ||
+            [&]() {
+                if (mo->volumes.size() != volumes_before.size()) return true;
+                for (size_t i = 0; i < volumes_before.size(); ++i)
+                    if (mo->volumes[i]->id().id != volumes_before[i].first || !mo->volumes[i]->get_matrix().isApprox(volumes_before[i].second))
+                        return true;
+                return false;
+            }()) {
             m_message          = _u8L("The object was changed while it was being cut. Cut it again.");
             m_message_is_error = true;
             reset_path();
