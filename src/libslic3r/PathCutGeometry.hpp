@@ -631,10 +631,11 @@ inline size_t make_edge_manifold(indexed_triangle_set &its)
             its.indices.resize(w);
         }
     }
-    // 2) Edges shared by more than two faces: around each of their vertices, the faces form fans
-    //    connected through ordinary (two-face) edges, e.g. two cubes touching along an edge give two
-    //    fans at each end. Every fan but the first gets its own copy of the vertex, which separates the
-    //    sheets without opening any of them.
+    // 2) Edges shared by more than two faces (bodies touching along an edge). Around such an edge the
+    //    faces, in angular order, pair up as the two sides of each solid wedge. Around each vertex of
+    //    such an edge, faces linked through ordinary edges or through a wedge pair form one sheet; every
+    //    sheet but the first gets its own copy of the vertex. Nothing is opened, the bodies just stop
+    //    sharing vertices.
     std::vector<std::pair<uint64_t, uint32_t>> edges;
     edges.reserve(its.indices.size() * 3);
     for (size_t i = 0; i < its.indices.size(); ++i)
@@ -647,14 +648,38 @@ inline size_t make_edge_manifold(indexed_triangle_set &its)
         for (auto it = lo; it != edges.end() && it->first == k; ++it) ++n;
         return n;
     };
-    std::vector<int> pinched;
+    auto vpos = [&its](int v) { return V3(its.vertices[v].cast<double>()); };
+    std::vector<int>                                                   pinched;
+    std::unordered_map<uint64_t, std::vector<std::pair<uint32_t, uint32_t>>> wedges; // pinched edge -> face pairs
     for (size_t i = 0; i < edges.size();) {
         size_t j = i + 1;
         while (j < edges.size() && edges[j].first == edges[i].first) ++j;
         if (j - i > 2) {
             ++fixes;
-            pinched.push_back(int(edges[i].first >> 32));
-            pinched.push_back(int(edges[i].first & 0xffffffffu));
+            const int a = int(edges[i].first >> 32), b = int(edges[i].first & 0xffffffffu);
+            pinched.push_back(a);
+            pinched.push_back(b);
+            const V3 pa = vpos(a), d = (vpos(b) - pa).normalized();
+            const V3 e1 = (std::abs(d.x()) < 0.9 ? V3::UnitX() : V3::UnitY()).cross(d).normalized(), e2 = d.cross(e1);
+            struct Side { double angle; uint32_t face; bool solid_ahead; };
+            std::vector<Side> sides;
+            for (size_t k = i; k < j; ++k) {
+                const auto &t = its.indices[edges[k].second];
+                int c = t[0];
+                for (int q = 0; q < 3; ++q) if (t[q] != a && t[q] != b) c = t[q];
+                V3 u = vpos(c) - pa;
+                u -= d * u.dot(d);
+                const V3 n = (vpos(t[1]) - vpos(t[0])).cross(vpos(t[2]) - vpos(t[0]));
+                // The face's normal points away from the wedge ahead of it (larger angle) when that wedge is solid.
+                sides.push_back({std::atan2(u.dot(e2), u.dot(e1)), edges[k].second, d.cross(u).dot(n) < 0.});
+            }
+            std::sort(sides.begin(), sides.end(), [](const Side &l, const Side &r) { return l.angle < r.angle; });
+            auto &pairs = wedges[edges[i].first];
+            for (size_t k = 0; k < sides.size(); ++k)
+                if (sides[k].solid_ahead) {
+                    const uint32_t f0 = sides[k].face, f1 = sides[(k + 1) % sides.size()].face;
+                    pairs.emplace_back(std::min(f0, f1), std::max(f0, f1));
+                }
         }
         i = j;
     }
@@ -674,24 +699,37 @@ inline size_t make_edge_manifold(indexed_triangle_set &its)
         }
     for (int v : pinched) {
         const std::vector<uint32_t> &fs = around[v];
-        std::vector<int>             fan(fs.size());
-        for (size_t i = 0; i < fs.size(); ++i) fan[i] = int(i);
-        auto find = [&fan](int x) { while (fan[x] != x) x = fan[x] = fan[fan[x]]; return x; };
-        // Faces around v sharing an ordinary edge (v, w) belong to the same fan (w may already be a copy
-        // made for an earlier pinched vertex: look the edge up by the original indices).
+        std::vector<int>             sheet(fs.size());
+        for (size_t i = 0; i < fs.size(); ++i) sheet[i] = int(i);
+        auto find  = [&sheet](int x) { while (sheet[x] != x) x = sheet[x] = sheet[sheet[x]]; return x; };
+        auto unite = [&](int x, int y) { sheet[find(x)] = find(y); };
+        // Faces around v grouped by their other vertex on each edge through v (w may already be a copy
+        // made for an earlier pinched vertex: edges are looked up by original indices).
+        std::unordered_map<int, std::vector<int>> by_edge;
         for (size_t i = 0; i < fs.size(); ++i)
-            for (size_t k = i + 1; k < fs.size(); ++k) {
-                const auto &A = its.indices[fs[i]], &B = its.indices[fs[k]];
-                for (int ea = 0; ea < 3; ++ea) {
-                    const int w = A[ea];
-                    if (w == v || (B[0] != w && B[1] != w && B[2] != w)) continue;
-                    if (faces_on_edge(edge_key(v, original(w))) == 2) fan[find(int(i))] = find(int(k));
+            for (int e = 0; e < 3; ++e) {
+                const int w = its.indices[fs[i]][e];
+                if (w != v) by_edge[original(w)].push_back(int(i));
+            }
+        for (const auto &kv : by_edge) {
+            const uint64_t          ek    = edge_key(v, kv.first);
+            const std::vector<int> &local = kv.second;
+            if (faces_on_edge(ek) == 2) {
+                for (size_t k = 1; k < local.size(); ++k) unite(local[0], local[k]);
+            } else if (auto it = wedges.find(ek); it != wedges.end()) {
+                for (const auto &pr : it->second) {
+                    int x = -1, y = -1;
+                    for (int l : local) {
+                        if (fs[l] == pr.first) x = l;
+                        if (fs[l] == pr.second) y = l;
+                    }
+                    if (x >= 0 && y >= 0) unite(x, y);
                 }
             }
-        std::unordered_map<int, int> copy; // fan root -> vertex index used by that fan
+        }
+        std::unordered_map<int, int> copy; // sheet root -> vertex index used by that sheet
         for (size_t i = 0; i < fs.size(); ++i) {
-            const int root = find(int(i));
-            auto [it, first] = copy.emplace(root, v);
+            auto [it, first] = copy.emplace(find(int(i)), v);
             if (first && copy.size() > 1) {
                 it->second = int(its.vertices.size());
                 its.vertices.push_back(its.vertices[v]);
@@ -1083,6 +1121,11 @@ CutResult cut_with_slab(indexed_triangle_set its, const Cutter &cutter, bool bou
                 if (parent[h] == int(o)) add_ring(h);
             const std::vector<uint32_t> tri = mapbox::earcut<uint32_t>(polygon);
             const double sign = area[o] > 0. ? 1. : -1.;
+            std::unordered_set<uint64_t> ring_dir; // ring edges, in the direction the cap must walk them
+            for (size_t r = 0; r < loops.size(); ++r)
+                if (int(r) == int(o) || parent[r] == int(o))
+                    for (size_t k = 0; k < loops[r].size(); ++k)
+                        ring_dir.insert((uint64_t(uint32_t(loops[r][k])) << 32) | uint32_t(loops[r][(k + 1) % loops[r].size()]));
             std::vector<stl_triangle_vertex_indices> cap;
             for (size_t k = 0; k + 2 < tri.size(); k += 3) {
                 int a = ids[tri[k]], b = ids[tri[k + 1]], c = ids[tri[k + 2]];
@@ -1092,6 +1135,11 @@ CutResult cut_with_slab(indexed_triangle_set its, const Cutter &cutter, bool bou
                 // ring edges backwards; leave those out, the gap closing below covers the spot.
                 if (cr == 0.) continue;
                 if (cr < 0.) std::swap(b, c);
+                const int tv[3] = {a, b, c};
+                bool      backwards = false;
+                for (int e = 0; e < 3; ++e)
+                    backwards |= ring_dir.count((uint64_t(uint32_t(tv[(e + 1) % 3])) << 32) | uint32_t(tv[e])) > 0;
+                if (backwards) continue;
                 cap.emplace_back(a, b, c);
             }
             // The triangulation is flat in the chart but the level set may be curved in 3D (a bent wall,

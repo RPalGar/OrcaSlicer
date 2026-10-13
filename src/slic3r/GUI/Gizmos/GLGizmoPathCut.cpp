@@ -492,9 +492,10 @@ void GLGizmoPathCut::perform_cut()
     // Back on the UI thread.
     // What the cut was computed from, to detect edits made while it runs.
     const Transform3d                             inst_matrix = mi->get_matrix();
-    std::vector<std::pair<size_t, Transform3d>> volumes_before;
+    struct VolumeState { size_t id; Transform3d matrix; std::shared_ptr<const TriangleMesh> mesh; };
+    std::vector<VolumeState> volumes_before; // the mesh is held so its address cannot be reused
     for (const ModelVolume *v : mo->volumes)
-        volumes_before.emplace_back(v->id().id, v->get_matrix());
+        volumes_before.push_back({v->id().id, v->get_matrix(), v->get_mesh_shared_ptr()});
     auto finalize = [this, st, obj_idx, inst_idx, mo, offset, inst_matrix, volumes_before](bool canceled, std::exception_ptr &eptr) {
         m_busy = false;
         std::string error = st->error;
@@ -533,7 +534,8 @@ void GLGizmoPathCut::perform_cut()
             [&]() {
                 if (mo->volumes.size() != volumes_before.size()) return true;
                 for (size_t i = 0; i < volumes_before.size(); ++i)
-                    if (mo->volumes[i]->id().id != volumes_before[i].first || !mo->volumes[i]->get_matrix().isApprox(volumes_before[i].second))
+                    if (mo->volumes[i]->id().id != volumes_before[i].id || !mo->volumes[i]->get_matrix().isApprox(volumes_before[i].matrix) ||
+                        mo->volumes[i]->get_mesh_shared_ptr() != volumes_before[i].mesh)
                         return true;
                 return false;
             }()) {
