@@ -10,6 +10,8 @@
 #include "slic3r/GUI/MeshUtils.hpp"
 #include "slic3r/GUI/Plater.hpp"
 #include "slic3r/GUI/Selection.hpp"
+#include "slic3r/GUI/Jobs/Job.hpp"
+#include "slic3r/GUI/Jobs/Worker.hpp"
 
 #include "libslic3r/AABBMesh.hpp"
 #include "libslic3r/Geometry.hpp"
@@ -21,10 +23,11 @@
 #include <boost/log/trivial.hpp>
 #include <glad/gl.h>
 #include <imgui/imgui.h>
-#include <wx/utils.h>
 
 #include <algorithm>
+#include <exception>
 #include <limits>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -114,6 +117,8 @@ bool GLGizmoPathCut::raycast(const Vec2d &mouse_pos, Vec3d &hit_world) const
 
 bool GLGizmoPathCut::on_mouse(const wxMouseEvent &mouse_event)
 {
+    if (m_busy)
+        return false; // no picking while a cut is running
     const Vec2d mouse_pos(mouse_event.GetX(), mouse_event.GetY());
     if (mouse_event.LeftDown() && !mouse_event.CmdDown()) {
         Vec3d hit;
@@ -269,7 +274,7 @@ void GLGizmoPathCut::on_render_input_window(float x, float y, float bottom_limit
     if (m_imgui->button(_L("Clear"), ImVec2(0, 0), !m_points.empty()))
         reset_path();
     ImGui::SameLine();
-    if (m_imgui->button(_L("Perform cut"), ImVec2(0, 0), m_points.size() >= min_pts))
+    if (m_imgui->button(_L("Perform cut"), ImVec2(0, 0), m_points.size() >= min_pts && !m_busy))
         wxGetApp().CallAfter([this]() { perform_cut(); });
 
     if (!m_message.empty()) {
@@ -286,30 +291,37 @@ void GLGizmoPathCut::on_render_input_window(float x, float y, float bottom_limit
     ImGuiWrapper::pop_toolbar_style();
 }
 
-// MCUT first (fast); CGAL as a fallback when MCUT refuses the input or fails to split it.
+// MCUT is used alone: the CGAL fallback can run for minutes on meshes with hundreds of thousands
+// of triangles. CGAL is only tried for small meshes, and only when MCUT throws.
 static indexed_triangle_set mesh_minus(const indexed_triangle_set &src, const indexed_triangle_set &cutter)
 {
     std::vector<TriangleMesh> res;
+    bool                      mcut_threw = false;
     try {
         MeshBoolean::mcut::make_boolean(TriangleMesh(src), TriangleMesh(cutter), res, "A_NOT_B");
     } catch (const std::exception &e) {
         BOOST_LOG_TRIVIAL(warning) << "PathCut: MCUT failed: " << e.what();
         res.clear();
+        mcut_threw = true;
     }
-    if (!res.empty() && its_split(res.front().its).size() > its_split(src).size())
+    if (!res.empty())
         return std::move(res.front().its);
-    try {
-        TriangleMesh a(src);
-        MeshBoolean::cgal::minus(a, TriangleMesh(cutter));
-        return std::move(a.its);
-    } catch (const std::exception &e) {
-        BOOST_LOG_TRIVIAL(warning) << "PathCut: CGAL failed: " << e.what();
+    if (mcut_threw && src.indices.size() < 100000) {
+        try {
+            TriangleMesh a(src);
+            MeshBoolean::cgal::minus(a, TriangleMesh(cutter));
+            return std::move(a.its);
+        } catch (const std::exception &e) {
+            BOOST_LOG_TRIVIAL(warning) << "PathCut: CGAL failed: " << e.what();
+        }
     }
-    return res.empty() ? indexed_triangle_set() : std::move(res.front().its);
+    return {};
 }
 
 void GLGizmoPathCut::perform_cut()
 {
+    if (m_busy)
+        return;
     const Selection &selection = m_parent.get_selection();
     const int        obj_idx   = selection.get_object_idx();
     const int        inst_idx  = selection.get_instance_idx();
@@ -323,112 +335,170 @@ void GLGizmoPathCut::perform_cut()
     }
     const ModelInstance *mi = mo->instances[inst_idx];
 
+    // Everything the background job needs is copied here; the job never touches the Model.
+    struct State
+    {
+        indexed_triangle_set     src;
+        std::vector<PathCut::V3> pts;
+        Vec3d                    view_dir;
+        Mode                     mode;
+        float                    kerf, margin;
+        PathCut::Grouped         grouped;
+        std::string              error;
+    };
+    auto st = std::make_shared<State>();
+
     // Work in millimetres as printed: bake instance rotation/scale into the mesh, keep the offset.
     const Transform3d inst_no_offset = mi->get_transformation().get_matrix_no_offset();
     const Vec3d       offset         = mi->get_offset();
-    const ModelVolume *first_part    = nullptr;
-    indexed_triangle_set src;
     for (const ModelVolume *v : mo->volumes) {
         if (!v->is_model_part())
             continue;
-        if (!first_part)
-            first_part = v;
         indexed_triangle_set its = v->mesh().its;
         its_transform(its, inst_no_offset * v->get_matrix(), true);
-        its_merge(src, its);
+        its_merge(st->src, its);
     }
-    if (src.indices.empty())
+    if (st->src.indices.empty())
         return;
-
-    wxBusyCursor wait;
-    PathCut::make_edge_manifold(src);
-    PathCut::V3 mn = PathCut::V3::Constant(std::numeric_limits<double>::max()), mx = -mn;
-    for (const auto &v : src.vertices) {
-        mn = mn.cwiseMin(PathCut::V3(v.cast<double>()));
-        mx = mx.cwiseMax(PathCut::V3(v.cast<double>()));
-    }
-    std::vector<PathCut::V3> pts;
     for (const Vec3d &p : m_points)
-        pts.emplace_back(p - offset);
+        st->pts.emplace_back(p - offset);
+    st->view_dir = m_view_dir;
+    st->mode     = m_mode;
+    st->kerf     = m_kerf;
+    st->margin   = m_margin;
 
-    PathCut::Grouped grouped;
-    std::string      error;
-    if (m_mode == Mode::ViewPath) {
-        PathCut::ViewCutter vc = PathCut::make_view_cutter(pts, m_view_dir, mn, mx, m_kerf);
-        if (!vc.valid())
-            error = vc.error;
-        else {
-            indexed_triangle_set res = mesh_minus(src, vc.mesh);
-            grouped = PathCut::group_components(its_split(res), [&vc](const PathCut::V3 &p) { return vc.side(p); }, false);
+    m_busy             = true;
+    m_message          = _u8L("Cutting, please wait...");
+    m_message_is_error = false;
+    m_parent.set_as_dirty();
+
+    // Runs on the UI job worker thread (large stack, the UI stays responsive).
+    auto process = [st](Job::Ctl &ctl) {
+        ctl.update_status(0, _u8L("Cutting along path"));
+        PathCut::make_edge_manifold(st->src);
+        PathCut::V3 mn = PathCut::V3::Constant(std::numeric_limits<double>::max()), mx = -mn;
+        for (const auto &v : st->src.vertices) {
+            mn = mn.cwiseMin(PathCut::V3(v.cast<double>()));
+            mx = mx.cwiseMax(PathCut::V3(v.cast<double>()));
         }
-    } else {
-        AABBMesh aabb(src);
-        auto snap = [&aabb](const PathCut::V3 &p) -> PathCut::V3 {
-            int   idx;
-            Vec3d c;
-            aabb.squared_distance(Vec3d(p), idx, c);
-            return c;
-        };
-        PathCut::LoopCutter lc = PathCut::make_loop_cutter(pts, m_kerf, m_margin, snap);
-        if (!lc.valid())
-            error = lc.error;
-        else {
-            indexed_triangle_set res = mesh_minus(src, lc.mesh);
-            grouped = PathCut::group_components(its_split(res), [&lc](const PathCut::V3 &p) { return lc.side(p); }, true);
+        ctl.update_status(20, _u8L("Cutting along path"));
+        if (st->mode == Mode::ViewPath) {
+            PathCut::ViewCutter vc = PathCut::make_view_cutter(st->pts, st->view_dir, mn, mx, st->kerf);
+            if (!vc.valid()) {
+                st->error = vc.error;
+                return;
+            }
+            indexed_triangle_set res = mesh_minus(st->src, vc.mesh);
+            ctl.update_status(80, _u8L("Cutting along path"));
+            st->grouped = PathCut::group_components(its_split(res), [&vc](const PathCut::V3 &p) { return vc.side(p); }, false);
+        } else {
+            AABBMesh aabb(st->src);
+            auto     snap = [&aabb](const PathCut::V3 &p) -> PathCut::V3 {
+                int   idx;
+                Vec3d c;
+                aabb.squared_distance(Vec3d(p), idx, c);
+                return c;
+            };
+            PathCut::LoopCutter lc = PathCut::make_loop_cutter(st->pts, st->kerf, st->margin, snap);
+            if (!lc.valid()) {
+                st->error = lc.error;
+                return;
+            }
+            indexed_triangle_set res = mesh_minus(st->src, lc.mesh);
+            ctl.update_status(80, _u8L("Cutting along path"));
+            st->grouped = PathCut::group_components(its_split(res), [&lc](const PathCut::V3 &p) { return lc.side(p); }, true);
         }
-    }
-    if (error.empty() && (grouped.side_a.indices.empty() || grouped.side_b.indices.empty()))
-        error = m_mode == Mode::ViewPath ?
-                    "The path did not split the object. Make sure it crosses the object completely." :
-                    "The loop did not detach anything. Make sure it goes all the way around the part.";
-    if (!error.empty()) {
-        m_message          = _u8L(error.c_str());
-        m_message_is_error = true;
-        m_parent.set_as_dirty();
-        return;
-    }
+        ctl.update_status(100, _u8L("Cutting along path"));
+    };
 
-    // Detached piece (smaller) first.
-    std::vector<indexed_triangle_set *> sides{&grouped.side_a, &grouped.side_b};
-    if (std::abs(its_volume(grouped.side_a)) > std::abs(its_volume(grouped.side_b)))
-        std::swap(sides[0], sides[1]);
-
-    Model                    tmp;
-    const std::vector<std::string> suffix{_u8L("piece"), _u8L("rest")};
-    for (size_t i = 0; i < sides.size(); ++i) {
-        ModelObject *no = tmp.add_object(*mo);
-        no->clear_volumes();
-        no->clear_instances();
-        no->cut_connectors.clear();
-        no->cut_id.invalidate();
-        no->name = mo->name + " - " + suffix[i];
-        ModelVolume *nv = no->add_volume(TriangleMesh(std::move(*sides[i])));
-        nv->name = no->name;
-        if (first_part) {
-            nv->config.apply(first_part->config);
-            nv->set_material_id(first_part->material_id());
+    // Back on the UI thread.
+    auto finalize = [this, st, obj_idx, inst_idx, mo, offset](bool canceled, std::exception_ptr &eptr) {
+        m_busy = false;
+        std::string error = st->error;
+        if (eptr) {
+            try {
+                std::rethrow_exception(eptr);
+            } catch (const std::exception &e) {
+                BOOST_LOG_TRIVIAL(error) << "PathCut: " << e.what();
+                error = "The cut failed. Try a simpler path or a lower resolution model.";
+            }
+            eptr = nullptr; // handled here, don't let the worker show a generic error
         }
-        ModelInstance *ni = no->add_instance();
-        ni->set_offset(offset);
-        no->invalidate_bounding_box();
-        no->ensure_on_bed();
-    }
-    // Both pieces now rest on the bed; move the detached one beside the rest so they don't overlap.
-    if (tmp.objects.size() == 2) {
-        const BoundingBoxf3 piece = tmp.objects[0]->instance_bounding_box(0);
-        const BoundingBoxf3 rest  = tmp.objects[1]->instance_bounding_box(0);
-        ModelInstance      *pi    = tmp.objects[0]->instances[0];
-        pi->set_offset(pi->get_offset() + Vec3d(rest.max.x() - piece.min.x() + 5., 0., 0.));
-        tmp.objects[0]->invalidate_bounding_box();
-    }
+        if (canceled) {
+            m_message.clear();
+            m_parent.set_as_dirty();
+            return;
+        }
+        if (error.empty() && (st->grouped.side_a.indices.empty() || st->grouped.side_b.indices.empty()))
+            error = st->mode == Mode::ViewPath ?
+                        "The path did not split the object. Make sure it crosses the object completely." :
+                        "The loop did not detach anything. Make sure it goes all the way around the part.";
+        if (!error.empty()) {
+            m_message          = _u8L(error.c_str());
+            m_message_is_error = true;
+            m_parent.set_as_dirty();
+            return;
+        }
 
-    m_parent.reset_all_gizmos();
-    {
+        // The object may have been deleted or replaced while the job was running.
+        Plater *plater = wxGetApp().plater();
+        if (obj_idx >= int(plater->model().objects.size()) || plater->model().objects[obj_idx] != mo ||
+            inst_idx >= int(mo->instances.size())) {
+            m_message.clear();
+            reset_path();
+            return;
+        }
+        const ModelVolume *first_part = nullptr;
+        for (const ModelVolume *v : mo->volumes)
+            if (v->is_model_part()) {
+                first_part = v;
+                break;
+            }
+
+        // Detached piece (smaller) first.
+        PathCut::Grouped                   &grouped = st->grouped;
+        std::vector<indexed_triangle_set *> sides{&grouped.side_a, &grouped.side_b};
+        if (std::abs(its_volume(grouped.side_a)) > std::abs(its_volume(grouped.side_b)))
+            std::swap(sides[0], sides[1]);
+
+        Model                          tmp;
+        const std::vector<std::string> suffix{_u8L("piece"), _u8L("rest")};
+        for (size_t i = 0; i < sides.size(); ++i) {
+            ModelObject *no = tmp.add_object(*mo);
+            no->clear_volumes();
+            no->clear_instances();
+            no->cut_connectors.clear();
+            no->cut_id.invalidate();
+            no->name        = mo->name + " - " + suffix[i];
+            ModelVolume *nv = no->add_volume(TriangleMesh(std::move(*sides[i])));
+            nv->name        = no->name;
+            if (first_part) {
+                nv->config.apply(first_part->config);
+                nv->set_material_id(first_part->material_id());
+            }
+            ModelInstance *ni = no->add_instance();
+            ni->set_offset(offset);
+            no->invalidate_bounding_box();
+            no->ensure_on_bed();
+        }
+        // Both pieces now rest on the bed; move the detached one beside the rest so they don't overlap.
+        if (tmp.objects.size() == 2) {
+            const BoundingBoxf3 piece = tmp.objects[0]->instance_bounding_box(0);
+            const BoundingBoxf3 rest  = tmp.objects[1]->instance_bounding_box(0);
+            ModelInstance      *pi    = tmp.objects[0]->instances[0];
+            pi->set_offset(pi->get_offset() + Vec3d(rest.max.x() - piece.min.x() + 5., 0., 0.));
+            tmp.objects[0]->invalidate_bounding_box();
+        }
+        if (grouped.n_small > 0)
+            BOOST_LOG_TRIVIAL(info) << "PathCut: " << grouped.n_small << " tiny fragments kept with their side";
+
+        m_message.clear();
+        m_parent.reset_all_gizmos();
         Plater::TakeSnapshot snapshot(plater, _u8L("Cut along path"));
         plater->apply_cut_object_to_model(size_t(obj_idx), tmp.objects);
-    }
-    if (grouped.n_small > 0)
-        BOOST_LOG_TRIVIAL(info) << "PathCut: " << grouped.n_small << " tiny fragments kept with their side";
+    };
+
+    queue_job(plater->get_ui_job_worker(), std::move(process), std::move(finalize));
 }
 
 } // namespace GUI

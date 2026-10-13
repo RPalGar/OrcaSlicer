@@ -17,7 +17,7 @@ namespace GUI {
 //    view direction and splits the whole object (e.g. separate a head along the hair line).
 //  * Loop: pick points around a limb on its surface; a curved cap spanning the loop detaches only
 //    that region (e.g. an arm or a leg), following a non-planar loop.
-// The geometry lives in libslic3r/PathCutGeometry.hpp; the boolean uses MCUT with a CGAL fallback.
+// The geometry lives in libslic3r/PathCutGeometry.hpp; the boolean uses MCUT and runs as a background job.
 class GLGizmoPathCut : public GLGizmoBase
 {
 public:
@@ -56,6 +56,7 @@ private:
     GLModel m_curve;
     GLModel m_sphere;
     bool    m_preview_dirty{true};
+    bool    m_busy{false};                     // a cut job is running
 };
 
 } // namespace GUI
