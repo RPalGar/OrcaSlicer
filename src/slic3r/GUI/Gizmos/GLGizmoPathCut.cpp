@@ -9,6 +9,7 @@
 #include "slic3r/GUI/I18N.hpp"
 #include "slic3r/GUI/ImGuiWrapper.hpp"
 #include "slic3r/GUI/MeshUtils.hpp"
+#include "slic3r/GUI/NotificationManager.hpp"
 #include "slic3r/GUI/PartPlate.hpp"
 #include "slic3r/GUI/Plater.hpp"
 #include "slic3r/GUI/Selection.hpp"
@@ -219,6 +220,19 @@ std::vector<Vec3d> GLGizmoPathCut::preview_curve() const
     return out;
 }
 
+// The view direction locked at the first point, or forced level with the bed or vertical.
+Vec3d GLGizmoPathCut::sweep_dir() const
+{
+    switch (m_sweep) {
+    case Sweep::Level: {
+        const Vec3d d(m_view_dir.x(), m_view_dir.y(), 0.);
+        return d.norm() > 1e-6 ? Vec3d(d.normalized()) : Vec3d(Vec3d::UnitY());
+    }
+    case Sweep::Vertical: return m_view_dir.z() > 0. ? Vec3d(Vec3d::UnitZ()) : Vec3d(-Vec3d::UnitZ());
+    default: return m_view_dir;
+    }
+}
+
 void GLGizmoPathCut::rebuild_preview()
 {
     m_curve.reset();
@@ -250,7 +264,7 @@ void GLGizmoPathCut::rebuild_cutter_preview()
     GLModel::Geometry g;
     g.format = {GLModel::Geometry::EPrimitiveType::Triangles, GLModel::Geometry::EVertexLayout::P3};
     if (m_mode == Mode::ViewPath && pts.size() >= 2) {
-        const PathCut::ViewCutter vc = PathCut::make_view_cutter(pts, m_view_dir, bb.min, bb.max, m_kerf, m_limit_ends ? m_extend : -1.,
+        const PathCut::ViewCutter vc = PathCut::make_view_cutter(pts, sweep_dir(), bb.min, bb.max, m_kerf, m_limit_ends ? m_extend : -1.,
                                                                  m_limit_depth ? m_depth : -1.);
         if (!vc.valid())
             return;
@@ -418,6 +432,23 @@ void GLGizmoPathCut::on_render_input_window(float x, float y, float bottom_limit
             m_preview_dirty = true;
         m_margin = std::clamp(m_margin, 0.2f, 10.f);
     } else {
+        // Direction the path is swept along: as seen when placing the first point, or forced level with
+        // the bed (a cut parallel to the bed for a path drawn from the front) or vertical.
+        ImGui::AlignTextToFramePadding();
+        m_imgui->text(_u8L("Cut direction"));
+        ImGui::SameLine(input_w * 1.6f);
+        const std::vector<std::string> sweeps{_u8L("From the view"), _u8L("Level with the bed"), _u8L("Vertical")};
+        int sweep = int(m_sweep);
+        ImGui::PushItemWidth(input_w * 2.2f);
+        if (ImGui::BeginCombo("##pathcut_sweep", sweeps[size_t(sweep)].c_str())) {
+            for (int i = 0; i < int(sweeps.size()); ++i)
+                if (ImGui::Selectable(sweeps[size_t(i)].c_str(), i == sweep)) {
+                    m_sweep         = Sweep(i);
+                    m_preview_dirty = true;
+                }
+            ImGui::EndCombo();
+        }
+        ImGui::PopItemWidth();
         // How far the wall reaches: through everything by default, or limited in depth and length.
         if (m_imgui->bbl_checkbox(_L("Limit depth (mm)"), m_limit_depth))
             m_preview_dirty = true;
@@ -552,6 +583,7 @@ void GLGizmoPathCut::perform_cut()
         Mode                     mode;
         float                    kerf, margin;
         double                   extend, depth; // view path limits, < 0 = none
+        bool                     joined{false}; // the cut is made but the sides still touch elsewhere
         PathCut::Grouped         grouped;
         std::string              error;
     };
@@ -571,7 +603,7 @@ void GLGizmoPathCut::perform_cut()
         return;
     for (const Vec3d &p : m_points)
         st->pts.emplace_back(p - offset);
-    st->view_dir = m_view_dir;
+    st->view_dir = sweep_dir();
     st->mode     = m_mode;
     st->kerf     = m_kerf;
     st->margin   = m_margin;
@@ -646,10 +678,7 @@ void GLGizmoPathCut::perform_cut()
             return;
         }
         ctl.update_status(80, status);
-        bool joined = false;
-        st->grouped = PathCut::group_cut(res, side, st->mode == Mode::Loop, &joined);
-        if (joined)
-            st->error = "The cut did not separate the object: the two sides are still connected somewhere. Check the preview of the cut.";
+        st->grouped = PathCut::group_cut(res, side, st->mode == Mode::Loop, &st->joined);
         lap("grouping");
         ctl.update_status(100, status);
     };
@@ -681,7 +710,7 @@ void GLGizmoPathCut::perform_cut()
             m_parent.set_as_dirty();
             return;
         }
-        if (error.empty() && (st->grouped.side_a.indices.empty() || st->grouped.side_b.indices.empty()))
+        if (error.empty() && !st->joined && (st->grouped.side_a.indices.empty() || st->grouped.side_b.indices.empty()))
             error = st->mode == Mode::ViewPath ?
                         "The path did not split the object. Make sure it crosses the object completely." :
                         "The loop did not detach anything. Make sure it goes all the way around the part.";
@@ -722,9 +751,14 @@ void GLGizmoPathCut::perform_cut()
         std::vector<indexed_triangle_set *> sides{&grouped.side_a, &grouped.side_b};
         if (std::abs(its_volume(grouped.side_a)) > std::abs(its_volume(grouped.side_b)))
             std::swap(sides[0], sides[1]);
+        // Still connected elsewhere: apply the cut anyway (one object with the gap) so the remaining
+        // connection can be cut next, and say so.
+        if (sides[0]->indices.empty())
+            sides.erase(sides.begin());
 
         Model                          tmp;
-        const std::vector<std::string> suffix{_u8L("piece"), _u8L("rest")};
+        const std::vector<std::string> suffix = sides.size() == 2 ? std::vector<std::string>{_u8L("piece"), _u8L("rest")} :
+                                                                     std::vector<std::string>{_u8L("cut")};
         for (size_t i = 0; i < sides.size(); ++i) {
             ModelObject *no = tmp.add_object(*mo);
             no->clear_volumes();
@@ -755,6 +789,11 @@ void GLGizmoPathCut::perform_cut()
         const auto t0 = std::chrono::steady_clock::now();
         Plater::TakeSnapshot snapshot(plater, _u8L("Cut along path"));
         plater->apply_cut_object_to_model(size_t(obj_idx), tmp.objects);
+        if (st->joined)
+            plater->get_notification_manager()->push_notification(
+                NotificationType::CustomNotification, NotificationManager::NotificationLevel::WarningNotificationLevel,
+                _u8L("Cut along path: the cut is made, but the two sides still touch elsewhere (an arm resting on the body, a "
+                     "weapon reaching the base...). Cut that connection too to separate them."));
         BOOST_LOG_TRIVIAL(info) << "PathCut: apply to model "
                                 << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count()
                                 << " ms";

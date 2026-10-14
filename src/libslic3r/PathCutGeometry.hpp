@@ -1409,8 +1409,9 @@ inline void its_append(indexed_triangle_set &dst, const indexed_triangle_set &sr
 
 // Splits a cut result into its connected parts and assigns each to a side by the cut face it carries
 // (exact, unlike sampling). Parts without a cut face are assigned by side_of (+1 / -1 / 0 majority
-// vote) or, with `untouched_follow_inside`, follow a side-a part they lie inside. `joined` is set when
-// a part carries both cut faces, i.e. the cut did not separate it.
+// vote) or, with `untouched_follow_inside`, follow a side-a part they lie inside. A part carrying both
+// cut faces is still connected around the cut (an arm resting on a leg, say): it goes to side b and
+// `joined` is set.
 template<class SideOf>
 Grouped group_cut(const CutResult &cut, SideOf side_of, bool untouched_follow_inside, bool *joined = nullptr)
 {
@@ -1434,9 +1435,12 @@ Grouped group_cut(const CutResult &cut, SideOf side_of, bool untouched_follow_in
             if (m < 0) { m = int(parts[c].vertices.size()); parts[c].vertices.push_back(its.vertices[size_t(t[k])]); }
             nt[k] = m;
             const int lv = size_t(t[k]) < cut.level.size() ? cut.level[size_t(t[k])] : 0;
-            if (lv != 0) {
-                if (label[c] != 0 && label[c] != lv && joined) *joined = true;
-                if (label[c] == 0) label[c] = lv;
+            if (lv != 0 && label[c] != 2) {
+                if (label[c] != 0 && label[c] != lv) {
+                    label[c] = 2; // both cut faces
+                    if (joined) *joined = true;
+                } else
+                    label[c] = lv;
             }
         }
         parts[c].indices.push_back(nt);
