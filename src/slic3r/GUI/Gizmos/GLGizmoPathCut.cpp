@@ -25,6 +25,7 @@
 #include <boost/log/trivial.hpp>
 #include <glad/gl.h>
 #include <imgui/imgui.h>
+#include <wx/glcanvas.h>
 
 #include <algorithm>
 #include <chrono>
