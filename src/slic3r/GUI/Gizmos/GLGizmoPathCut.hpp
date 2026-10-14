@@ -43,18 +43,31 @@ private:
     void rebuild_preview();
     void perform_cut();
     std::vector<Vec3d> preview_curve() const;
+    void               add_point(const Vec3d &hit);
+    void               rebuild_cutter_preview();
 
     Mode               m_mode{Mode::ViewPath};
     std::vector<Vec3d> m_points;                 // picked points, world coordinates
     Vec3d              m_view_dir{Vec3d::UnitY()}; // locked at the first point (view path mode)
     float              m_kerf{0.2f};             // clearance between parts [mm]
     float              m_margin{1.5f};           // minimum reach of the loop cap past the loop, widened as needed [mm]
+    bool               m_limit_depth{false};     // view path: stop the wall `m_depth` mm behind the picked points
+    float              m_depth{20.f};
+    bool               m_limit_ends{false};      // view path: stop the wall `m_extend` mm past the end points
+    float              m_extend{3.f};
     std::string        m_message;
     bool               m_message_is_error{false};
     const ModelObject *m_object{nullptr};        // object the points were picked on
 
     GLModel m_curve;
     GLModel m_sphere;
+    GLModel m_cutter;                            // translucent preview of the wall / loop cap
+
+    // A left press on the object adds a point on release, unless the mouse was dragged: then it orbits.
+    bool  m_press_on_object{false};
+    bool  m_orbiting{false};
+    Vec2d m_press_pos{Vec2d::Zero()}, m_last_pos{Vec2d::Zero()};
+    Vec3d m_press_hit{Vec3d::Zero()};
     bool    m_preview_dirty{true};
     bool    m_busy{false};                     // a cut job is running
 };

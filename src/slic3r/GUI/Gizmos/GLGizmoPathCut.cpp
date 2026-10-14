@@ -56,6 +56,8 @@ static const ColorRGBA POINT_COLOR = {1.f, 0.55f, 0.f, 1.f};
     L("The cap spanning the loop runs into another part of the model. Place the loop where the part is free all around."),
     L("The object was changed while it was being cut. Cut it again."),
     L("The cut failed. Try a simpler path or a lower resolution model."),
+    L("The cut ends inside the object. Increase the depth or the path extension, or start and end the path beyond the part."),
+    L("The cut did not separate the object: the two sides are still connected somewhere. Check the preview of the cut."),
 };
 
 GLGizmoPathCut::GLGizmoPathCut(GLCanvas3D &parent, const std::string &icon_filename, unsigned int sprite_id)
@@ -125,6 +127,23 @@ bool GLGizmoPathCut::raycast(const Vec2d &mouse_pos, Vec3d &hit_world) const
     return found;
 }
 
+void GLGizmoPathCut::add_point(const Vec3d &hit)
+{
+    const ModelObject *mo = m_c->selection_info() ? m_c->selection_info()->model_object() : nullptr;
+    if (mo == nullptr)
+        return;
+    if (m_object != mo) {
+        m_points.clear();
+        m_object = mo;
+    }
+    if (m_points.empty())
+        m_view_dir = wxGetApp().plater()->get_camera().get_dir_forward();
+    m_points.push_back(hit);
+    m_message.clear();
+    m_preview_dirty = true;
+    m_parent.set_as_dirty();
+}
+
 bool GLGizmoPathCut::on_mouse(const wxMouseEvent &mouse_event)
 {
     if (m_busy) // the scene is frozen while a cut runs (zooming is fine)
@@ -133,18 +152,34 @@ bool GLGizmoPathCut::on_mouse(const wxMouseEvent &mouse_event)
     if (mouse_event.LeftDown() && !mouse_event.CmdDown()) {
         Vec3d hit;
         if (!raycast(mouse_pos, hit))
-            return false; // let the canvas rotate the view
-        const ModelObject *mo = m_c->selection_info()->model_object();
-        if (m_object != mo) {
-            m_points.clear();
-            m_object = mo;
+            return false; // empty space: the canvas orbits the view
+        // On the object: a click adds a point (on release), a drag orbits the view. The canvas must not
+        // see this press, or it would start moving the object.
+        m_press_on_object = true;
+        m_orbiting        = false;
+        m_press_pos = m_last_pos = mouse_pos;
+        m_press_hit       = hit;
+        return true;
+    }
+    if (m_press_on_object && mouse_event.Dragging() && mouse_event.LeftIsDown()) {
+        if (!m_orbiting && (mouse_pos - m_press_pos).norm() > 4.)
+            m_orbiting = true;
+        if (m_orbiting) {
+            // Same orbit as the canvas (GLCanvas3D, TRACKBALLSIZE = 0.8).
+            Camera     &camera = wxGetApp().plater()->get_camera();
+            const Vec2d rot    = (mouse_pos - m_last_pos) * (PI * 0.8 / 180.);
+            camera.recover_from_free_camera();
+            camera.rotate_on_sphere(rot.x(), rot.y(), true);
+            m_parent.set_as_dirty();
         }
-        if (m_points.empty())
-            m_view_dir = wxGetApp().plater()->get_camera().get_dir_forward();
-        m_points.push_back(hit);
-        m_message.clear();
-        m_preview_dirty = true;
-        m_parent.set_as_dirty();
+        m_last_pos = mouse_pos;
+        return true;
+    }
+    if (m_press_on_object && mouse_event.LeftUp()) {
+        m_press_on_object = false;
+        if (!m_orbiting)
+            add_point(m_press_hit);
+        m_orbiting = false;
         return true;
     }
     if (mouse_event.RightDown() && !m_points.empty()) {
@@ -182,7 +217,78 @@ void GLGizmoPathCut::rebuild_preview()
     }
     if (!m_sphere.is_initialized())
         m_sphere.init_from(smooth_sphere(16, 1.f));
+    rebuild_cutter_preview();
     m_preview_dirty = false;
+}
+
+// Translucent preview of what will cut: the wall swept from the view path, or the cap spanning the loop
+// (at the minimum margin; the cut may widen it).
+void GLGizmoPathCut::rebuild_cutter_preview()
+{
+    m_cutter.reset();
+    const std::vector<PathCut::V3> pts(m_points.begin(), m_points.end());
+    const BoundingBoxf3            bb = m_parent.get_selection().get_bounding_box();
+    if (!bb.defined)
+        return;
+    GLModel::Geometry g;
+    g.format = {GLModel::Geometry::EPrimitiveType::Triangles, GLModel::Geometry::EVertexLayout::P3};
+    if (m_mode == Mode::ViewPath && pts.size() >= 2) {
+        const PathCut::ViewCutter vc = PathCut::make_view_cutter(pts, m_view_dir, bb.min, bb.max, m_kerf, m_limit_ends ? m_extend : -1.,
+                                                                 m_limit_depth ? m_depth : -1.);
+        if (!vc.valid())
+            return;
+        double lo = std::numeric_limits<double>::max(), hi = -lo;
+        for (int c = 0; c < 8; ++c) {
+            const double h = vc.frame.height(Vec3d(c & 1 ? bb.max.x() : bb.min.x(), c & 2 ? bb.max.y() : bb.min.y(), c & 4 ? bb.max.z() : bb.min.z()));
+            lo = std::min(lo, h);
+            hi = std::max(hi, h);
+        }
+        if (vc.limit_depth)
+            hi = std::min(hi, vc.h_max);
+        // Clip the unlimited extensions to a little past the object.
+        const double reach = (bb.max - bb.min).norm() * 0.6;
+        for (size_t i = 0; i + 1 < vc.path.size(); ++i) {
+            PathCut::V2 a = vc.path[i], b = vc.path[i + 1];
+            if (!vc.limit_ends) {
+                const PathCut::V2 c = vc.frame.to2d(bb.center());
+                if ((a - c).norm() > reach) a = c + (a - c).normalized() * reach;
+                if ((b - c).norm() > reach) b = c + (b - c).normalized() * reach;
+            }
+            const unsigned base = unsigned(g.vertices_count());
+            g.add_vertex(Vec3f(vc.frame.to3d(a, lo).cast<float>()));
+            g.add_vertex(Vec3f(vc.frame.to3d(b, lo).cast<float>()));
+            g.add_vertex(Vec3f(vc.frame.to3d(b, hi).cast<float>()));
+            g.add_vertex(Vec3f(vc.frame.to3d(a, hi).cast<float>()));
+            g.add_triangle(base, base + 1, base + 2);
+            g.add_triangle(base, base + 2, base + 3);
+        }
+    } else if (m_mode == Mode::Loop && pts.size() >= 3) {
+        const PathCut::LoopCutter lc = PathCut::make_loop_cutter(pts, m_kerf, m_margin, [](const PathCut::V3 &p) { return p; });
+        if (!lc.valid())
+            return;
+        constexpr int rings = 8, sectors = 72;
+        g.add_vertex(Vec3f(lc.frame.to3d(lc.center2d, lc.cap_height(lc.center2d)).cast<float>()));
+        for (int k = 1; k <= rings + 1; ++k)
+            for (int j = 0; j < sectors; ++j) {
+                const double a = 2. * PI * j / sectors;
+                double       r, h;
+                lc.spoke_at(a, r, h);
+                const double            rr = k <= rings ? r * k / rings : r + lc.margin;
+                const PathCut::V2 q  = lc.center2d + PathCut::V2(std::cos(a), std::sin(a)) * rr;
+                g.add_vertex(Vec3f(lc.frame.to3d(q, lc.cap_height(q)).cast<float>()));
+            }
+        for (int j = 0; j < sectors; ++j) {
+            const unsigned j1 = unsigned((j + 1) % sectors);
+            g.add_triangle(0, 1 + unsigned(j), 1 + j1);
+            for (int k = 1; k <= rings; ++k) {
+                const unsigned a0 = 1 + unsigned((k - 1) * sectors), a1 = 1 + unsigned(k * sectors);
+                g.add_triangle(a0 + unsigned(j), a1 + unsigned(j), a1 + j1);
+                g.add_triangle(a0 + unsigned(j), a1 + j1, a0 + j1);
+            }
+        }
+    }
+    if (g.vertices_count() > 0)
+        m_cutter.init_from(std::move(g));
 }
 
 void GLGizmoPathCut::on_render()
@@ -194,6 +300,22 @@ void GLGizmoPathCut::on_render()
 
     const Camera &camera = wxGetApp().plater()->get_camera();
     glsafe(::glDisable(GL_DEPTH_TEST));
+
+    if (m_cutter.is_initialized()) {
+        if (GLShaderProgram *shader = wxGetApp().get_shader("flat")) {
+            glsafe(::glDisable(GL_CULL_FACE));
+            glsafe(::glEnable(GL_BLEND));
+            glsafe(::glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA));
+            shader->start_using();
+            shader->set_uniform("view_model_matrix", camera.get_view_matrix());
+            shader->set_uniform("projection_matrix", camera.get_projection_matrix());
+            m_cutter.set_color(ColorRGBA(PATH_COLOR.r(), PATH_COLOR.g(), PATH_COLOR.b(), 0.25f));
+            m_cutter.render();
+            shader->stop_using();
+            glsafe(::glDisable(GL_BLEND));
+            glsafe(::glEnable(GL_CULL_FACE));
+        }
+    }
 
     if (m_curve.is_initialized()) {
         if (GLShaderProgram *shader = wxGetApp().get_shader("flat")) {
@@ -260,7 +382,7 @@ void GLGizmoPathCut::on_render_input_window(float x, float y, float bottom_limit
     else
         m_imgui->text(_u8L("Click points on the surface all the way around the part to detach (e.g. an arm). The loop closes "
                            "itself; a curved cap spanning it separates only that part."));
-    m_imgui->text(_u8L("Right click removes the last point. Drag on empty space, or Ctrl + drag, to rotate the view."));
+    m_imgui->text(_u8L("Click to add a point, right click removes the last one. Drag to rotate the view."));
     ImGui::PopTextWrapPos();
 
     ImGui::Separator();
@@ -268,14 +390,34 @@ void GLGizmoPathCut::on_render_input_window(float x, float y, float bottom_limit
     m_imgui->text(_u8L("Clearance (mm)"));
     ImGui::SameLine(input_w * 1.6f);
     ImGui::PushItemWidth(input_w);
-    ImGui::InputFloat("##pathcut_kerf", &m_kerf, 0.05f, 0.1f, "%.2f");
+    if (ImGui::InputFloat("##pathcut_kerf", &m_kerf, 0.05f, 0.1f, "%.2f"))
+        m_preview_dirty = true;
     m_kerf = std::clamp(m_kerf, 0.02f, 2.f);
     if (m_mode == Mode::Loop) {
         ImGui::AlignTextToFramePadding();
         m_imgui->text(_u8L("Min. cap margin (mm)"));
         ImGui::SameLine(input_w * 1.6f);
-        ImGui::InputFloat("##pathcut_margin", &m_margin, 0.1f, 0.5f, "%.1f");
+        if (ImGui::InputFloat("##pathcut_margin", &m_margin, 0.1f, 0.5f, "%.1f"))
+            m_preview_dirty = true;
         m_margin = std::clamp(m_margin, 0.2f, 10.f);
+    } else {
+        // How far the wall reaches: through everything by default, or limited in depth and length.
+        if (m_imgui->bbl_checkbox(_L("Limit depth (mm)"), m_limit_depth))
+            m_preview_dirty = true;
+        if (m_limit_depth) {
+            ImGui::SameLine(input_w * 1.6f);
+            if (ImGui::InputFloat("##pathcut_depth", &m_depth, 1.f, 5.f, "%.1f"))
+                m_preview_dirty = true;
+            m_depth = std::clamp(m_depth, 1.f, 1000.f);
+        }
+        if (m_imgui->bbl_checkbox(_L("Limit past the ends (mm)"), m_limit_ends))
+            m_preview_dirty = true;
+        if (m_limit_ends) {
+            ImGui::SameLine(input_w * 1.6f);
+            if (ImGui::InputFloat("##pathcut_extend", &m_extend, 0.5f, 2.f, "%.1f"))
+                m_preview_dirty = true;
+            m_extend = std::clamp(m_extend, 0.f, 500.f);
+        }
     }
     ImGui::PopItemWidth();
     m_imgui->disabled_end();
@@ -392,6 +534,7 @@ void GLGizmoPathCut::perform_cut()
         Vec3d                    view_dir;
         Mode                     mode;
         float                    kerf, margin;
+        double                   extend, depth; // view path limits, < 0 = none
         PathCut::Grouped         grouped;
         std::string              error;
     };
@@ -415,6 +558,8 @@ void GLGizmoPathCut::perform_cut()
     st->mode     = m_mode;
     st->kerf     = m_kerf;
     st->margin   = m_margin;
+    st->extend   = m_limit_ends ? double(m_extend) : -1.;
+    st->depth    = m_limit_depth ? double(m_depth) : -1.;
 
     m_busy             = true;
     m_message          = _u8L("Cutting, please wait...");
@@ -448,12 +593,12 @@ void GLGizmoPathCut::perform_cut()
         PathCut::ViewCutter            vc;
         PathCut::LoopCutter            lc;
         if (st->mode == Mode::ViewPath) {
-            vc = PathCut::make_view_cutter(st->pts, st->view_dir, mn, mx, st->kerf);
+            vc = PathCut::make_view_cutter(st->pts, st->view_dir, mn, mx, st->kerf, st->extend, st->depth);
             if (!vc.valid()) {
                 st->error = vc.error;
                 return;
             }
-            res  = PathCut::cut_with_slab(std::move(st->src), vc, false, 0.5, canceled);
+            res  = PathCut::cut_with_slab(std::move(st->src), vc, vc.limited(), 0.5, canceled);
             side = [&vc](const PathCut::V3 &p) { return vc.side(p); };
         } else {
             AABBMesh aabb(st->src);
@@ -484,7 +629,10 @@ void GLGizmoPathCut::perform_cut()
             return;
         }
         ctl.update_status(80, status);
-        st->grouped = PathCut::group_components(its_split(res.mesh), side, st->mode == Mode::Loop);
+        bool joined = false;
+        st->grouped = PathCut::group_cut(res, side, st->mode == Mode::Loop, &joined);
+        if (joined)
+            st->error = "The cut did not separate the object: the two sides are still connected somewhere. Check the preview of the cut.";
         lap("grouping");
         ctl.update_status(100, status);
     };

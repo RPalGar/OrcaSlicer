@@ -170,8 +170,17 @@ struct ViewCutter
     std::vector<double> arc;       // arc length at each path point
     std::vector<V2>     left_side; // polygon covering everything left of the path
     double              kerf{0.};
+    // Optional limits: the wall stops `extend` mm past the first and last picked points, and spans
+    // only heights [h_min, h_max] along the view direction (from just in front of the picked points).
+    bool                limit_ends{false}, limit_depth{false};
+    double              h_min{0.}, h_max{0.};
     std::string         error;
     bool valid() const { return error.empty() && path.size() >= 2; }
+    bool limited() const { return limit_ends || limit_depth; }
+    const char *rim_error() const
+    {
+        return "The cut ends inside the object. Increase the depth or the path extension, or start and end the path beyond the part.";
+    }
 
     // +1 left of the path, -1 right of it.
     int side(const V3 &p) const { return point_in_polygon(left_side, frame.to2d(p)) ? 1 : -1; }
@@ -227,6 +236,21 @@ struct ViewCutter
                 if (cell_segs[size_t(y) * nx + x].empty())
                     cell_side[size_t(y) * nx + x] = point_in_polygon(left_side, grid_min + V2((x + 0.5) * cell, (y + 0.5) * cell)) ? 1 : -1;
     }
+    // Nearest path segment among those listed in the grid cell of q; false when none is near.
+    bool nearest_in_grid(const V2 &q, size_t &seg, double &t, double &d) const
+    {
+        const int x = int(std::floor((q.x() - grid_min.x()) / cell)), y = int(std::floor((q.y() - grid_min.y()) / cell));
+        if (x < 0 || y < 0 || x >= nx || y >= ny) return false;
+        d = std::numeric_limits<double>::max();
+        for (int i : cell_segs[size_t(y) * nx + x]) {
+            const V2     ab = path[i + 1] - path[i];
+            const double l2 = ab.squaredNorm();
+            const double tt = l2 > 0. ? std::clamp((q - path[i]).dot(ab) / l2, 0., 1.) : 0.;
+            const double dd = (q - (path[i] + ab * tt)).norm();
+            if (dd < d) { d = dd; seg = size_t(i); t = tt; }
+        }
+        return d < std::numeric_limits<double>::max();
+    }
     // Signed distance across the wall: positive on the left of the path.
     double field(const V3 &p) const
     {
@@ -258,7 +282,26 @@ struct ViewCutter
         const V2 foot = path[bs] + (path[bs + 1] - path[bs]) * bt;
         return (q - foot).dot(n) >= 0. ? best : -best;
     }
-    double outside(const V3 &) const { return -1.; } // the wall has no rim
+    // How far a point lies outside the limited wall (negative inside it, always inside when unlimited).
+    double outside(const V3 &p) const
+    {
+        double o = -1.;
+        if (limit_depth) {
+            const double h = frame.height(p);
+            o = std::max(o, std::max(h_min - h, h - h_max));
+        }
+        if (limit_ends) {
+            const V2 q = frame.to2d(p);
+            size_t   seg = 0; double t = 0., d = 0.;
+            // Far from the path the grid knows nothing: those points need the exact nearest segment, as
+            // the side polygon (and so the field's sign) still flips along the lines through the ends.
+            if (!nearest_in_grid(q, seg, t, d))
+                nearest(q, seg, t, d);
+            if (seg == 0 && t <= 0.) o = std::max(o, (q - path.front()).dot((path[0] - path[1]).normalized()));
+            if (seg + 2 == path.size() && t >= 1.) o = std::max(o, (q - path.back()).dot((path.back() - path[path.size() - 2]).normalized()));
+        }
+        return o;
+    }
     // Chart lines where the wall bends; between two of them it is planar.
     // Only the bends that matter: Douglas-Peucker on the path with tolerance `tol`.
     std::vector<std::pair<V2, V2>> kinks(int, double tol) const
@@ -317,7 +360,10 @@ struct ViewCutter
 
 // points: picked points in the same coordinate system as the mesh to be cut.
 // bb_min/bb_max: bounding box of that mesh. kerf: wall thickness = clearance between parts.
-inline ViewCutter make_view_cutter(const std::vector<V3> &points, const V3 &view_dir, const V3 &bb_min, const V3 &bb_max, double kerf)
+// extend: how far the wall reaches past the first and last points [mm], < 0 = through the whole object.
+// depth:  how deep the wall reaches behind the picked points along the view direction [mm], <= 0 = through.
+inline ViewCutter make_view_cutter(const std::vector<V3> &points, const V3 &view_dir, const V3 &bb_min, const V3 &bb_max, double kerf,
+                                   double extend = -1., double depth = -1.)
 {
     ViewCutter vc;
     vc.kerf           = kerf;
@@ -335,10 +381,12 @@ inline ViewCutter make_view_cutter(const std::vector<V3> &points, const V3 &view
     if (q.size() >= 3)
         q = remove_close_points(catmull_rom(q, false, 16), 1e-4, false);
 
-    // Extend both ends well outside the object so the wall cuts through it completely.
+    // Extend both ends: well outside the object unless limited.
     const V2 t0 = (q[0] - q[1]).normalized(), t1 = (q.back() - q[q.size() - 2]).normalized();
-    q.insert(q.begin(), q.front() + t0 * diag);
-    q.push_back(q.back() + t1 * diag);
+    vc.limit_ends    = extend >= 0.;
+    const double ext = vc.limit_ends ? std::max(extend, 1e-3) : diag;
+    q.insert(q.begin(), q.front() + t0 * ext);
+    q.push_back(q.back() + t1 * ext);
     vc.path = q;
 
     const V2 chord = q.back() - q.front();
@@ -346,10 +394,21 @@ inline ViewCutter make_view_cutter(const std::vector<V3> &points, const V3 &view
         vc.error = "The path must not end where it starts. Use the loop mode for closed paths.";
         return vc;
     }
+    // Side polygon from the path extended through everything, so side() covers the whole object.
     const V2 perp = V2(-chord.y(), chord.x()).normalized();
     vc.left_side  = q;
-    vc.left_side.push_back(q.back() + perp * 3. * diag);
-    vc.left_side.push_back(q.front() + perp * 3. * diag);
+    vc.left_side.front() = q.front() + t0 * diag;
+    vc.left_side.back()  = q.back() + t1 * diag;
+    vc.left_side.push_back(vc.left_side.back() + perp * 3. * diag);
+    vc.left_side.push_back(vc.left_side.front() + perp * 3. * diag);
+
+    vc.limit_depth = depth > 0.;
+    if (vc.limit_depth) {
+        double front = std::numeric_limits<double>::max();
+        for (const V3 &p : points) front = std::min(front, vc.frame.height(p));
+        vc.h_min = front - diag; // only the far end is limited
+        vc.h_max = front + depth;
+    }
 
     vc.arc.assign(q.size(), 0.);
     for (size_t i = 1; i < q.size(); ++i)
@@ -378,6 +437,11 @@ struct LoopCutter
     std::vector<V3>     loop;   // dense loop (for display)
     std::string         error;
     bool valid() const { return error.empty() && angles.size() >= 3; }
+    bool limited() const { return true; }
+    const char *rim_error() const
+    {
+        return "The loop does not go all the way around the part. Place the points around it, or lower the cap margin.";
+    }
 
     // Interpolate the per-spoke data at an angle.
     void spoke_at(double ang, double &r, double &h) const
@@ -849,6 +913,7 @@ struct CutResult
     std::string          error;
     size_t               cap_triangles{0};
     size_t               first_cap{0};  // index of the first cap triangle in mesh.indices
+    std::vector<signed char> level;     // per vertex: +1 / -1 on the cut face of that side, 0 elsewhere
 };
 
 // Removes the slab |field| < kerf / 2 from a closed mesh and closes the openings.
@@ -1038,7 +1103,7 @@ CutResult cut_with_slab(indexed_triangle_set its, const Cutter &cutter, bool bou
             for (int e = 0; e < 3; ++e)
                 for (auto *m : {&cross[0], &cross[1], &removed})
                     if (m->count(edge_key(t[e], t[(e + 1) % 3]))) {
-                        res.error = "The loop does not go all the way around the part. Place the points around it, or lower the cap margin.";
+                        res.error = cutter.rim_error();
                         return res;
                     }
         }
@@ -1295,6 +1360,9 @@ CutResult cut_with_slab(indexed_triangle_set its, const Cutter &cutter, bool bou
                 if (cap.size() > 2000000) break;
             }
             res.cap_triangles += cap.size();
+            res.level.resize(its.vertices.size(), 0);
+            for (const auto &t : cap)
+                for (int k = 0; k < 3; ++k) res.level[size_t(t[k])] = static_cast<signed char>(level);
             its.indices.insert(its.indices.end(), cap.begin(), cap.end());
         }
         if (stop()) return {};
@@ -1314,6 +1382,9 @@ CutResult cut_with_slab(indexed_triangle_set its, const Cutter &cutter, bool bou
         its.indices[ti] = {chain[0], chain[1], o};
         for (size_t j = 1; j + 1 < chain.size(); ++j) its.indices.emplace_back(chain[j], chain[j + 1], o);
     }
+    res.level.resize(its.vertices.size(), 0);
+    for (int li = 0; li < 2; ++li)
+        for (const auto &kv : cross[li]) res.level[size_t(kv.second)] = static_cast<signed char>(li == 0 ? 1 : -1);
     res.mesh = std::move(its);
     return res;
 }
@@ -1330,6 +1401,66 @@ inline void its_append(indexed_triangle_set &dst, const indexed_triangle_set &sr
     const int off = int(dst.vertices.size());
     dst.vertices.insert(dst.vertices.end(), src.vertices.begin(), src.vertices.end());
     for (auto f : src.indices) dst.indices.emplace_back(f[0] + off, f[1] + off, f[2] + off);
+}
+
+// Splits a cut result into its connected parts and assigns each to a side by the cut face it carries
+// (exact, unlike sampling). Parts without a cut face are assigned by side_of (+1 / -1 / 0 majority
+// vote) or, with `untouched_follow_inside`, follow a side-a part they lie inside. `joined` is set when
+// a part carries both cut faces, i.e. the cut did not separate it.
+template<class SideOf>
+Grouped group_cut(const CutResult &cut, SideOf side_of, bool untouched_follow_inside, bool *joined = nullptr)
+{
+    const indexed_triangle_set &its = cut.mesh;
+    std::vector<int>            dsu(its.vertices.size());
+    for (size_t i = 0; i < dsu.size(); ++i) dsu[i] = int(i);
+    auto find = [&dsu](int x) { while (dsu[x] != x) x = dsu[x] = dsu[dsu[x]]; return x; };
+    for (const auto &t : its.indices) { dsu[find(t[0])] = find(t[1]); dsu[find(t[1])] = find(t[2]); }
+    std::unordered_map<int, size_t>   comp_of_root;
+    std::vector<indexed_triangle_set> parts;
+    std::vector<int>                  label;
+    std::vector<int>                  remap(its.vertices.size(), -1);
+    if (joined) *joined = false;
+    for (const auto &t : its.indices) {
+        auto [it, ins] = comp_of_root.emplace(find(t[0]), parts.size());
+        if (ins) { parts.emplace_back(); label.push_back(0); }
+        const size_t c = it->second;
+        stl_triangle_vertex_indices nt;
+        for (int k = 0; k < 3; ++k) {
+            int &m = remap[size_t(t[k])];
+            if (m < 0) { m = int(parts[c].vertices.size()); parts[c].vertices.push_back(its.vertices[size_t(t[k])]); }
+            nt[k] = m;
+            const int lv = size_t(t[k]) < cut.level.size() ? cut.level[size_t(t[k])] : 0;
+            if (lv != 0) {
+                if (label[c] != 0 && label[c] != lv && joined) *joined = true;
+                if (label[c] == 0) label[c] = lv;
+            }
+        }
+        parts[c].indices.push_back(nt);
+    }
+    for (size_t i = 0; i < parts.size(); ++i) {
+        if (label[i] != 0) continue;
+        if (untouched_follow_inside) {
+            const auto  &vs   = parts[i].vertices;
+            const size_t step = std::max<size_t>(1, vs.size() / 64);
+            for (size_t j = 0; j < parts.size() && label[i] == 0; ++j)
+                if (label[j] == 1)
+                    for (size_t k = 0; k < vs.size(); k += step)
+                        if (point_inside(parts[j], V3(vs[k].cast<double>()))) { label[i] = 1; break; }
+        } else {
+            const auto  &vs   = parts[i].vertices;
+            const size_t step = std::max<size_t>(1, vs.size() / 4000);
+            long         vote = 0;
+            for (size_t k = 0; k < vs.size(); k += step) vote += side_of(V3(vs[k].cast<double>()));
+            label[i] = vote > 0 ? 1 : -1;
+        }
+    }
+    Grouped g;
+    for (size_t i = 0; i < parts.size(); ++i) {
+        if (std::abs(signed_volume(parts[i])) < 1.) ++g.n_small;
+        if (label[i] == 1) { its_append(g.side_a, parts[i]); ++g.n_a; }
+        else               { its_append(g.side_b, parts[i]); ++g.n_b; }
+    }
+    return g;
 }
 
 // side_of(V3) -> +1 / -1 / 0. Components get the majority vote of their vertices (0 = no vote).

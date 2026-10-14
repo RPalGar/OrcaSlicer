@@ -67,6 +67,35 @@ TEST_CASE("A wavy path picked from the front splits a cube into two closed parts
     CHECK(total > 8000. - kerf * 20. * 40.);
 }
 
+TEST_CASE("A view path limited in depth cuts the front box and leaves the one behind it whole", "[PathCut]")
+{
+    // Looking along +Y: a front box (y 0..10) and a back box (y 20..30).
+    indexed_triangle_set boxes = its_make_cube(20., 10., 20.), back = its_make_cube(20., 10., 20.);
+    its_translate(back, Vec3f(0.f, 20.f, 0.f));
+    its_merge(boxes, back);
+    const std::vector<PathCut::V3> pts{{2., 0., 10.}, {10., 0., 12.}, {18., 0., 9.}};
+
+    SECTION("depth 15 mm stops in the gap")
+    {
+        const PathCut::ViewCutter vc = PathCut::make_view_cutter(pts, PathCut::V3::UnitY(), PathCut::V3::Zero(), PathCut::V3(20., 30., 20.), 0.2, -1., 15.);
+        REQUIRE(vc.limited());
+        const PathCut::CutResult res = PathCut::cut_with_slab(boxes, vc, vc.limited());
+        REQUIRE(res.error.empty());
+        const auto parts = its_split(res.mesh);
+        CHECK(parts.size() == 3);
+        require_closed_parts(parts);
+        bool joined = true;
+        const PathCut::Grouped g = PathCut::group_cut(res, [&vc](const PathCut::V3 &p) { return vc.side(p); }, false, &joined);
+        CHECK_FALSE(joined);
+        CHECK(g.n_a + g.n_b == 3);
+    }
+    SECTION("depth 25 mm ends inside the back box and is reported")
+    {
+        const PathCut::ViewCutter vc = PathCut::make_view_cutter(pts, PathCut::V3::UnitY(), PathCut::V3::Zero(), PathCut::V3(20., 30., 20.), 0.2, -1., 25.);
+        CHECK_FALSE(PathCut::cut_with_slab(boxes, vc, vc.limited()).error.empty());
+    }
+}
+
 TEST_CASE("A tilted loop around a cylinder detaches its end", "[PathCut]")
 {
     // Cylinder r = 5, h = 30, loop around it tilted between z = 13 and z = 17.
