@@ -1479,7 +1479,8 @@ Grouped group_cut(const CutResult &cut, SideOf side_of, bool untouched_follow_in
 // Where a cut that did not separate the object is still connected: shortest routes over the surface
 // from the +1 cut face to the -1 cut face. After each route, the surface within `block` mm of it is
 // excluded so the next route shows another connection. Returns up to `max_routes` polylines.
-inline std::vector<std::vector<V3>> joined_routes(const CutResult &cut, int max_routes = 3, double block = -1.)
+inline std::vector<std::vector<V3>> joined_routes(const CutResult &cut, int max_routes = 3, double block = -1.,
+                                                  const std::function<bool()> &canceled = {})
 {
     const indexed_triangle_set &its = cut.mesh;
     const size_t                nv  = its.vertices.size();
@@ -1497,7 +1498,7 @@ inline std::vector<std::vector<V3>> joined_routes(const CutResult &cut, int max_
     auto pos = [&its](int v) { return V3(its.vertices[size_t(v)].cast<double>()); };
     std::vector<char>             blocked(nv, 0);
     std::vector<std::vector<V3>>  routes;
-    for (int r = 0; r < max_routes; ++r) {
+    for (int r = 0; r < max_routes && !(canceled && canceled()); ++r) {
         std::vector<double> dist(nv, std::numeric_limits<double>::max());
         std::vector<int>    prev(nv, -1);
         using Item = std::pair<double, int>;

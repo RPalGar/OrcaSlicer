@@ -50,7 +50,7 @@ private:
     Vec3d              sweep_dir() const;
     PathCut::ViewLimits view_limits() const;
     void               add_point(const Vec3d &hit);
-    void               apply_cut(const std::shared_ptr<PathCutJob> &job);
+    void               apply_cut(std::shared_ptr<PathCutJob> job); // by value: callers pass m_pending
     void               clear_pending();
     void               rebuild_cutter_preview();
 

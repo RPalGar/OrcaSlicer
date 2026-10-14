@@ -430,6 +430,11 @@ void GLGizmoPathCut::on_render_input_window(float x, float y, float bottom_limit
         m_busy = false;
         m_message.clear();
     }
+    // A pending cut was computed with the old settings: drop it when they change.
+    auto settings_changed = [this]() {
+        clear_pending();
+        m_preview_dirty = true;
+    };
     const float scale = m_parent.get_scale();
     ImGuiWrapper::push_toolbar_style(scale);
     GizmoImguiSetNextWIndowPos(x, y, ImGuiCond_Always, 0.0f, 0.0f);
@@ -465,14 +470,14 @@ void GLGizmoPathCut::on_render_input_window(float x, float y, float bottom_limit
     ImGui::SameLine(input_w * 1.6f);
     ImGui::PushItemWidth(input_w);
     if (ImGui::InputFloat("##pathcut_kerf", &m_kerf, 0.05f, 0.1f, "%.2f"))
-        m_preview_dirty = true;
+        settings_changed();
     m_kerf = std::clamp(m_kerf, 0.02f, 2.f);
     if (m_mode == Mode::Loop) {
         ImGui::AlignTextToFramePadding();
         m_imgui->text(_u8L("Min. cap margin (mm)"));
         ImGui::SameLine(input_w * 1.6f);
         if (ImGui::InputFloat("##pathcut_margin", &m_margin, 0.1f, 0.5f, "%.1f"))
-            m_preview_dirty = true;
+            settings_changed();
         m_margin = std::clamp(m_margin, 0.2f, 10.f);
     } else {
         // Direction the path is swept along: as seen when placing the first point, forced level with the
@@ -492,7 +497,7 @@ void GLGizmoPathCut::on_render_input_window(float x, float y, float bottom_limit
                         m_tilt = float(std::asin(std::clamp(-d.z(), -1., 1.)) * 180. / PI);
                     }
                     m_sweep         = Sweep(i);
-                    m_preview_dirty = true;
+                    settings_changed();
                 }
             ImGui::EndCombo();
         }
@@ -502,23 +507,23 @@ void GLGizmoPathCut::on_render_input_window(float x, float y, float bottom_limit
             m_imgui->text(_u8L("Turn (deg)"));
             ImGui::SameLine(input_w * 1.6f);
             if (ImGui::InputFloat("##pathcut_turn", &m_turn, 1.f, 15.f, "%.0f"))
-                m_preview_dirty = true;
+                settings_changed();
             m_turn = std::fmod(m_turn + 540.f, 360.f) - 180.f;
             ImGui::AlignTextToFramePadding();
             m_imgui->text(_u8L("Tilt (deg)"));
             ImGui::SameLine(input_w * 1.6f);
             if (ImGui::InputFloat("##pathcut_tilt", &m_tilt, 1.f, 15.f, "%.0f"))
-                m_preview_dirty = true;
+                settings_changed();
             m_tilt = std::clamp(m_tilt, -90.f, 90.f);
         }
         // How far the wall reaches: through everything unless limited, each side on its own.
         auto limit_row = [&](const wxString &label, Limit &lim, const char *id) {
             if (m_imgui->bbl_checkbox(label, lim.on))
-                m_preview_dirty = true;
+                settings_changed();
             if (lim.on) {
                 ImGui::SameLine(input_w * 2.6f);
                 if (ImGui::InputFloat(id, &lim.mm, 0.5f, 5.f, "%.1f"))
-                    m_preview_dirty = true;
+                    settings_changed();
                 lim.mm = std::clamp(lim.mm, 0.f, 1000.f);
             }
         };
@@ -538,7 +543,7 @@ void GLGizmoPathCut::on_render_input_window(float x, float y, float bottom_limit
     if (m_imgui->button(_L("Undo point"), ImVec2(0, 0), !m_points.empty() && !m_busy)) {
         clear_pending();
         m_points.pop_back();
-        m_preview_dirty = true;
+        settings_changed();
     }
     ImGui::SameLine();
     if (m_imgui->button(_L("Clear"), ImVec2(0, 0), !m_points.empty() && !m_busy))
@@ -784,7 +789,7 @@ void GLGizmoPathCut::perform_cut()
         ctl.update_status(80, status);
         st->grouped = PathCut::group_cut(res, side, st->mode == GLGizmoPathCut::Mode::Loop, &st->joined);
         if (st->joined) {
-            st->routes = PathCut::joined_routes(res);
+            st->routes = PathCut::joined_routes(res, 3, -1., canceled);
             lap("connection routes");
         }
         lap("grouping");
@@ -823,6 +828,13 @@ void GLGizmoPathCut::perform_cut()
             return;
         }
         if (st->joined) {
+            if (!st->object_unchanged()) {
+                m_message          = _u8L("The object was changed while it was being cut. Cut it again.");
+                m_message_is_error = true;
+                reset_path();
+                m_parent.set_as_dirty();
+                return;
+            }
             // Show where it is still connected and let the user decide.
             m_pending = st;
             for (const auto &route : st->routes) {
@@ -842,7 +854,7 @@ void GLGizmoPathCut::perform_cut()
     queue_job(plater->get_ui_job_worker(), std::move(process), std::move(finalize));
 }
 
-void GLGizmoPathCut::apply_cut(const std::shared_ptr<PathCutJob> &st)
+void GLGizmoPathCut::apply_cut(std::shared_ptr<PathCutJob> st)
 {
     clear_pending();
     if (!st->object_unchanged()) {
