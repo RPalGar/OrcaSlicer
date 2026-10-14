@@ -75,9 +75,11 @@ TEST_CASE("A view path limited in depth cuts the front box and leaves the one be
     its_merge(boxes, back);
     const std::vector<PathCut::V3> pts{{2., 0., 10.}, {10., 0., 12.}, {18., 0., 9.}};
 
-    SECTION("depth 15 mm stops in the gap")
+    SECTION("15 mm behind the points stops in the gap")
     {
-        const PathCut::ViewCutter vc = PathCut::make_view_cutter(pts, PathCut::V3::UnitY(), PathCut::V3::Zero(), PathCut::V3(20., 30., 20.), 0.2, -1., 15.);
+        PathCut::ViewLimits lim;
+        lim.back = 15.;
+        const PathCut::ViewCutter vc = PathCut::make_view_cutter(pts, PathCut::V3::UnitY(), PathCut::V3::Zero(), PathCut::V3(20., 30., 20.), 0.2, lim);
         REQUIRE(vc.limited());
         const PathCut::CutResult res = PathCut::cut_with_slab(boxes, vc, vc.limited());
         REQUIRE(res.error.empty());
@@ -89,9 +91,11 @@ TEST_CASE("A view path limited in depth cuts the front box and leaves the one be
         CHECK_FALSE(joined);
         CHECK(g.n_a + g.n_b == 3);
     }
-    SECTION("depth 25 mm ends inside the back box and is reported")
+    SECTION("25 mm behind the points ends inside the back box and is reported")
     {
-        const PathCut::ViewCutter vc = PathCut::make_view_cutter(pts, PathCut::V3::UnitY(), PathCut::V3::Zero(), PathCut::V3(20., 30., 20.), 0.2, -1., 25.);
+        PathCut::ViewLimits lim;
+        lim.back = 25.;
+        const PathCut::ViewCutter vc = PathCut::make_view_cutter(pts, PathCut::V3::UnitY(), PathCut::V3::Zero(), PathCut::V3(20., 30., 20.), 0.2, lim);
         CHECK_FALSE(PathCut::cut_with_slab(boxes, vc, vc.limited()).error.empty());
     }
 }

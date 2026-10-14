@@ -60,8 +60,7 @@ static const ColorRGBA POINT_COLOR = {1.f, 0.55f, 0.f, 1.f};
     L("The cap spanning the loop runs into another part of the model. Place the loop where the part is free all around."),
     L("The object was changed while it was being cut. Cut it again."),
     L("The cut failed. Try a simpler path or a lower resolution model."),
-    L("The cut ends inside the object. Increase the depth or the path extension, or start and end the path beyond the part."),
-    L("The cut did not separate the object: the two sides are still connected somewhere. Check the preview of the cut."),
+    L("The cut ends inside the object. Increase or remove the limits, or start and end the path beyond the part."),
 };
 
 GLGizmoPathCut::GLGizmoPathCut(GLCanvas3D &parent, const std::string &icon_filename, unsigned int sprite_id)
@@ -97,6 +96,7 @@ void GLGizmoPathCut::on_set_state()
 
 void GLGizmoPathCut::reset_path()
 {
+    clear_pending();
     m_points.clear();
     m_object        = nullptr;
     m_preview_dirty = true;
@@ -142,6 +142,7 @@ void GLGizmoPathCut::add_point(const Vec3d &hit)
     }
     if (m_points.empty())
         m_view_dir = wxGetApp().plater()->get_camera().get_dir_forward();
+    clear_pending();
     m_points.push_back(hit);
     m_message.clear();
     m_preview_dirty = true;
@@ -201,6 +202,7 @@ bool GLGizmoPathCut::on_mouse(const wxMouseEvent &mouse_event)
         return true;
     }
     if (mouse_event.RightDown() && !m_points.empty()) {
+        clear_pending();
         m_points.pop_back();
         m_preview_dirty = true;
         m_parent.set_as_dirty();
@@ -229,6 +231,10 @@ Vec3d GLGizmoPathCut::sweep_dir() const
         return d.norm() > 1e-6 ? Vec3d(d.normalized()) : Vec3d(Vec3d::UnitY());
     }
     case Sweep::Vertical: return m_view_dir.z() > 0. ? Vec3d(Vec3d::UnitZ()) : Vec3d(-Vec3d::UnitZ());
+    case Sweep::Custom: {
+        const double turn = m_turn * PI / 180., tilt = m_tilt * PI / 180.;
+        return Vec3d(std::cos(tilt) * std::cos(turn), std::cos(tilt) * std::sin(turn), -std::sin(tilt));
+    }
     default: return m_view_dir;
     }
 }
@@ -249,7 +255,31 @@ void GLGizmoPathCut::rebuild_preview()
     if (!m_sphere.is_initialized())
         m_sphere.init_from(smooth_sphere(16, 1.f));
     rebuild_cutter_preview();
+    m_routes_model.reset();
+    if (!m_routes.empty()) {
+        GLModel::Geometry g;
+        g.format = {GLModel::Geometry::EPrimitiveType::Lines, GLModel::Geometry::EVertexLayout::P3};
+        for (const auto &route : m_routes)
+            for (size_t i = 0; i + 1 < route.size(); ++i) {
+                const unsigned base = unsigned(g.vertices_count());
+                g.add_vertex(Vec3f(route[i].cast<float>()));
+                g.add_vertex(Vec3f(route[i + 1].cast<float>()));
+                g.add_line(base, base + 1);
+            }
+        if (g.vertices_count() > 0)
+            m_routes_model.init_from(std::move(g));
+    }
     m_preview_dirty = false;
+}
+
+PathCut::ViewLimits GLGizmoPathCut::view_limits() const
+{
+    PathCut::ViewLimits l;
+    l.front = m_lim_front.on ? m_lim_front.mm : -1.;
+    l.back  = m_lim_back.on ? m_lim_back.mm : -1.;
+    l.start = m_lim_start.on ? m_lim_start.mm : -1.;
+    l.end   = m_lim_end.on ? m_lim_end.mm : -1.;
+    return l;
 }
 
 // Translucent preview of what will cut: the wall swept from the view path, or the cap spanning the loop
@@ -264,8 +294,7 @@ void GLGizmoPathCut::rebuild_cutter_preview()
     GLModel::Geometry g;
     g.format = {GLModel::Geometry::EPrimitiveType::Triangles, GLModel::Geometry::EVertexLayout::P3};
     if (m_mode == Mode::ViewPath && pts.size() >= 2) {
-        const PathCut::ViewCutter vc = PathCut::make_view_cutter(pts, sweep_dir(), bb.min, bb.max, m_kerf, m_limit_ends ? m_extend : -1.,
-                                                                 m_limit_depth ? m_depth : -1.);
+        const PathCut::ViewCutter vc = PathCut::make_view_cutter(pts, sweep_dir(), bb.min, bb.max, m_kerf, view_limits());
         if (!vc.valid())
             return;
         double lo = std::numeric_limits<double>::max(), hi = -lo;
@@ -274,14 +303,16 @@ void GLGizmoPathCut::rebuild_cutter_preview()
             lo = std::min(lo, h);
             hi = std::max(hi, h);
         }
-        if (vc.limit_depth)
+        if (vc.limit_depth) {
+            lo = std::max(lo, vc.h_min);
             hi = std::min(hi, vc.h_max);
+        }
         // Clip the unlimited extensions to a little past the object.
         const double reach = (bb.max - bb.min).norm() * 0.6;
         for (size_t i = 0; i + 1 < vc.path.size(); ++i) {
             PathCut::V2 a = vc.path[i], b = vc.path[i + 1];
-            if (!vc.limit_ends) {
-                const PathCut::V2 c = vc.frame.to2d(bb.center());
+            const PathCut::V2 c = vc.frame.to2d(bb.center());
+            if ((i == 0 && !vc.limit_start) || (i + 2 == vc.path.size() && !vc.limit_end)) {
                 if ((a - c).norm() > reach) a = c + (a - c).normalized() * reach;
                 if ((b - c).norm() > reach) b = c + (b - c).normalized() * reach;
             }
@@ -345,6 +376,18 @@ void GLGizmoPathCut::on_render()
             shader->stop_using();
             glsafe(::glDisable(GL_BLEND));
             glsafe(::glEnable(GL_CULL_FACE));
+        }
+    }
+
+    if (m_routes_model.is_initialized()) {
+        if (GLShaderProgram *shader = wxGetApp().get_shader("flat")) {
+            shader->start_using();
+            shader->set_uniform("view_model_matrix", camera.get_view_matrix());
+            shader->set_uniform("projection_matrix", camera.get_projection_matrix());
+            shader->set_uniform("width", 0.6f);
+            m_routes_model.set_color(ColorRGBA(1.f, 0.15f, 0.15f, 1.f));
+            m_routes_model.render();
+            shader->stop_using();
         }
     }
 
@@ -432,40 +475,57 @@ void GLGizmoPathCut::on_render_input_window(float x, float y, float bottom_limit
             m_preview_dirty = true;
         m_margin = std::clamp(m_margin, 0.2f, 10.f);
     } else {
-        // Direction the path is swept along: as seen when placing the first point, or forced level with
-        // the bed (a cut parallel to the bed for a path drawn from the front) or vertical.
+        // Direction the path is swept along: as seen when placing the first point, forced level with the
+        // bed (a cut parallel to the bed for a path drawn from the front), vertical, or set by hand.
         ImGui::AlignTextToFramePadding();
         m_imgui->text(_u8L("Cut direction"));
         ImGui::SameLine(input_w * 1.6f);
-        const std::vector<std::string> sweeps{_u8L("From the view"), _u8L("Level with the bed"), _u8L("Vertical")};
-        int sweep = int(m_sweep);
+        const std::vector<std::string> sweeps{_u8L("From the view"), _u8L("Level with the bed"), _u8L("Vertical"), _u8L("Custom")};
+        const int sweep = int(m_sweep);
         ImGui::PushItemWidth(input_w * 2.2f);
         if (ImGui::BeginCombo("##pathcut_sweep", sweeps[size_t(sweep)].c_str())) {
             for (int i = 0; i < int(sweeps.size()); ++i)
-                if (ImGui::Selectable(sweeps[size_t(i)].c_str(), i == sweep)) {
+                if (ImGui::Selectable(sweeps[size_t(i)].c_str(), i == sweep) && i != sweep) {
+                    if (Sweep(i) == Sweep::Custom) { // start from the current direction
+                        const Vec3d d = sweep_dir();
+                        m_turn = float(std::atan2(d.y(), d.x()) * 180. / PI);
+                        m_tilt = float(std::asin(std::clamp(-d.z(), -1., 1.)) * 180. / PI);
+                    }
                     m_sweep         = Sweep(i);
                     m_preview_dirty = true;
                 }
             ImGui::EndCombo();
         }
         ImGui::PopItemWidth();
-        // How far the wall reaches: through everything by default, or limited in depth and length.
-        if (m_imgui->bbl_checkbox(_L("Limit depth (mm)"), m_limit_depth))
-            m_preview_dirty = true;
-        if (m_limit_depth) {
+        if (m_sweep == Sweep::Custom) {
+            ImGui::AlignTextToFramePadding();
+            m_imgui->text(_u8L("Turn (deg)"));
             ImGui::SameLine(input_w * 1.6f);
-            if (ImGui::InputFloat("##pathcut_depth", &m_depth, 1.f, 5.f, "%.1f"))
+            if (ImGui::InputFloat("##pathcut_turn", &m_turn, 1.f, 15.f, "%.0f"))
                 m_preview_dirty = true;
-            m_depth = std::clamp(m_depth, 1.f, 1000.f);
-        }
-        if (m_imgui->bbl_checkbox(_L("Limit past the ends (mm)"), m_limit_ends))
-            m_preview_dirty = true;
-        if (m_limit_ends) {
+            m_turn = std::fmod(m_turn + 540.f, 360.f) - 180.f;
+            ImGui::AlignTextToFramePadding();
+            m_imgui->text(_u8L("Tilt (deg)"));
             ImGui::SameLine(input_w * 1.6f);
-            if (ImGui::InputFloat("##pathcut_extend", &m_extend, 0.5f, 2.f, "%.1f"))
+            if (ImGui::InputFloat("##pathcut_tilt", &m_tilt, 1.f, 15.f, "%.0f"))
                 m_preview_dirty = true;
-            m_extend = std::clamp(m_extend, 0.f, 500.f);
+            m_tilt = std::clamp(m_tilt, -90.f, 90.f);
         }
+        // How far the wall reaches: through everything unless limited, each side on its own.
+        auto limit_row = [&](const wxString &label, Limit &lim, const char *id) {
+            if (m_imgui->bbl_checkbox(label, lim.on))
+                m_preview_dirty = true;
+            if (lim.on) {
+                ImGui::SameLine(input_w * 2.6f);
+                if (ImGui::InputFloat(id, &lim.mm, 0.5f, 5.f, "%.1f"))
+                    m_preview_dirty = true;
+                lim.mm = std::clamp(lim.mm, 0.f, 1000.f);
+            }
+        };
+        limit_row(_L("Limit in front (mm)"), m_lim_front, "##pathcut_front");
+        limit_row(_L("Limit behind (mm)"), m_lim_back, "##pathcut_back");
+        limit_row(_L("Limit past the first point (mm)"), m_lim_start, "##pathcut_start");
+        limit_row(_L("Limit past the last point (mm)"), m_lim_end, "##pathcut_end");
     }
     ImGui::PopItemWidth();
     m_imgui->disabled_end();
@@ -476,6 +536,7 @@ void GLGizmoPathCut::on_render_input_window(float x, float y, float bottom_limit
     // inside the disabled block above)
     const size_t min_pts = m_mode == Mode::Loop ? 3 : 2;
     if (m_imgui->button(_L("Undo point"), ImVec2(0, 0), !m_points.empty() && !m_busy)) {
+        clear_pending();
         m_points.pop_back();
         m_preview_dirty = true;
     }
@@ -491,6 +552,10 @@ void GLGizmoPathCut::on_render_input_window(float x, float y, float bottom_limit
             wxGetApp().plater()->get_ui_job_worker().cancel();
     }
 
+    if (m_pending && !m_busy) {
+        if (m_imgui->button(_L("Apply this cut anyway")))
+            wxGetApp().CallAfter([this]() { if (m_pending) apply_cut(m_pending); });
+    }
     if (!m_message.empty()) {
         ImGui::PushTextWrapPos(ImGui::GetFontSize() * 26.f);
         if (m_message_is_error)
@@ -557,10 +622,56 @@ static void place_piece(ModelObject &piece, const BoundingBoxf3 &rest, const Mod
     piece.invalidate_bounding_box();
 }
 
+// A cut in flight: what it was computed from (to apply it, and to detect edits made meanwhile) and
+// what came out.
+struct PathCutJob
+{
+    // input
+    indexed_triangle_set     src;
+    std::vector<PathCut::V3> pts;
+    Vec3d                    view_dir;
+    GLGizmoPathCut::Mode     mode;
+    float                    kerf, margin;
+    PathCut::ViewLimits      limits;
+    // the object
+    int          obj_idx{-1}, inst_idx{-1};
+    ModelObject *mo{nullptr};
+    Vec3d        offset{Vec3d::Zero()};
+    Transform3d  inst_matrix;
+    struct VolumeState { size_t id; Transform3d matrix; std::shared_ptr<const TriangleMesh> mesh; };
+    std::vector<VolumeState> volumes_before; // meshes held so their addresses cannot be reused
+    // output
+    PathCut::Grouped                          grouped;
+    bool                                      joined{false}; // the sides still touch elsewhere
+    std::vector<std::vector<PathCut::V3>>     routes;        // ... along these, object coordinates
+    std::string                               error;
+
+    bool object_unchanged() const
+    {
+        const Model &model = wxGetApp().plater()->model();
+        if (obj_idx < 0 || obj_idx >= int(model.objects.size()) || model.objects[obj_idx] != mo || inst_idx >= int(mo->instances.size()) ||
+            !mo->instances[inst_idx]->get_matrix().isApprox(inst_matrix) || mo->volumes.size() != volumes_before.size())
+            return false;
+        for (size_t i = 0; i < volumes_before.size(); ++i)
+            if (mo->volumes[i]->id().id != volumes_before[i].id || !mo->volumes[i]->get_matrix().isApprox(volumes_before[i].matrix) ||
+                mo->volumes[i]->get_mesh_shared_ptr() != volumes_before[i].mesh)
+                return false;
+        return true;
+    }
+};
+
+void GLGizmoPathCut::clear_pending()
+{
+    m_pending.reset();
+    m_routes.clear();
+    m_routes_model.reset();
+}
+
 void GLGizmoPathCut::perform_cut()
 {
     if (m_busy)
         return;
+    clear_pending();
     const Selection &selection = m_parent.get_selection();
     const int        obj_idx   = selection.get_object_idx();
     const int        inst_idx  = selection.get_instance_idx();
@@ -575,23 +686,17 @@ void GLGizmoPathCut::perform_cut()
     const ModelInstance *mi = mo->instances[inst_idx];
 
     // Everything the background job needs is copied here; the job never touches the Model.
-    struct State
-    {
-        indexed_triangle_set     src;
-        std::vector<PathCut::V3> pts;
-        Vec3d                    view_dir;
-        Mode                     mode;
-        float                    kerf, margin;
-        double                   extend, depth; // view path limits, < 0 = none
-        bool                     joined{false}; // the cut is made but the sides still touch elsewhere
-        PathCut::Grouped         grouped;
-        std::string              error;
-    };
-    auto st = std::make_shared<State>();
+    auto st      = std::make_shared<PathCutJob>();
+    st->obj_idx  = obj_idx;
+    st->inst_idx = inst_idx;
+    st->mo       = mo;
+    st->offset   = mi->get_offset();
+    st->inst_matrix = mi->get_matrix();
+    for (const ModelVolume *v : mo->volumes)
+        st->volumes_before.push_back({v->id().id, v->get_matrix(), v->get_mesh_shared_ptr()});
 
     // Work in millimetres as printed: bake instance rotation/scale into the mesh, keep the offset.
     const Transform3d inst_no_offset = mi->get_transformation().get_matrix_no_offset();
-    const Vec3d       offset         = mi->get_offset();
     for (const ModelVolume *v : mo->volumes) {
         if (!v->is_model_part())
             continue;
@@ -602,13 +707,12 @@ void GLGizmoPathCut::perform_cut()
     if (st->src.indices.empty())
         return;
     for (const Vec3d &p : m_points)
-        st->pts.emplace_back(p - offset);
+        st->pts.emplace_back(p - st->offset);
     st->view_dir = sweep_dir();
     st->mode     = m_mode;
     st->kerf     = m_kerf;
     st->margin   = m_margin;
-    st->extend   = m_limit_ends ? double(m_extend) : -1.;
-    st->depth    = m_limit_depth ? double(m_depth) : -1.;
+    st->limits   = view_limits();
 
     m_busy             = true;
     m_message          = _u8L("Cutting, please wait...");
@@ -637,12 +741,12 @@ void GLGizmoPathCut::perform_cut()
             mx = mx.cwiseMax(PathCut::V3(v.cast<double>()));
         }
         ctl.update_status(20, status);
-        PathCut::CutResult             res;
+        PathCut::CutResult                      res;
         std::function<int(const PathCut::V3 &)> side;
-        PathCut::ViewCutter            vc;
-        PathCut::LoopCutter            lc;
-        if (st->mode == Mode::ViewPath) {
-            vc = PathCut::make_view_cutter(st->pts, st->view_dir, mn, mx, st->kerf, st->extend, st->depth);
+        PathCut::ViewCutter                     vc;
+        PathCut::LoopCutter                     lc;
+        if (st->mode == GLGizmoPathCut::Mode::ViewPath) {
+            vc = PathCut::make_view_cutter(st->pts, st->view_dir, mn, mx, st->kerf, st->limits);
             if (!vc.valid()) {
                 st->error = vc.error;
                 return;
@@ -678,19 +782,17 @@ void GLGizmoPathCut::perform_cut()
             return;
         }
         ctl.update_status(80, status);
-        st->grouped = PathCut::group_cut(res, side, st->mode == Mode::Loop, &st->joined);
+        st->grouped = PathCut::group_cut(res, side, st->mode == GLGizmoPathCut::Mode::Loop, &st->joined);
+        if (st->joined) {
+            st->routes = PathCut::joined_routes(res);
+            lap("connection routes");
+        }
         lap("grouping");
         ctl.update_status(100, status);
     };
 
     // Back on the UI thread.
-    // What the cut was computed from, to detect edits made while it runs.
-    const Transform3d                             inst_matrix = mi->get_matrix();
-    struct VolumeState { size_t id; Transform3d matrix; std::shared_ptr<const TriangleMesh> mesh; };
-    std::vector<VolumeState> volumes_before; // the mesh is held so its address cannot be reused
-    for (const ModelVolume *v : mo->volumes)
-        volumes_before.push_back({v->id().id, v->get_matrix(), v->get_mesh_shared_ptr()});
-    auto finalize = [this, st, obj_idx, inst_idx, mo, offset, inst_matrix, volumes_before](bool canceled, std::exception_ptr &eptr) {
+    auto finalize = [this, st](bool canceled, std::exception_ptr &eptr) {
         m_busy = false;
         std::string error = st->error;
         if (eptr) {
@@ -720,86 +822,94 @@ void GLGizmoPathCut::perform_cut()
             m_parent.set_as_dirty();
             return;
         }
-
-        // The object may have been deleted or replaced while the job was running.
-        Plater *plater = wxGetApp().plater();
-        if (obj_idx >= int(plater->model().objects.size()) || plater->model().objects[obj_idx] != mo ||
-            inst_idx >= int(mo->instances.size()) || !mo->instances[inst_idx]->get_matrix().isApprox(inst_matrix) ||
-            [&]() {
-                if (mo->volumes.size() != volumes_before.size()) return true;
-                for (size_t i = 0; i < volumes_before.size(); ++i)
-                    if (mo->volumes[i]->id().id != volumes_before[i].id || !mo->volumes[i]->get_matrix().isApprox(volumes_before[i].matrix) ||
-                        mo->volumes[i]->get_mesh_shared_ptr() != volumes_before[i].mesh)
-                        return true;
-                return false;
-            }()) {
-            m_message          = _u8L("The object was changed while it was being cut. Cut it again.");
+        if (st->joined) {
+            // Show where it is still connected and let the user decide.
+            m_pending = st;
+            for (const auto &route : st->routes) {
+                m_routes.emplace_back();
+                for (const PathCut::V3 &p : route) m_routes.back().push_back(p + st->offset);
+            }
+            m_message          = _u8L("The cut does not separate the object: it is still connected along the red lines. Cut there too, "
+                                      "or apply this cut now and cut the connection next.");
             m_message_is_error = true;
-            reset_path();
+            m_preview_dirty    = true;
             m_parent.set_as_dirty();
             return;
         }
-        const ModelVolume *first_part = nullptr;
-        for (const ModelVolume *v : mo->volumes)
-            if (v->is_model_part()) {
-                first_part = v;
-                break;
-            }
-
-        // Detached piece (smaller) first.
-        PathCut::Grouped                   &grouped = st->grouped;
-        std::vector<indexed_triangle_set *> sides{&grouped.side_a, &grouped.side_b};
-        if (std::abs(its_volume(grouped.side_a)) > std::abs(its_volume(grouped.side_b)))
-            std::swap(sides[0], sides[1]);
-        // Still connected elsewhere: apply the cut anyway (one object with the gap) so the remaining
-        // connection can be cut next, and say so.
-        if (sides[0]->indices.empty())
-            sides.erase(sides.begin());
-
-        Model                          tmp;
-        const std::vector<std::string> suffix = sides.size() == 2 ? std::vector<std::string>{_u8L("piece"), _u8L("rest")} :
-                                                                     std::vector<std::string>{_u8L("cut")};
-        for (size_t i = 0; i < sides.size(); ++i) {
-            ModelObject *no = tmp.add_object(*mo);
-            no->clear_volumes();
-            no->clear_instances();
-            no->cut_connectors.clear();
-            no->cut_id.invalidate();
-            no->name        = mo->name + " - " + suffix[i];
-            ModelVolume *nv = no->add_volume(TriangleMesh(std::move(*sides[i])));
-            nv->name        = no->name;
-            if (first_part) {
-                nv->config.apply(first_part->config);
-                nv->set_material_id(first_part->material_id());
-            }
-            ModelInstance *ni = no->add_instance();
-            ni->set_offset(offset);
-            no->invalidate_bounding_box();
-            no->ensure_on_bed();
-        }
-        // Both pieces now rest on the bed; put the detached one in the free spot of the current plate
-        // closest to the rest, so it doesn't overlap the rest or any other object.
-        if (tmp.objects.size() == 2)
-            place_piece(*tmp.objects[0], tmp.objects[1]->instance_bounding_box(0), mo);
-        if (grouped.n_small > 0)
-            BOOST_LOG_TRIVIAL(info) << "PathCut: " << grouped.n_small << " tiny fragments kept with their side";
-
-        m_message.clear();
-        m_parent.reset_all_gizmos();
-        const auto t0 = std::chrono::steady_clock::now();
-        Plater::TakeSnapshot snapshot(plater, _u8L("Cut along path"));
-        plater->apply_cut_object_to_model(size_t(obj_idx), tmp.objects);
-        if (st->joined)
-            plater->get_notification_manager()->push_notification(
-                NotificationType::CustomNotification, NotificationManager::NotificationLevel::WarningNotificationLevel,
-                _u8L("Cut along path: the cut is made, but the two sides still touch elsewhere (an arm resting on the body, a "
-                     "weapon reaching the base...). Cut that connection too to separate them."));
-        BOOST_LOG_TRIVIAL(info) << "PathCut: apply to model "
-                                << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count()
-                                << " ms";
+        apply_cut(st);
     };
 
     queue_job(plater->get_ui_job_worker(), std::move(process), std::move(finalize));
+}
+
+void GLGizmoPathCut::apply_cut(const std::shared_ptr<PathCutJob> &st)
+{
+    clear_pending();
+    if (!st->object_unchanged()) {
+        m_message          = _u8L("The object was changed while it was being cut. Cut it again.");
+        m_message_is_error = true;
+        reset_path();
+        m_parent.set_as_dirty();
+        return;
+    }
+    Plater            *plater     = wxGetApp().plater();
+    ModelObject       *mo         = st->mo;
+    const ModelVolume *first_part = nullptr;
+    for (const ModelVolume *v : mo->volumes)
+        if (v->is_model_part()) {
+            first_part = v;
+            break;
+        }
+
+    // Detached piece (smaller) first. If the sides still touch elsewhere, everything is one object
+    // with the gap, so the remaining connection can be cut next.
+    PathCut::Grouped                   &grouped = st->grouped;
+    std::vector<indexed_triangle_set *> sides{&grouped.side_a, &grouped.side_b};
+    if (std::abs(its_volume(grouped.side_a)) > std::abs(its_volume(grouped.side_b)))
+        std::swap(sides[0], sides[1]);
+    if (sides[0]->indices.empty())
+        sides.erase(sides.begin());
+
+    Model                          tmp;
+    const std::vector<std::string> suffix = sides.size() == 2 ? std::vector<std::string>{_u8L("piece"), _u8L("rest")} :
+                                                                 std::vector<std::string>{_u8L("cut")};
+    for (size_t i = 0; i < sides.size(); ++i) {
+        ModelObject *no = tmp.add_object(*mo);
+        no->clear_volumes();
+        no->clear_instances();
+        no->cut_connectors.clear();
+        no->cut_id.invalidate();
+        no->name        = mo->name + " - " + suffix[i];
+        ModelVolume *nv = no->add_volume(TriangleMesh(std::move(*sides[i])));
+        nv->name        = no->name;
+        if (first_part) {
+            nv->config.apply(first_part->config);
+            nv->set_material_id(first_part->material_id());
+        }
+        ModelInstance *ni = no->add_instance();
+        ni->set_offset(st->offset);
+        no->invalidate_bounding_box();
+        no->ensure_on_bed();
+    }
+    // Both pieces now rest on the bed; put the detached one in the free spot of the current plate
+    // closest to the rest, so it doesn't overlap the rest or any other object.
+    if (tmp.objects.size() == 2)
+        place_piece(*tmp.objects[0], tmp.objects[1]->instance_bounding_box(0), mo);
+    if (grouped.n_small > 0)
+        BOOST_LOG_TRIVIAL(info) << "PathCut: " << grouped.n_small << " tiny fragments kept with their side";
+
+    m_message.clear();
+    m_parent.reset_all_gizmos();
+    const auto t0 = std::chrono::steady_clock::now();
+    Plater::TakeSnapshot snapshot(plater, _u8L("Cut along path"));
+    plater->apply_cut_object_to_model(size_t(st->obj_idx), tmp.objects);
+    if (st->joined)
+        plater->get_notification_manager()->push_notification(
+            NotificationType::CustomNotification, NotificationManager::NotificationLevel::WarningNotificationLevel,
+            _u8L("Cut along path: the cut is made, but the object is still in one piece. Cut the remaining connection to separate it."));
+    BOOST_LOG_TRIVIAL(info) << "PathCut: apply to model "
+                            << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count()
+                            << " ms";
 }
 
 } // namespace GUI

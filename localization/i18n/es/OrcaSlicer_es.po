@@ -36418,3 +36418,99 @@ msgstr "pieza"
 # AI Translated
 msgid "rest"
 msgstr "resto"
+
+# AI Translated
+msgid "Apply this cut anyway"
+msgstr "Aplicar este corte igualmente"
+
+# AI Translated
+msgid "Click to add a point, right click removes the last one. Drag to rotate the view."
+msgstr "Haz clic para añadir un punto; el clic derecho elimina el último. Arrastra para girar la vista."
+
+# AI Translated
+msgid "Cut along path: the cut is made, but the object is still in one piece. Cut the remaining connection to separate it."
+msgstr "Cortar por ruta: el corte está hecho, pero el objeto sigue siendo una sola pieza. Corta la unión que queda para separarlo."
+
+# AI Translated
+msgid "Cut direction"
+msgstr "Dirección del corte"
+
+# AI Translated
+msgid "Cutting along path"
+msgstr "Cortando por ruta"
+
+# AI Translated
+msgid "Cutting, please wait..."
+msgstr "Cortando, espera..."
+
+# AI Translated
+msgid "From the view"
+msgstr "Desde la vista"
+
+# AI Translated
+msgid "Level with the bed"
+msgstr "Nivelada con la cama"
+
+# AI Translated
+msgid "Limit behind (mm)"
+msgstr "Limitar por detrás (mm)"
+
+# AI Translated
+msgid "Limit in front (mm)"
+msgstr "Limitar por delante (mm)"
+
+# AI Translated
+msgid "Limit past the first point (mm)"
+msgstr "Limitar tras el primer punto (mm)"
+
+# AI Translated
+msgid "Limit past the last point (mm)"
+msgstr "Limitar tras el último punto (mm)"
+
+# AI Translated
+msgid "Min. cap margin (mm)"
+msgstr "Margen mín. de la tapa (mm)"
+
+# AI Translated
+msgid "The cap spanning the loop runs into another part of the model. Place the loop where the part is free all around."
+msgstr "La tapa que rellena el lazo choca con otra parte del modelo. Coloca el lazo donde la pieza esté libre alrededor."
+
+# AI Translated
+msgid "The cut does not separate the object: it is still connected along the red lines. Cut there too, or apply this cut now and cut the connection next."
+msgstr "El corte no separa el objeto: sigue unido por donde marcan las líneas rojas. Corta también ahí, o aplica este corte ahora y corta la unión después."
+
+# AI Translated
+msgid "The cut ends inside the object. Increase or remove the limits, or start and end the path beyond the part."
+msgstr "El corte termina dentro del objeto. Aumenta o quita los límites, o empieza y acaba la ruta fuera de la pieza."
+
+# AI Translated
+msgid "The cut failed. Try a simpler path or a lower resolution model."
+msgstr "El corte ha fallado. Prueba con una ruta más sencilla o un modelo de menor resolución."
+
+# AI Translated
+msgid "The loop does not go all the way around the part. Place the points around it, or lower the cap margin."
+msgstr "El lazo no rodea la pieza por completo. Coloca los puntos alrededor de ella o reduce el margen de la tapa."
+
+# AI Translated
+msgid "The loop is too irregular. Place the points more evenly around the part."
+msgstr "El lazo es demasiado irregular. Reparte los puntos de forma más uniforme alrededor de la pieza."
+
+# AI Translated
+msgid "The model has holes along the cut, so the cut faces cannot be closed. Repair the model first."
+msgstr "El modelo tiene agujeros a lo largo del corte y no se pueden cerrar las caras del corte. Repara antes el modelo."
+
+# AI Translated
+msgid "The object was changed while it was being cut. Cut it again."
+msgstr "El objeto se ha modificado mientras se cortaba. Vuelve a cortarlo."
+
+# AI Translated
+msgid "Tilt (deg)"
+msgstr "Inclinación (°)"
+
+# AI Translated
+msgid "Turn (deg)"
+msgstr "Giro (°)"
+
+# AI Translated
+msgid "cut"
+msgstr "cortado"

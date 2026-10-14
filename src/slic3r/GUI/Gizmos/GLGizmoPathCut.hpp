@@ -3,14 +3,18 @@
 #include "GLGizmoBase.hpp"
 #include "GLGizmosCommon.hpp"
 #include "slic3r/GUI/GLModel.hpp"
+#include "libslic3r/PathCutGeometry.hpp"
 #include "libslic3r/Point.hpp"
 
+#include <memory>
 #include <string>
 #include <vector>
 
 namespace Slic3r {
 class ModelObject;
 namespace GUI {
+
+struct PathCutJob;
 
 // Cut an object along a user-drawn path instead of a plane.
 //  * View path: pick points on the object from one view; the smoothed path is extruded along the
@@ -44,7 +48,10 @@ private:
     void perform_cut();
     std::vector<Vec3d> preview_curve() const;
     Vec3d              sweep_dir() const;
+    PathCut::ViewLimits view_limits() const;
     void               add_point(const Vec3d &hit);
+    void               apply_cut(const std::shared_ptr<PathCutJob> &job);
+    void               clear_pending();
     void               rebuild_cutter_preview();
 
     Mode               m_mode{Mode::ViewPath};
@@ -52,12 +59,13 @@ private:
     Vec3d              m_view_dir{Vec3d::UnitY()}; // locked at the first point (view path mode)
     float              m_kerf{0.2f};             // clearance between parts [mm]
     float              m_margin{1.5f};           // minimum reach of the loop cap past the loop, widened as needed [mm]
-    enum class Sweep : int { View = 0, Level = 1, Vertical = 2 };
+    enum class Sweep : int { View = 0, Level = 1, Vertical = 2, Custom = 3 };
     Sweep              m_sweep{Sweep::View};     // view path: direction the path is swept along
-    bool               m_limit_depth{false};     // view path: stop the wall `m_depth` mm behind the picked points
-    float              m_depth{20.f};
-    bool               m_limit_ends{false};      // view path: stop the wall `m_extend` mm past the end points
-    float              m_extend{3.f};
+    float              m_turn{0.f}, m_tilt{0.f}; // custom sweep: around the vertical axis / below horizontal [deg]
+    // View path: optional limits of the wall [mm]: in front of / behind the picked points along the sweep,
+    // past the first / last point along the path. Unchecked = through the whole object.
+    struct Limit { bool on{false}; float mm{3.f}; };
+    Limit              m_lim_front, m_lim_back{false, 20.f}, m_lim_start, m_lim_end;
     std::string        m_message;
     bool               m_message_is_error{false};
     const ModelObject *m_object{nullptr};        // object the points were picked on
@@ -65,6 +73,12 @@ private:
     GLModel m_curve;
     GLModel m_sphere;
     GLModel m_cutter;                            // translucent preview of the wall / loop cap
+    GLModel m_routes_model;                      // where a cut that did not separate is still connected
+
+    // A finished cut that leaves the sides connected elsewhere: shown with its connection routes,
+    // applied only on request.
+    std::shared_ptr<PathCutJob>     m_pending;
+    std::vector<std::vector<Vec3d>> m_routes;
 
     // A left press on the object adds a point on release, unless the mouse was dragged: then it orbits.
     bool  m_press_on_object{false};

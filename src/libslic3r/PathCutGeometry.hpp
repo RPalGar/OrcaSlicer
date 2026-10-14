@@ -170,16 +170,16 @@ struct ViewCutter
     std::vector<double> arc;       // arc length at each path point
     std::vector<V2>     left_side; // polygon covering everything left of the path
     double              kerf{0.};
-    // Optional limits: the wall stops `extend` mm past the first and last picked points, and spans
-    // only heights [h_min, h_max] along the view direction (from just in front of the picked points).
-    bool                limit_ends{false}, limit_depth{false};
+    // Optional limits (see ViewLimits): the wall may stop short past the first / last picked point and
+    // span only heights [h_min, h_max] along the sweep direction.
+    bool                limit_start{false}, limit_end{false}, limit_depth{false};
     double              h_min{0.}, h_max{0.};
     std::string         error;
     bool valid() const { return error.empty() && path.size() >= 2; }
-    bool limited() const { return limit_ends || limit_depth; }
+    bool limited() const { return limit_start || limit_end || limit_depth; }
     const char *rim_error() const
     {
-        return "The cut ends inside the object. Increase the depth or the path extension, or start and end the path beyond the part.";
+        return "The cut ends inside the object. Increase or remove the limits, or start and end the path beyond the part.";
     }
 
     // +1 left of the path, -1 right of it.
@@ -290,19 +290,19 @@ struct ViewCutter
             const double h = frame.height(p);
             o = std::max(o, std::max(h_min - h, h - h_max));
         }
-        if (limit_ends) {
+        if (limit_start || limit_end) {
             const V2     q  = frame.to2d(p);
-            const double d0 = (q - path.front()).dot((path[0] - path[1]).normalized());
-            const double d1 = (q - path.back()).dot((path.back() - path[path.size() - 2]).normalized());
+            const double d0 = limit_start ? (q - path.front()).dot((path[0] - path[1]).normalized()) : -1.;
+            const double d1 = limit_end ? (q - path.back()).dot((path.back() - path[path.size() - 2]).normalized()) : -1.;
             if (d0 <= 0. && d1 <= 0.)
-                return o; // not beyond either end
+                return o; // not beyond a limited end
             size_t seg = 0; double t = 0., d = 0.;
             // Far from the path the grid knows nothing: those points need the exact nearest segment, as
             // the side polygon (and so the field's sign) still flips along the lines through the ends.
             if (!nearest_in_grid(q, seg, t, d))
                 nearest(q, seg, t, d);
-            if (seg == 0 && t <= 0.) o = std::max(o, d0);
-            if (seg + 2 == path.size() && t >= 1.) o = std::max(o, d1);
+            if (limit_start && seg == 0 && t <= 0.) o = std::max(o, d0);
+            if (limit_end && seg + 2 == path.size() && t >= 1.) o = std::max(o, d1);
         }
         return o;
     }
@@ -364,10 +364,15 @@ struct ViewCutter
 
 // points: picked points in the same coordinate system as the mesh to be cut.
 // bb_min/bb_max: bounding box of that mesh. kerf: wall thickness = clearance between parts.
-// extend: how far the wall reaches past the first and last points [mm], < 0 = through the whole object.
-// depth:  how deep the wall reaches behind the picked points along the view direction [mm], <= 0 = through.
+// How far the wall reaches, in mm; negative = through the whole object.
+struct ViewLimits
+{
+    double start{-1.}, end{-1.}; // past the first / last picked point, along the path
+    double front{-1.}, back{-1.}; // in front of / behind the picked points, along the sweep direction
+};
+
 inline ViewCutter make_view_cutter(const std::vector<V3> &points, const V3 &view_dir, const V3 &bb_min, const V3 &bb_max, double kerf,
-                                   double extend = -1., double depth = -1.)
+                                   const ViewLimits &limits = {})
 {
     ViewCutter vc;
     vc.kerf           = kerf;
@@ -387,10 +392,10 @@ inline ViewCutter make_view_cutter(const std::vector<V3> &points, const V3 &view
 
     // Extend both ends: well outside the object unless limited.
     const V2 t0 = (q[0] - q[1]).normalized(), t1 = (q.back() - q[q.size() - 2]).normalized();
-    vc.limit_ends    = extend >= 0.;
-    const double ext = vc.limit_ends ? std::max(extend, 1e-3) : diag;
-    q.insert(q.begin(), q.front() + t0 * ext);
-    q.push_back(q.back() + t1 * ext);
+    vc.limit_start = limits.start >= 0.;
+    vc.limit_end   = limits.end >= 0.;
+    q.insert(q.begin(), q.front() + t0 * (vc.limit_start ? std::max(limits.start, 1e-3) : diag));
+    q.push_back(q.back() + t1 * (vc.limit_end ? std::max(limits.end, 1e-3) : diag));
     vc.path = q;
 
     const V2 chord = q.back() - q.front();
@@ -406,12 +411,12 @@ inline ViewCutter make_view_cutter(const std::vector<V3> &points, const V3 &view
     vc.left_side.push_back(vc.left_side.back() + perp * 3. * diag);
     vc.left_side.push_back(vc.left_side.front() + perp * 3. * diag);
 
-    vc.limit_depth = depth > 0.;
+    vc.limit_depth = limits.front >= 0. || limits.back >= 0.;
     if (vc.limit_depth) {
-        double front = std::numeric_limits<double>::max();
-        for (const V3 &p : points) front = std::min(front, vc.frame.height(p));
-        vc.h_min = front - diag; // only the far end is limited
-        vc.h_max = front + depth;
+        double lo = std::numeric_limits<double>::max(), hi = -lo;
+        for (const V3 &p : points) { lo = std::min(lo, vc.frame.height(p)); hi = std::max(hi, vc.frame.height(p)); }
+        vc.h_min = limits.front >= 0. ? lo - limits.front : lo - diag;
+        vc.h_max = limits.back >= 0. ? hi + limits.back : hi + diag;
     }
 
     vc.arc.assign(q.size(), 0.);
@@ -1469,6 +1474,73 @@ Grouped group_cut(const CutResult &cut, SideOf side_of, bool untouched_follow_in
         else               { its_append(g.side_b, parts[i]); ++g.n_b; }
     }
     return g;
+}
+
+// Where a cut that did not separate the object is still connected: shortest routes over the surface
+// from the +1 cut face to the -1 cut face. After each route, the surface within `block` mm of it is
+// excluded so the next route shows another connection. Returns up to `max_routes` polylines.
+inline std::vector<std::vector<V3>> joined_routes(const CutResult &cut, int max_routes = 3, double block = -1.)
+{
+    const indexed_triangle_set &its = cut.mesh;
+    const size_t                nv  = its.vertices.size();
+    if (block <= 0.) { // a tenth of the object, so a second route is really another connection
+        V3 mn = V3::Constant(std::numeric_limits<double>::max()), mx = -mn;
+        for (const auto &v : its.vertices) { mn = mn.cwiseMin(V3(v.cast<double>())); mx = mx.cwiseMax(V3(v.cast<double>())); }
+        block = std::max(4., 0.1 * (mx - mn).norm());
+    }
+    std::vector<std::vector<int>> adj(nv);
+    for (const auto &t : its.indices)
+        for (int e = 0; e < 3; ++e) {
+            adj[size_t(t[e])].push_back(t[(e + 1) % 3]);
+            adj[size_t(t[(e + 1) % 3])].push_back(t[e]);
+        }
+    auto pos = [&its](int v) { return V3(its.vertices[size_t(v)].cast<double>()); };
+    std::vector<char>             blocked(nv, 0);
+    std::vector<std::vector<V3>>  routes;
+    for (int r = 0; r < max_routes; ++r) {
+        std::vector<double> dist(nv, std::numeric_limits<double>::max());
+        std::vector<int>    prev(nv, -1);
+        using Item = std::pair<double, int>;
+        std::vector<Item> heap;
+        for (size_t v = 0; v < nv; ++v)
+            if (v < cut.level.size() && cut.level[v] == 1 && !blocked[v]) { dist[v] = 0.; heap.emplace_back(0., int(v)); }
+        std::make_heap(heap.begin(), heap.end(), std::greater<Item>());
+        int target = -1;
+        while (!heap.empty()) {
+            std::pop_heap(heap.begin(), heap.end(), std::greater<Item>());
+            const auto [d, v] = heap.back();
+            heap.pop_back();
+            if (d > dist[size_t(v)]) continue;
+            if (size_t(v) < cut.level.size() && cut.level[size_t(v)] == -1) { target = v; break; }
+            for (int w : adj[size_t(v)]) {
+                if (blocked[size_t(w)]) continue;
+                const double nd = d + (pos(w) - pos(v)).norm();
+                if (nd < dist[size_t(w)]) {
+                    dist[size_t(w)] = nd;
+                    prev[size_t(w)] = v;
+                    heap.emplace_back(nd, w);
+                    std::push_heap(heap.begin(), heap.end(), std::greater<Item>());
+                }
+            }
+        }
+        if (target < 0) break;
+        std::vector<V3> route;
+        for (int v = target; v >= 0; v = prev[size_t(v)]) route.push_back(pos(v));
+        // Block the surface around this route (a coarse grid keeps it linear).
+        const double cell = block;
+        struct H { size_t operator()(const std::array<int64_t, 3> &k) const { return size_t(k[0] * 73856093 ^ k[1] * 19349663 ^ k[2] * 83492791); } };
+        std::unordered_map<std::array<int64_t, 3>, char, H> near_cells;
+        for (const V3 &p : route)
+            for (int dx = -1; dx <= 1; ++dx) for (int dy = -1; dy <= 1; ++dy) for (int dz = -1; dz <= 1; ++dz)
+                near_cells[{int64_t(std::floor(p.x() / cell)) + dx, int64_t(std::floor(p.y() / cell)) + dy, int64_t(std::floor(p.z() / cell)) + dz}] = 1;
+        for (size_t v = 0; v < nv; ++v) {
+            const V3 p = pos(int(v));
+            if (near_cells.count({int64_t(std::floor(p.x() / cell)), int64_t(std::floor(p.y() / cell)), int64_t(std::floor(p.z() / cell))}))
+                blocked[v] = 1;
+        }
+        routes.push_back(std::move(route));
+    }
+    return routes;
 }
 
 // side_of(V3) -> +1 / -1 / 0. Components get the majority vote of their vertices (0 = no vote).
