@@ -2,6 +2,7 @@
 
 #include "slic3r/GUI/3DScene.hpp"
 #include "slic3r/GUI/Camera.hpp"
+#include "libslic3r/AppConfig.hpp"
 #include "slic3r/GUI/GLCanvas3D.hpp"
 #include "slic3r/GUI/GLShader.hpp"
 #include "slic3r/GUI/GUI_App.hpp"
@@ -27,6 +28,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdlib>
 #include <exception>
 #include <functional>
 #include <limits>
@@ -149,6 +151,8 @@ bool GLGizmoPathCut::on_mouse(const wxMouseEvent &mouse_event)
     if (m_busy) // the scene is frozen while a cut runs (zooming is fine)
         return mouse_event.GetWheelRotation() == 0;
     const Vec2d mouse_pos(mouse_event.GetX(), mouse_event.GetY());
+    if (mouse_event.LeftDown())
+        m_press_on_object = m_orbiting = false; // a lost release must not leave a press behind
     if (mouse_event.LeftDown() && !mouse_event.CmdDown()) {
         Vec3d hit;
         if (!raycast(mouse_pos, hit))
@@ -162,14 +166,26 @@ bool GLGizmoPathCut::on_mouse(const wxMouseEvent &mouse_event)
         return true;
     }
     if (m_press_on_object && mouse_event.Dragging() && mouse_event.LeftIsDown()) {
-        if (!m_orbiting && (mouse_pos - m_press_pos).norm() > 4.)
+        if (!m_orbiting && (mouse_pos - m_press_pos).norm() > 4.) {
             m_orbiting = true;
-        if (m_orbiting) {
-            // Same orbit as the canvas (GLCanvas3D, TRACKBALLSIZE = 0.8).
-            Camera     &camera = wxGetApp().plater()->get_camera();
-            const Vec2d rot    = (mouse_pos - m_last_pos) * (PI * 0.8 / 180.);
-            camera.recover_from_free_camera();
-            camera.rotate_on_sphere(rot.x(), rot.y(), true);
+            if (!m_parent.has_mouse_capture())
+                m_parent.get_wxglcanvas()->CaptureMouse(); // released by the canvas on button up
+        }
+        // Orbit like the canvas does on empty space (GLCanvas3D, TRACKBALLSIZE = 0.8), with the user's
+        // settings, around the selected object. Left drag mapped to something else: just no point.
+        const AppConfig *cfg = wxGetApp().app_config;
+        if (m_orbiting && std::atoi(cfg->get("left_mouse_drag_action").c_str()) == int(GLCanvas3D::MouseAction::Rotation)) {
+            const std::string mult_pref = cfg->get("camera_orbit_mult");
+            const double      mult      = mult_pref.empty() ? 1. : std::stod(mult_pref);
+            const Vec2d       rot       = (mouse_pos - m_last_pos) * (PI * 0.8 / 180.) * mult;
+            Camera           &camera    = wxGetApp().plater()->get_camera();
+            if (cfg->get_bool("use_free_camera"))
+                camera.rotate_local_around_target(Vec3d(rot.y(), rot.x(), 0.));
+            else {
+                camera.recover_from_free_camera();
+                camera.rotate_on_sphere_with_target(rot.x(), rot.y(), true, m_parent.get_selection().get_bounding_box().center());
+            }
+            camera.auto_type(Camera::EType::Perspective);
             m_parent.set_as_dirty();
         }
         m_last_pos = mouse_pos;

@@ -249,7 +249,7 @@ struct ViewCutter
             const double dd = (q - (path[i] + ab * tt)).norm();
             if (dd < d) { d = dd; seg = size_t(i); t = tt; }
         }
-        return d < std::numeric_limits<double>::max();
+        return d <= reach; // farther away, a segment not listed in this cell may be nearer
     }
     // Signed distance across the wall: positive on the left of the path.
     double field(const V3 &p) const
@@ -291,14 +291,18 @@ struct ViewCutter
             o = std::max(o, std::max(h_min - h, h - h_max));
         }
         if (limit_ends) {
-            const V2 q = frame.to2d(p);
-            size_t   seg = 0; double t = 0., d = 0.;
+            const V2     q  = frame.to2d(p);
+            const double d0 = (q - path.front()).dot((path[0] - path[1]).normalized());
+            const double d1 = (q - path.back()).dot((path.back() - path[path.size() - 2]).normalized());
+            if (d0 <= 0. && d1 <= 0.)
+                return o; // not beyond either end
+            size_t seg = 0; double t = 0., d = 0.;
             // Far from the path the grid knows nothing: those points need the exact nearest segment, as
             // the side polygon (and so the field's sign) still flips along the lines through the ends.
             if (!nearest_in_grid(q, seg, t, d))
                 nearest(q, seg, t, d);
-            if (seg == 0 && t <= 0.) o = std::max(o, (q - path.front()).dot((path[0] - path[1]).normalized()));
-            if (seg + 2 == path.size() && t >= 1.) o = std::max(o, (q - path.back()).dot((path.back() - path[path.size() - 2]).normalized()));
+            if (seg == 0 && t <= 0.) o = std::max(o, d0);
+            if (seg + 2 == path.size() && t >= 1.) o = std::max(o, d1);
         }
         return o;
     }
