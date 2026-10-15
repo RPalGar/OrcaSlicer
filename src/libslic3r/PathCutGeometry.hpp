@@ -362,6 +362,48 @@ struct ViewCutter
     }
 };
 
+// First crossing of two non-adjacent segments of an open polyline, searching from the start: the
+// segments i < j and the crossing point. Returns false when the polyline does not cross itself.
+inline bool first_self_crossing(const std::vector<V2> &q, size_t &si, size_t &sj, V2 &x)
+{
+    auto cross = [](const V2 &a, const V2 &b) { return a.x() * b.y() - a.y() * b.x(); };
+    const size_t n = q.size();
+    for (size_t i = 0; i + 1 < n; ++i) {
+        const V2 a = q[i], b = q[i + 1];
+        const V2 lo = a.cwiseMin(b), hi = a.cwiseMax(b);
+        for (size_t j = n - 2; j >= i + 2 && j + 1 < n; --j) { // the farthest crossing removes the largest loop
+            const V2 c = q[j], d = q[j + 1];
+            if (std::max(c.x(), d.x()) < lo.x() || std::min(c.x(), d.x()) > hi.x() || std::max(c.y(), d.y()) < lo.y() ||
+                std::min(c.y(), d.y()) > hi.y())
+                continue;
+            const double d1 = cross(b - a, c - a), d2 = cross(b - a, d - a), d3 = cross(d - c, a - c), d4 = cross(d - c, b - c);
+            if (((d1 > 0.) != (d2 > 0.)) && ((d3 > 0.) != (d4 > 0.)) && d1 != 0. && d2 != 0. && d3 != 0. && d4 != 0.) {
+                si = i; sj = j;
+                x  = c + (d - c) * (d3 / (d3 - d4));
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+// Cuts the loops out of a polyline that crosses itself (hand jitter between close points, which the
+// spline turns into tiny curls). Returns the total length removed.
+inline double remove_self_loops(std::vector<V2> &q)
+{
+    double removed = 0.;
+    size_t i, j;
+    V2     x;
+    while (q.size() > 3 && first_self_crossing(q, i, j, x)) {
+        for (size_t k = i + 1; k <= j; ++k) removed += (q[k] - q[k - 1]).norm();
+        std::vector<V2> out(q.begin(), q.begin() + long(i) + 1);
+        out.push_back(x);
+        out.insert(out.end(), q.begin() + long(j) + 1, q.end());
+        q.swap(out);
+    }
+    return removed;
+}
+
 // points: picked points in the same coordinate system as the mesh to be cut.
 // bb_min/bb_max: bounding box of that mesh. kerf: wall thickness = clearance between parts.
 // How far the wall reaches, in mm; negative = through the whole object.
@@ -389,6 +431,21 @@ inline ViewCutter make_view_cutter(const std::vector<V3> &points, const V3 &view
     }
     if (q.size() >= 3)
         q = remove_close_points(catmull_rom(q, false, 16), 1e-4, false);
+    // Hand jitter between points picked close together curls the spline back on itself: cut the curls
+    // out. A path that really doubles back (points picked out of order) is refused instead of guessed at.
+    {
+        double length = 0.;
+        for (size_t i = 1; i < q.size(); ++i) length += (q[i] - q[i - 1]).norm();
+        if (remove_self_loops(q) > std::max(3., 0.1 * length)) {
+            vc.error = "The path crosses itself seen from the view. Place the points in order along the cut line.";
+            return vc;
+        }
+        q = remove_close_points(q, 1e-4, false);
+        if (q.size() < 2) {
+            vc.error = "The path needs at least two points.";
+            return vc;
+        }
+    }
 
     // Extend both ends: well outside the object unless limited.
     const V2 t0 = (q[0] - q[1]).normalized(), t1 = (q.back() - q[q.size() - 2]).normalized();
@@ -397,6 +454,14 @@ inline ViewCutter make_view_cutter(const std::vector<V3> &points, const V3 &view
     q.insert(q.begin(), q.front() + t0 * (vc.limit_start ? std::max(limits.start, 1e-3) : diag));
     q.push_back(q.back() + t1 * (vc.limit_end ? std::max(limits.end, 1e-3) : diag));
     vc.path = q;
+
+    // The extensions can still cross the path (a path that curls round): the wall would fold over itself.
+    size_t ci, cj;
+    V2     cx;
+    if (first_self_crossing(q, ci, cj, cx)) {
+        vc.error = "The path crosses itself seen from the view. Place the points in order along the cut line.";
+        return vc;
+    }
 
     const V2 chord = q.back() - q.front();
     if (chord.norm() < 1e-6) {
@@ -1125,7 +1190,7 @@ CutResult cut_with_slab(indexed_triangle_set its, const Cutter &cutter, bool bou
 
     // 3) Close the openings: chain the cut edges into loops, triangulate them in the chart of their
     //    level set and refine the caps so they follow curved walls.
-    const double sag_tol = std::max(0.05, 0.25 * cutter.kerf);
+    const double sag_tol = std::max(0.1, 0.25 * cutter.kerf); // 0.1 mm: half a layer; finer only multiplies the cap triangles
     const double min_len2 = 0.25 * 0.25; // never split cap edges shorter than this (chart mm)
     std::unordered_map<uint64_t, std::vector<int>> inserts; // cut edge -> cap vertices placed on it
     std::unordered_map<uint64_t, uint64_t>         orig_of; // piece of a cut edge -> the cut edge
@@ -1281,7 +1346,7 @@ CutResult cut_with_slab(indexed_triangle_set its, const Cutter &cutter, bool bou
             // Slice the cap along the kink lines of the level set, so every piece lies where the level set
             // is planar (or nearly). A slice through a boundary edge also splits the clipped triangle
             // that owns it (see below), keeping the mesh watertight.
-            for (const auto &kink : cutter.kinks(level, 0.5 * sag_tol)) {
+            for (const auto &kink : cutter.kinks(level, sag_tol)) {
                 const V2 p0 = kink.first, nrm(-kink.second.y(), kink.second.x());
                 auto dist = [&](int v) { const double d = (uv[v] - p0).dot(nrm); return std::abs(d) < 1e-5 ? 0. : d; };
                 std::unordered_map<uint64_t, int> xing;
@@ -1338,7 +1403,7 @@ CutResult cut_with_slab(indexed_triangle_set its, const Cutter &cutter, bool bou
                 }
                 return best;
             };
-            for (int pass = 0; pass < 60; ++pass) {
+            for (int pass = 0; pass < 60 && !stop(); ++pass) {
                 // Triangles with a curved edge get their longest edge split; marks then propagate to the
                 // longest edge of every triangle sharing a marked edge, so the splits keep their shape.
                 std::unordered_map<uint64_t, int> mid;
@@ -1353,7 +1418,7 @@ CutResult cut_with_slab(indexed_triangle_set its, const Cutter &cutter, bool bou
                     if (e >= 0) mid.emplace(edge_key(t[e], t[(e + 1) % 3]), -1);
                 }
                 if (mid.empty()) break;
-                for (bool changed = true; changed;) {
+                for (bool changed = true; changed && !stop();) {
                     changed = false;
                     for (const auto &t : cap) {
                         const bool marked = mid.count(edge_key(t[0], t[1])) || mid.count(edge_key(t[1], t[2])) || mid.count(edge_key(t[2], t[0]));

@@ -36567,3 +36567,7 @@ msgstr "Cortar por ruta: solo caben %1% de %2% conectores en la cara de corte."
 # AI Translated
 msgid "Flat cut face"
 msgstr "Cara de corte plana"
+
+# AI Translated
+msgid "The path crosses itself seen from the view. Place the points in order along the cut line."
+msgstr "La ruta se cruza consigo misma vista desde la cámara. Coloca los puntos en orden a lo largo de la línea de corte."

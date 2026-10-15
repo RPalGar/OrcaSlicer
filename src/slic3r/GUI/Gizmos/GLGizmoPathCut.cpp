@@ -64,6 +64,7 @@ static const ColorRGBA POINT_COLOR = {1.f, 0.55f, 0.f, 1.f};
     L("The object was changed while it was being cut. Cut it again."),
     L("The cut failed. Try a simpler path or a lower resolution model."),
     L("The cut ends inside the object. Increase or remove the limits, or start and end the path beyond the part."),
+    L("The path crosses itself seen from the view. Place the points in order along the cut line."),
     L("No connectors fit: the cut face is too curved for a straight connector."),
     L("No connectors fit: the cut face is too small or too thin for them. Make them smaller or shorter."),
 };

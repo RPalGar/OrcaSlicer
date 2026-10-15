@@ -269,3 +269,25 @@ TEST_CASE("A flat loop cap cuts along the mean plane of the loop", "[PathCut]")
             CHECK_THAT(std::abs(lc.frame.height(p) - lc.hmean), WithinAbs(0.5 * kerf, 1e-3));
         }
 }
+
+TEST_CASE("Curls from hand jitter are cut out of a view path; a path doubling back is refused", "[PathCut]")
+{
+    const indexed_triangle_set cube = its_make_cube(20., 20., 20.);
+    SECTION("two points picked almost on top of each other, the second slightly behind")
+    {
+        const std::vector<PathCut::V3> pts{{-2., 0., 10.}, {6., 0., 10.5}, {9., 0., 10.}, {8.5, 0., 10.3}, {10., 0., 9.8}, {14., 0., 9.5}, {22., 0., 10.}};
+        const PathCut::ViewCutter vc = PathCut::make_view_cutter(pts, PathCut::V3::UnitY(), PathCut::V3::Zero(), PathCut::V3::Constant(20.), 0.2);
+        REQUIRE(vc.valid());
+        size_t i, j;
+        PathCut::V2 x;
+        CHECK_FALSE(PathCut::first_self_crossing(vc.path, i, j, x));
+        const PathCut::CutResult res = PathCut::cut_with_slab(cube, vc, false);
+        REQUIRE(res.error.empty());
+        require_closed_parts(its_split(res.mesh));
+    }
+    SECTION("points picked back and forth")
+    {
+        const std::vector<PathCut::V3> pts{{-2., 0., 10.}, {15., 0., 10.}, {5., 0., 12.}, {22., 0., 8.}};
+        CHECK_FALSE(PathCut::make_view_cutter(pts, PathCut::V3::UnitY(), PathCut::V3::Zero(), PathCut::V3::Constant(20.), 0.2).valid());
+    }
+}
