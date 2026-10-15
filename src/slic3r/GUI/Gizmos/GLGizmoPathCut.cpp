@@ -450,6 +450,20 @@ void GLGizmoPathCut::on_render_input_window(float x, float y, float bottom_limit
     GizmoImguiBegin(on_get_name(), ImGuiWindowFlags_NoMove | ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoTitleBar);
 
     const float input_w = ImGui::CalcTextSize("000.00").x * 2.5f;
+    // Input fields start right of the longest label in the current language (translations are often much
+    // longer than the English text), so no label runs under a field.
+    const float gap = ImGui::GetStyle().ItemSpacing.x * 2.f;
+    float       label_w = 0.f, check_w = 0.f;
+    for (const std::string &l : {_u8L("Clearance (mm)"), _u8L("Min. cap margin (mm)"), _u8L("Cut direction"), _u8L("Turn (deg)"),
+                                 _u8L("Tilt (deg)"), _u8L("Connectors"), _u8L("Shape"), _u8L("Number of connectors"),
+                                 _u8L("Diameter / side (mm)"), _u8L("Depth (mm)"), _u8L("Hole clearance (mm)")})
+        label_w = std::max(label_w, ImGui::CalcTextSize(l.c_str()).x);
+    for (const std::string &l : {_u8L("Limit in front (mm)"), _u8L("Limit behind (mm)"), _u8L("Limit past the first point (mm)"),
+                                 _u8L("Limit past the last point (mm)")})
+        check_w = std::max(check_w, ImGui::CalcTextSize(l.c_str()).x);
+    const float field_x = ImGui::GetStyle().WindowPadding.x + label_w + gap;
+    // checkbox square + its spacing, generously: the toolbar style draws larger boxes
+    const float check_x = ImGui::GetStyle().WindowPadding.x + ImGui::GetFrameHeight() * 1.5f + check_w + gap;
 
     m_imgui->disabled_begin(m_busy);
     if (m_imgui->bbl_radio_button(_u8L("Path from view").c_str(), m_mode == Mode::ViewPath) && m_mode != Mode::ViewPath) {
@@ -516,7 +530,7 @@ void GLGizmoPathCut::on_render_input_window(float x, float y, float bottom_limit
     m_imgui->disabled_begin(m_busy);
     ImGui::AlignTextToFramePadding();
     m_imgui->text(_u8L("Clearance (mm)"));
-    ImGui::SameLine(input_w * 1.6f);
+    ImGui::SameLine(field_x);
     ImGui::PushItemWidth(input_w);
     if (ImGui::InputFloat("##pathcut_kerf", &m_kerf, 0.05f, 0.1f, "%.2f"))
         settings_changed();
@@ -524,7 +538,7 @@ void GLGizmoPathCut::on_render_input_window(float x, float y, float bottom_limit
     if (m_mode == Mode::Loop) {
         ImGui::AlignTextToFramePadding();
         m_imgui->text(_u8L("Min. cap margin (mm)"));
-        ImGui::SameLine(input_w * 1.6f);
+        ImGui::SameLine(field_x);
         if (ImGui::InputFloat("##pathcut_margin", &m_margin, 0.1f, 0.5f, "%.1f"))
             settings_changed();
         m_margin = std::clamp(m_margin, 0.2f, 10.f);
@@ -535,7 +549,7 @@ void GLGizmoPathCut::on_render_input_window(float x, float y, float bottom_limit
         // bed (a cut parallel to the bed for a path drawn from the front), vertical, or set by hand.
         ImGui::AlignTextToFramePadding();
         m_imgui->text(_u8L("Cut direction"));
-        ImGui::SameLine(input_w * 1.6f);
+        ImGui::SameLine(field_x);
         const std::vector<std::string> sweeps{_u8L("From the view"), _u8L("Level with the bed"), _u8L("Vertical"), _u8L("Custom")};
         const int sweep = int(m_sweep);
         ImGui::PushItemWidth(input_w * 2.2f);
@@ -556,13 +570,13 @@ void GLGizmoPathCut::on_render_input_window(float x, float y, float bottom_limit
         if (m_sweep == Sweep::Custom) {
             ImGui::AlignTextToFramePadding();
             m_imgui->text(_u8L("Turn (deg)"));
-            ImGui::SameLine(input_w * 1.6f);
+            ImGui::SameLine(field_x);
             if (ImGui::InputFloat("##pathcut_turn", &m_turn, 1.f, 15.f, "%.0f"))
                 settings_changed();
             m_turn = std::fmod(m_turn + 540.f, 360.f) - 180.f;
             ImGui::AlignTextToFramePadding();
             m_imgui->text(_u8L("Tilt (deg)"));
-            ImGui::SameLine(input_w * 1.6f);
+            ImGui::SameLine(field_x);
             if (ImGui::InputFloat("##pathcut_tilt", &m_tilt, 1.f, 15.f, "%.0f"))
                 settings_changed();
             m_tilt = std::clamp(m_tilt, -90.f, 90.f);
@@ -572,7 +586,7 @@ void GLGizmoPathCut::on_render_input_window(float x, float y, float bottom_limit
             if (m_imgui->bbl_checkbox(label, lim.on))
                 settings_changed();
             if (lim.on) {
-                ImGui::SameLine(input_w * 2.6f);
+                ImGui::SameLine(check_x);
                 if (ImGui::InputFloat(id, &lim.mm, 0.5f, 5.f, "%.1f"))
                     settings_changed();
                 lim.mm = std::clamp(lim.mm, 0.f, 1000.f);
@@ -588,7 +602,7 @@ void GLGizmoPathCut::on_render_input_window(float x, float y, float bottom_limit
     ImGui::Separator();
     ImGui::AlignTextToFramePadding();
     m_imgui->text(_u8L("Connectors"));
-    ImGui::SameLine(input_w * 1.6f);
+    ImGui::SameLine(field_x);
     {
         const std::vector<std::string> types{_u8L("None"), _u8L("Peg and hole"), _u8L("Separate pin")};
         const int                      type = std::clamp(int(m_conn.type), 0, int(types.size()) - 1);
@@ -606,7 +620,7 @@ void GLGizmoPathCut::on_render_input_window(float x, float y, float bottom_limit
     if (m_conn.type != PathCut::ConnectorType::None) {
         ImGui::AlignTextToFramePadding();
         m_imgui->text(_u8L("Shape"));
-        ImGui::SameLine(input_w * 1.6f);
+        ImGui::SameLine(field_x);
         if (m_imgui->bbl_radio_button(_u8L("Cylinder").c_str(), m_conn.shape == PathCut::ConnectorShape::Cylinder) &&
             m_conn.shape != PathCut::ConnectorShape::Cylinder) {
             m_conn.shape = PathCut::ConnectorShape::Cylinder;
@@ -621,7 +635,7 @@ void GLGizmoPathCut::on_render_input_window(float x, float y, float bottom_limit
         auto float_row = [&](const std::string &label, const char *id, double &value, float step, float lo, float hi, const char *fmt) {
             ImGui::AlignTextToFramePadding();
             m_imgui->text(label);
-            ImGui::SameLine(input_w * 1.6f);
+            ImGui::SameLine(field_x);
             float v = float(value);
             if (ImGui::InputFloat(id, &v, step, step * 5.f, fmt)) {
                 value = std::clamp(v, lo, hi);
@@ -630,7 +644,7 @@ void GLGizmoPathCut::on_render_input_window(float x, float y, float bottom_limit
         };
         ImGui::AlignTextToFramePadding();
         m_imgui->text(_u8L("Number of connectors"));
-        ImGui::SameLine(input_w * 1.6f);
+        ImGui::SameLine(field_x);
         if (ImGui::InputInt("##pathcut_conn_count", &m_conn.count, 1, 1)) {
             m_conn.count = std::clamp(m_conn.count, 1, 8);
             settings_changed();
