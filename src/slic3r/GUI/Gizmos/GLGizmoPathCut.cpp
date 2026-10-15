@@ -31,6 +31,7 @@
 #include <wx/glcanvas.h>
 
 #include <algorithm>
+#include <cfloat>
 #include <chrono>
 #include <cstdlib>
 #include <exception>
@@ -329,7 +330,7 @@ void GLGizmoPathCut::rebuild_cutter_preview()
             g.add_triangle(base, base + 2, base + 3);
         }
     } else if (m_mode == Mode::Loop && pts.size() >= 3) {
-        const PathCut::LoopCutter lc = PathCut::make_loop_cutter(pts, m_kerf, m_margin, [](const PathCut::V3 &p) { return p; });
+        const PathCut::LoopCutter lc = PathCut::make_loop_cutter(pts, m_kerf, m_margin, [](const PathCut::V3 &p) { return p; }, m_flat_cap);
         if (!lc.valid())
             return;
         constexpr int rings = 8, sectors = 72;
@@ -441,6 +442,9 @@ void GLGizmoPathCut::on_render_input_window(float x, float y, float bottom_limit
     };
     const float scale = m_parent.get_scale();
     ImGuiWrapper::push_toolbar_style(scale);
+    // Keep the window inside the canvas: move it up when it gets taller, and scroll beyond that.
+    y = std::max(0.f, std::min(y, bottom_limit - m_window_height));
+    ImGui::SetNextWindowSizeConstraints(ImVec2(0.f, 0.f), ImVec2(FLT_MAX, std::max(100.f, bottom_limit - y)));
     GizmoImguiSetNextWIndowPos(x, y, ImGuiCond_Always, 0.0f, 0.0f);
     GizmoImguiBegin(on_get_name(), ImGuiWindowFlags_NoMove | ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoTitleBar);
 
@@ -467,8 +471,48 @@ void GLGizmoPathCut::on_render_input_window(float x, float y, float bottom_limit
                            "itself; a curved cap spanning it separates only that part."));
     m_imgui->text(_u8L("Click to add a point, right click removes the last one. Drag to rotate the view."));
     ImGui::PopTextWrapPos();
+    m_imgui->disabled_end();
+
+    // The actions come first so they stay in view however long the settings below get.
+    ImGui::Separator();
+    m_imgui->text(_u8L("Points") + ": " + std::to_string(m_points.size()));
+
+    // (button() disables itself, so these take !m_busy as their enable flag rather than nesting
+    // inside the disabled block above)
+    const size_t min_pts = m_mode == Mode::Loop ? 3 : 2;
+    if (m_imgui->button(_L("Undo point"), ImVec2(0, 0), !m_points.empty() && !m_busy)) {
+        clear_pending();
+        m_points.pop_back();
+        settings_changed();
+    }
+    ImGui::SameLine();
+    if (m_imgui->button(_L("Clear"), ImVec2(0, 0), !m_points.empty() && !m_busy))
+        reset_path();
+    ImGui::SameLine();
+    if (m_imgui->button(_L("Perform cut"), ImVec2(0, 0), m_points.size() >= min_pts && !m_busy))
+        wxGetApp().CallAfter([this]() { perform_cut(); });
+    if (m_busy) {
+        ImGui::SameLine();
+        if (m_imgui->button(_L("Cancel")))
+            wxGetApp().plater()->get_ui_job_worker().cancel();
+    }
+
+    if (m_pending && !m_busy) {
+        if (m_imgui->button(_L("Apply this cut anyway")))
+            wxGetApp().CallAfter([this]() { if (m_pending) apply_cut(m_pending); });
+    }
+    if (!m_message.empty()) {
+        ImGui::PushTextWrapPos(ImGui::GetFontSize() * 26.f);
+        if (m_message_is_error)
+            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.f, 0.35f, 0.35f, 1.f));
+        m_imgui->text(m_message);
+        if (m_message_is_error)
+            ImGui::PopStyleColor();
+        ImGui::PopTextWrapPos();
+    }
 
     ImGui::Separator();
+    m_imgui->disabled_begin(m_busy);
     ImGui::AlignTextToFramePadding();
     m_imgui->text(_u8L("Clearance (mm)"));
     ImGui::SameLine(input_w * 1.6f);
@@ -483,6 +527,8 @@ void GLGizmoPathCut::on_render_input_window(float x, float y, float bottom_limit
         if (ImGui::InputFloat("##pathcut_margin", &m_margin, 0.1f, 0.5f, "%.1f"))
             settings_changed();
         m_margin = std::clamp(m_margin, 0.2f, 10.f);
+        if (m_imgui->bbl_checkbox(_L("Flat cut face"), m_flat_cap))
+            settings_changed();
     } else {
         // Direction the path is swept along: as seen when placing the first point, forced level with the
         // bed (a cut parallel to the bed for a path drawn from the front), vertical, or set by hand.
@@ -599,42 +645,7 @@ void GLGizmoPathCut::on_render_input_window(float x, float y, float bottom_limit
     ImGui::PopItemWidth();
     m_imgui->disabled_end();
 
-    m_imgui->text(_u8L("Points") + ": " + std::to_string(m_points.size()));
-
-    // (button() disables itself, so these take !m_busy as their enable flag rather than nesting
-    // inside the disabled block above)
-    const size_t min_pts = m_mode == Mode::Loop ? 3 : 2;
-    if (m_imgui->button(_L("Undo point"), ImVec2(0, 0), !m_points.empty() && !m_busy)) {
-        clear_pending();
-        m_points.pop_back();
-        settings_changed();
-    }
-    ImGui::SameLine();
-    if (m_imgui->button(_L("Clear"), ImVec2(0, 0), !m_points.empty() && !m_busy))
-        reset_path();
-    ImGui::SameLine();
-    if (m_imgui->button(_L("Perform cut"), ImVec2(0, 0), m_points.size() >= min_pts && !m_busy))
-        wxGetApp().CallAfter([this]() { perform_cut(); });
-    if (m_busy) {
-        ImGui::SameLine();
-        if (m_imgui->button(_L("Cancel")))
-            wxGetApp().plater()->get_ui_job_worker().cancel();
-    }
-
-    if (m_pending && !m_busy) {
-        if (m_imgui->button(_L("Apply this cut anyway")))
-            wxGetApp().CallAfter([this]() { if (m_pending) apply_cut(m_pending); });
-    }
-    if (!m_message.empty()) {
-        ImGui::PushTextWrapPos(ImGui::GetFontSize() * 26.f);
-        if (m_message_is_error)
-            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.f, 0.35f, 0.35f, 1.f));
-        m_imgui->text(m_message);
-        if (m_message_is_error)
-            ImGui::PopStyleColor();
-        ImGui::PopTextWrapPos();
-    }
-
+    m_window_height = ImGui::GetWindowHeight();
     GizmoImguiEnd();
     ImGuiWrapper::pop_toolbar_style();
 }
@@ -703,6 +714,7 @@ struct PathCutJob
     Vec3d                    view_dir;
     GLGizmoPathCut::Mode     mode;
     float                    kerf, margin;
+    bool                     flat_cap{true};
     PathCut::ViewLimits      limits;
     PathCut::ConnectorParams conn;
     // the object
@@ -787,6 +799,7 @@ void GLGizmoPathCut::perform_cut()
     st->mode     = m_mode;
     st->kerf     = m_kerf;
     st->margin   = m_margin;
+    st->flat_cap = m_flat_cap;
     st->limits   = view_limits();
     st->conn     = m_conn;
 
@@ -837,7 +850,7 @@ void GLGizmoPathCut::perform_cut()
                 aabb.squared_distance(Vec3d(p), idx, c);
                 return c;
             };
-            lc = PathCut::make_loop_cutter(st->pts, st->kerf, st->margin, snap);
+            lc = PathCut::make_loop_cutter(st->pts, st->kerf, st->margin, snap, st->flat_cap);
             if (!lc.valid()) {
                 st->error = lc.error;
                 return;

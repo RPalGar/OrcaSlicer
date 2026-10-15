@@ -36563,3 +36563,7 @@ msgstr "Los conectores solo se añaden cuando el corte separa el objeto."
 #, boost-format
 msgid "Cut along path: only %1% of %2% connectors fit on the cut face."
 msgstr "Cortar por ruta: solo caben %1% de %2% conectores en la cara de corte."
+
+# AI Translated
+msgid "Flat cut face"
+msgstr "Cara de corte plana"

@@ -246,3 +246,26 @@ TEST_CASE("Connectors on a wavy cut face fit inside both parts", "[PathCut]")
         CHECK_FALSE(error.empty());
     }
 }
+
+TEST_CASE("A flat loop cap cuts along the mean plane of the loop", "[PathCut]")
+{
+    // Wavy loop around a cylinder: with a flat cap both cut faces are planes a kerf apart.
+    const double               r = 5., kerf = 0.2;
+    const indexed_triangle_set cyl = its_make_cylinder(r, 30.);
+    std::vector<PathCut::V3>   loop;
+    for (int i = 0; i < 12; ++i) {
+        const double a = 2. * PI * i / 12.;
+        loop.emplace_back(r * std::cos(a), r * std::sin(a), 15. + 1.5 * std::cos(2. * a));
+    }
+    PathCut::LoopCutter lc = PathCut::make_loop_cutter(loop, kerf, 1.5, [](const PathCut::V3 &p) { return p; }, true);
+    REQUIRE(lc.valid());
+    REQUIRE(PathCut::fit_loop_margin(cyl, lc));
+    const PathCut::CutResult res = PathCut::cut_with_slab(cyl, lc, true);
+    REQUIRE(res.error.empty());
+    require_closed_parts(its_split(res.mesh));
+    for (size_t i = res.first_cap; i < res.first_cap + res.cap_triangles; ++i)
+        for (int k = 0; k < 3; ++k) {
+            const PathCut::V3 p = res.mesh.vertices[size_t(res.mesh.indices[i][k])].cast<double>();
+            CHECK_THAT(std::abs(lc.frame.height(p) - lc.hmean), WithinAbs(0.5 * kerf, 1e-3));
+        }
+}

@@ -502,8 +502,10 @@ struct LoopCutter
 
 // loop_points: points on the surface around the region to detach (closed, >= 3 points).
 // They are smoothed; pass a `snap` functor (V3 -> V3) to put the smoothed curve back on the surface.
+// flat: the cap is the mean plane of the loop instead of a surface following the loop's heights, for a
+// clean flat cut face (the cut then runs a little off the picked points where the loop is not planar).
 template<class Snap>
-LoopCutter make_loop_cutter(const std::vector<V3> &loop_points, double kerf, double margin, Snap snap)
+LoopCutter make_loop_cutter(const std::vector<V3> &loop_points, double kerf, double margin, Snap snap, bool flat = false)
 {
     LoopCutter lc;
     lc.kerf   = kerf;
@@ -611,6 +613,8 @@ LoopCutter make_loop_cutter(const std::vector<V3> &loop_points, double kerf, dou
     lc.angles = ang; lc.radius = rad; lc.hloop = h;
     double hm = 0.; for (double x : h) hm += x;
     lc.hmean = hm / double(h.size());
+    if (flat)
+        std::fill(lc.hloop.begin(), lc.hloop.end(), lc.hmean);
     return lc;
 }
 

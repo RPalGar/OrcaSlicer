@@ -60,6 +60,7 @@ private:
     Vec3d              m_view_dir{Vec3d::UnitY()}; // locked at the first point (view path mode)
     float              m_kerf{0.2f};             // clearance between parts [mm]
     float              m_margin{1.5f};           // minimum reach of the loop cap past the loop, widened as needed [mm]
+    bool               m_flat_cap{true};         // loop: flat cut face (mean plane) instead of following the loop
     enum class Sweep : int { View = 0, Level = 1, Vertical = 2, Custom = 3 };
     Sweep              m_sweep{Sweep::View};     // view path: direction the path is swept along
     float              m_turn{0.f}, m_tilt{0.f}; // custom sweep: around the vertical axis / below horizontal [deg]
@@ -90,6 +91,7 @@ private:
     Vec3d m_press_hit{Vec3d::Zero()};
     bool    m_preview_dirty{true};
     bool    m_busy{false};                     // a cut job is running
+    float   m_window_height{0.f};               // of the settings window, last frame
 };
 
 } // namespace GUI
