@@ -8,6 +8,7 @@
 #include "slic3r/GUI/GUI_App.hpp"
 #include "slic3r/GUI/I18N.hpp"
 #include "slic3r/GUI/ImGuiWrapper.hpp"
+#include "slic3r/GUI/format.hpp"
 #include "slic3r/GUI/MeshUtils.hpp"
 #include "slic3r/GUI/NotificationManager.hpp"
 #include "slic3r/GUI/PartPlate.hpp"
@@ -20,6 +21,7 @@
 #include "libslic3r/BoundingBox.hpp"
 #include "libslic3r/Geometry.hpp"
 #include "libslic3r/Model.hpp"
+#include "libslic3r/PathCutConnectors.hpp"
 #include "libslic3r/PathCutGeometry.hpp"
 #include "libslic3r/TriangleMesh.hpp"
 
@@ -61,6 +63,8 @@ static const ColorRGBA POINT_COLOR = {1.f, 0.55f, 0.f, 1.f};
     L("The object was changed while it was being cut. Cut it again."),
     L("The cut failed. Try a simpler path or a lower resolution model."),
     L("The cut ends inside the object. Increase or remove the limits, or start and end the path beyond the part."),
+    L("No connectors fit: the cut face is too curved for a straight connector."),
+    L("No connectors fit: the cut face is too small or too thin for them. Make them smaller or shorter."),
 };
 
 GLGizmoPathCut::GLGizmoPathCut(GLCanvas3D &parent, const std::string &icon_filename, unsigned int sprite_id)
@@ -532,6 +536,66 @@ void GLGizmoPathCut::on_render_input_window(float x, float y, float bottom_limit
         limit_row(_L("Limit past the first point (mm)"), m_lim_start, "##pathcut_start");
         limit_row(_L("Limit past the last point (mm)"), m_lim_end, "##pathcut_end");
     }
+
+    // Connectors: straight, along the mean direction of the cut face, placed where they fit.
+    ImGui::Separator();
+    ImGui::AlignTextToFramePadding();
+    m_imgui->text(_u8L("Connectors"));
+    ImGui::SameLine(input_w * 1.6f);
+    {
+        const std::vector<std::string> types{_u8L("None"), _u8L("Peg and hole"), _u8L("Separate pin")};
+        const int                      type = std::clamp(int(m_conn.type), 0, int(types.size()) - 1);
+        ImGui::PushItemWidth(input_w * 2.2f);
+        if (ImGui::BeginCombo("##pathcut_conn_type", types[size_t(type)].c_str())) {
+            for (int i = 0; i < int(types.size()); ++i)
+                if (ImGui::Selectable(types[size_t(i)].c_str(), i == type) && i != type) {
+                    m_conn.type = PathCut::ConnectorType(i);
+                    settings_changed();
+                }
+            ImGui::EndCombo();
+        }
+        ImGui::PopItemWidth();
+    }
+    if (m_conn.type != PathCut::ConnectorType::None) {
+        ImGui::AlignTextToFramePadding();
+        m_imgui->text(_u8L("Shape"));
+        ImGui::SameLine(input_w * 1.6f);
+        if (m_imgui->bbl_radio_button(_u8L("Cylinder").c_str(), m_conn.shape == PathCut::ConnectorShape::Cylinder) &&
+            m_conn.shape != PathCut::ConnectorShape::Cylinder) {
+            m_conn.shape = PathCut::ConnectorShape::Cylinder;
+            settings_changed();
+        }
+        ImGui::SameLine();
+        if (m_imgui->bbl_radio_button(_u8L("Square").c_str(), m_conn.shape == PathCut::ConnectorShape::Square) &&
+            m_conn.shape != PathCut::ConnectorShape::Square) {
+            m_conn.shape = PathCut::ConnectorShape::Square;
+            settings_changed();
+        }
+        auto float_row = [&](const std::string &label, const char *id, double &value, float step, float lo, float hi, const char *fmt) {
+            ImGui::AlignTextToFramePadding();
+            m_imgui->text(label);
+            ImGui::SameLine(input_w * 1.6f);
+            float v = float(value);
+            if (ImGui::InputFloat(id, &v, step, step * 5.f, fmt)) {
+                value = std::clamp(v, lo, hi);
+                settings_changed();
+            }
+        };
+        ImGui::AlignTextToFramePadding();
+        m_imgui->text(_u8L("Number of connectors"));
+        ImGui::SameLine(input_w * 1.6f);
+        if (ImGui::InputInt("##pathcut_conn_count", &m_conn.count, 1, 1)) {
+            m_conn.count = std::clamp(m_conn.count, 1, 8);
+            settings_changed();
+        }
+        float_row(_u8L("Diameter / side (mm)"), "##pathcut_conn_size", m_conn.size, 0.5f, 1.f, 50.f, "%.1f");
+        float_row(_u8L("Depth (mm)"), "##pathcut_conn_depth", m_conn.depth, 0.5f, 1.f, 50.f, "%.1f");
+        float_row(_u8L("Hole clearance (mm)"), "##pathcut_conn_tol", m_conn.clearance, 0.05f, 0.f, 1.f, "%.2f");
+        ImGui::PushTextWrapPos(ImGui::GetFontSize() * 26.f);
+        m_imgui->text(_u8L("Straight connectors along the mean direction of the cut face, placed automatically where both parts "
+                           "have room for them. Two or more also keep the parts from turning."));
+        ImGui::PopTextWrapPos();
+    }
     ImGui::PopItemWidth();
     m_imgui->disabled_end();
 
@@ -578,12 +642,14 @@ void GLGizmoPathCut::on_render_input_window(float x, float y, float bottom_limit
 // Moves the piece (single instance) to the free spot of the current plate nearest to `rest`,
 // keeping a gap to the rest and to every other object except `replaced` (the object being cut).
 // Falls back to just beside the rest when the plate has no room.
-static void place_piece(ModelObject &piece, const BoundingBoxf3 &rest, const ModelObject *replaced)
+static void place_piece(ModelObject &piece, const BoundingBoxf3 &rest, const ModelObject *replaced,
+                        const std::vector<BoundingBoxf3> &also_avoid = {})
 {
     constexpr double gap = 5.;
     Plater          *plater = wxGetApp().plater();
 
     std::vector<BoundingBoxf3> obstacles{rest};
+    obstacles.insert(obstacles.end(), also_avoid.begin(), also_avoid.end());
     for (const ModelObject *o : plater->model().objects)
         if (o != replaced)
             for (size_t i = 0; i < o->instances.size(); ++i)
@@ -638,6 +704,7 @@ struct PathCutJob
     GLGizmoPathCut::Mode     mode;
     float                    kerf, margin;
     PathCut::ViewLimits      limits;
+    PathCut::ConnectorParams conn;
     // the object
     int          obj_idx{-1}, inst_idx{-1};
     ModelObject *mo{nullptr};
@@ -649,6 +716,9 @@ struct PathCutJob
     PathCut::Grouped                          grouped;
     bool                                      joined{false}; // the sides still touch elsewhere
     std::vector<std::vector<PathCut::V3>>     routes;        // ... along these, object coordinates
+    PathCut::ConnectorResult                  connectors;    // object coordinates
+    bool                                      connectors_from_a{false}; // pegs stick out of side_a
+    std::string                               connector_error;
     std::string                               error;
 
     bool object_unchanged() const
@@ -718,6 +788,7 @@ void GLGizmoPathCut::perform_cut()
     st->kerf     = m_kerf;
     st->margin   = m_margin;
     st->limits   = view_limits();
+    st->conn     = m_conn;
 
     m_busy             = true;
     m_message          = _u8L("Cutting, please wait...");
@@ -788,11 +859,19 @@ void GLGizmoPathCut::perform_cut()
         }
         ctl.update_status(80, status);
         st->grouped = PathCut::group_cut(res, side, st->mode == GLGizmoPathCut::Mode::Loop, &st->joined);
+        lap("grouping");
         if (st->joined) {
             st->routes = PathCut::joined_routes(res, 3, -1., canceled);
             lap("connection routes");
+        } else if (st->conn.type != PathCut::ConnectorType::None && !st->grouped.side_a.indices.empty() &&
+                   !st->grouped.side_b.indices.empty()) {
+            ctl.update_status(90, status);
+            st->connectors_from_a = PathCut::peg_side(res, st->grouped.side_a, st->grouped.side_b) == 1;
+            const indexed_triangle_set &from = st->connectors_from_a ? st->grouped.side_a : st->grouped.side_b;
+            const indexed_triangle_set &to   = st->connectors_from_a ? st->grouped.side_b : st->grouped.side_a;
+            st->connectors = PathCut::place_connectors(res, st->connectors_from_a ? 1 : -1, from, to, st->conn, st->connector_error, canceled);
+            lap("connectors");
         }
-        lap("grouping");
         ctl.update_status(100, status);
     };
 
@@ -882,31 +961,69 @@ void GLGizmoPathCut::apply_cut(std::shared_ptr<PathCutJob> st)
     if (sides[0]->indices.empty())
         sides.erase(sides.begin());
 
+    const PathCut::ConnectorResult &conn       = st->connectors;
+    const bool                      connectors = sides.size() == 2 && !conn.positions.empty();
+    const indexed_triangle_set     *from_side  = st->connectors_from_a ? &grouped.side_a : &grouped.side_b;
+
     Model                          tmp;
     const std::vector<std::string> suffix = sides.size() == 2 ? std::vector<std::string>{_u8L("piece"), _u8L("rest")} :
                                                                  std::vector<std::string>{_u8L("cut")};
-    for (size_t i = 0; i < sides.size(); ++i) {
+    auto add_part = [&](ModelObject *no, const std::string &name, indexed_triangle_set its, ModelVolumeType type) {
+        if (its.indices.empty())
+            return;
+        ModelVolume *nv = no->add_volume(TriangleMesh(std::move(its)), type);
+        nv->name        = name;
+        if (first_part && type == ModelVolumeType::MODEL_PART) {
+            nv->config.apply(first_part->config);
+            nv->set_material_id(first_part->material_id());
+        }
+    };
+    auto new_object = [&](const std::string &name, indexed_triangle_set its) {
         ModelObject *no = tmp.add_object(*mo);
         no->clear_volumes();
         no->clear_instances();
         no->cut_connectors.clear();
         no->cut_id.invalidate();
-        no->name        = mo->name + " - " + suffix[i];
-        ModelVolume *nv = no->add_volume(TriangleMesh(std::move(*sides[i])));
-        nv->name        = no->name;
-        if (first_part) {
-            nv->config.apply(first_part->config);
-            nv->set_material_id(first_part->material_id());
-        }
+        no->name = name;
+        add_part(no, name, std::move(its), ModelVolumeType::MODEL_PART);
+        return no;
+    };
+    auto put_on_bed = [&](ModelObject *no) {
         ModelInstance *ni = no->add_instance();
         ni->set_offset(st->offset);
         no->invalidate_bounding_box();
         no->ensure_on_bed();
+    };
+    for (size_t i = 0; i < sides.size(); ++i) {
+        const bool   is_from = sides[i] == from_side;
+        ModelObject *no      = new_object(mo->name + " - " + suffix[i], std::move(*sides[i]));
+        if (connectors) {
+            const std::string name = _u8L("Connector");
+            if (is_from) {
+                add_part(no, name, conn.pegs, ModelVolumeType::MODEL_PART);
+                add_part(no, name, conn.holes_from, ModelVolumeType::NEGATIVE_VOLUME);
+            } else
+                add_part(no, name, conn.holes_to, ModelVolumeType::NEGATIVE_VOLUME);
+        }
+        put_on_bed(no);
     }
-    // Both pieces now rest on the bed; put the detached one in the free spot of the current plate
-    // closest to the rest, so it doesn't overlap the rest or any other object.
-    if (tmp.objects.size() == 2)
-        place_piece(*tmp.objects[0], tmp.objects[1]->instance_bounding_box(0), mo);
+    // Separate pins: one object each, standing on the bed.
+    const size_t n_cut = tmp.objects.size();
+    if (connectors && !conn.pin.indices.empty())
+        for (size_t k = 0; k < conn.positions.size(); ++k)
+            put_on_bed(new_object(mo->name + " - " + _u8L("pin") + " " + std::to_string(k + 1), conn.pin));
+    // The pieces now rest on the bed; put the detached one (and the pins) in the free spots of the current
+    // plate closest to the rest, so nothing overlaps the rest, each other or any other object.
+    if (n_cut == 2) {
+        const BoundingBoxf3        rest_bb = tmp.objects[1]->instance_bounding_box(0);
+        std::vector<BoundingBoxf3> placed;
+        for (size_t i = 0; i < tmp.objects.size(); ++i) {
+            if (i == 1)
+                continue;
+            place_piece(*tmp.objects[i], rest_bb, mo, placed);
+            placed.push_back(tmp.objects[i]->instance_bounding_box(0));
+        }
+    }
     if (grouped.n_small > 0)
         BOOST_LOG_TRIVIAL(info) << "PathCut: " << grouped.n_small << " tiny fragments kept with their side";
 
@@ -915,10 +1032,21 @@ void GLGizmoPathCut::apply_cut(std::shared_ptr<PathCutJob> st)
     const auto t0 = std::chrono::steady_clock::now();
     Plater::TakeSnapshot snapshot(plater, _u8L("Cut along path"));
     plater->apply_cut_object_to_model(size_t(st->obj_idx), tmp.objects);
-    if (st->joined)
-        plater->get_notification_manager()->push_notification(
-            NotificationType::CustomNotification, NotificationManager::NotificationLevel::WarningNotificationLevel,
-            _u8L("Cut along path: the cut is made, but the object is still in one piece. Cut the remaining connection to separate it."));
+    auto warn = [plater](const std::string &text) {
+        plater->get_notification_manager()->push_notification(NotificationType::CustomNotification,
+                                                              NotificationManager::NotificationLevel::WarningNotificationLevel, text);
+    };
+    if (st->joined) {
+        std::string text = _u8L("Cut along path: the cut is made, but the object is still in one piece. Cut the remaining connection to separate it.");
+        if (st->conn.type != PathCut::ConnectorType::None)
+            text += " " + _u8L("Connectors are only added once the cut separates the object.");
+        warn(text);
+    } else if (st->conn.type != PathCut::ConnectorType::None) {
+        if (!st->connector_error.empty())
+            warn(_u8L("Cut along path") + ": " + _u8L(st->connector_error.c_str()));
+        else if (int(conn.positions.size()) < st->conn.count)
+            warn(GUI::format(_u8L("Cut along path: only %1% of %2% connectors fit on the cut face."), conn.positions.size(), st->conn.count));
+    }
     BOOST_LOG_TRIVIAL(info) << "PathCut: apply to model "
                             << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count()
                             << " ms";

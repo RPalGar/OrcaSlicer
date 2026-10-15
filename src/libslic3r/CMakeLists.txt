@@ -120,6 +120,7 @@ set(lisbslic3r_sources
     CutUtils.cpp
     CutUtils.hpp
     PathCutGeometry.hpp
+    PathCutConnectors.hpp
     EdgeGrid.cpp
     EdgeGrid.hpp
     ElephantFootCompensation.cpp

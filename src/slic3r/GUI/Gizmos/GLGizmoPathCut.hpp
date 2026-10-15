@@ -3,6 +3,7 @@
 #include "GLGizmoBase.hpp"
 #include "GLGizmosCommon.hpp"
 #include "slic3r/GUI/GLModel.hpp"
+#include "libslic3r/PathCutConnectors.hpp"
 #include "libslic3r/PathCutGeometry.hpp"
 #include "libslic3r/Point.hpp"
 
@@ -66,6 +67,8 @@ private:
     // past the first / last point along the path. Unchecked = through the whole object.
     struct Limit { bool on{false}; float mm{3.f}; };
     Limit              m_lim_front, m_lim_back{false, 20.f}, m_lim_start, m_lim_end;
+    // Straight connectors across the cut face (pegs into holes, or separate pins), placed automatically.
+    PathCut::ConnectorParams m_conn;
     std::string        m_message;
     bool               m_message_is_error{false};
     const ModelObject *m_object{nullptr};        // object the points were picked on

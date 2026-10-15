@@ -1,6 +1,7 @@
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/matchers/catch_matchers_floating_point.hpp>
 
+#include <libslic3r/PathCutConnectors.hpp>
 #include <libslic3r/PathCutGeometry.hpp>
 #include <libslic3r/TriangleMesh.hpp>
 
@@ -191,4 +192,57 @@ TEST_CASE("Zero-thickness sheets glued to a mesh are removed before cutting", "[
     CHECK(PathCut::make_edge_manifold(its) > 0);
     edge_counts(its, open, max_faces);
     CHECK(max_faces == 2);
+}
+
+TEST_CASE("Connectors on a wavy cut face fit inside both parts", "[PathCut]")
+{
+    // 30 x 30 x 40 box cut by a wavy path around z = 20, seen from the front.
+    const indexed_triangle_set box = its_make_cube(30., 30., 40.);
+    const std::vector<PathCut::V3> pts{{-2., 0., 18.}, {10., 0., 22.}, {20., 0., 17.}, {32., 0., 21.}};
+    const PathCut::ViewCutter vc = PathCut::make_view_cutter(pts, PathCut::V3::UnitY(), PathCut::V3::Zero(), PathCut::V3(30., 30., 40.), 0.2);
+    REQUIRE(vc.valid());
+    const PathCut::CutResult res = PathCut::cut_with_slab(box, vc, false);
+    REQUIRE(res.error.empty());
+    bool joined = true;
+    const PathCut::Grouped g = PathCut::group_cut(res, [&vc](const PathCut::V3 &p) { return vc.side(p); }, false, &joined);
+    REQUIRE_FALSE(joined);
+
+    // The cut face looks up on the lower part: the pegs go there, pointing up.
+    const int                   level = PathCut::peg_side(res, g.side_a, g.side_b);
+    const indexed_triangle_set &from  = level == 1 ? g.side_a : g.side_b;
+    const indexed_triangle_set &to    = level == 1 ? g.side_b : g.side_a;
+
+    PathCut::ConnectorParams prm;
+    prm.type  = PathCut::ConnectorType::Plug;
+    prm.count = 3;
+    std::string                    error;
+    const PathCut::ConnectorResult c = PathCut::place_connectors(res, level, from, to, prm, error);
+    REQUIRE(error.empty());
+    REQUIRE(c.positions.size() == 3);
+    CHECK(c.axis.z() > 0.9);
+    require_closed_parts({c.pegs, c.holes_to});
+    for (const PathCut::V3 &p : c.positions) {
+        CHECK(PathCut::point_inside(from, p - 1. * c.axis));      // peg base sunk into the lower part
+        CHECK(PathCut::point_inside(to, p + prm.depth * c.axis)); // peg tip inside the upper part
+    }
+    for (size_t i = 0; i < c.positions.size(); ++i)
+        for (size_t j = i + 1; j < c.positions.size(); ++j)
+            CHECK((c.positions[i] - c.positions[j]).norm() > prm.size + 2. * (prm.clearance + prm.wall));
+
+    SECTION("separate pins get holes on both sides")
+    {
+        prm.type                        = PathCut::ConnectorType::Dowel;
+        const PathCut::ConnectorResult d = PathCut::place_connectors(res, level, from, to, prm, error);
+        REQUIRE_FALSE(d.positions.empty());
+        CHECK(d.pegs.indices.empty());
+        require_closed_parts({d.holes_from, d.holes_to, d.pin});
+        CHECK_THAT(its_volume(d.pin), WithinAbs(PI * 2.5 * 2.5 * 10., 2.));
+    }
+    SECTION("connectors too big for the part are reported")
+    {
+        prm.size  = 40.;
+        const PathCut::ConnectorResult big = PathCut::place_connectors(res, level, from, to, prm, error);
+        CHECK(big.positions.empty());
+        CHECK_FALSE(error.empty());
+    }
 }

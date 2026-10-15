@@ -36514,3 +36514,52 @@ msgstr "Giro (°)"
 # AI Translated
 msgid "cut"
 msgstr "cortado"
+
+# AI Translated
+msgid "No connectors fit: the cut face is too curved for a straight connector."
+msgstr "No caben conectores: la cara de corte es demasiado curva para un conector recto."
+
+# AI Translated
+msgid "No connectors fit: the cut face is too small or too thin for them. Make them smaller or shorter."
+msgstr "No caben conectores: la cara de corte es demasiado pequeña o estrecha para ellos. Hazlos más pequeños o más cortos."
+
+# AI Translated
+msgid "Peg and hole"
+msgstr "Espiga y agujero"
+
+# AI Translated
+msgid "Separate pin"
+msgstr "Pasador suelto"
+
+# AI Translated
+msgid "Number of connectors"
+msgstr "Número de conectores"
+
+# AI Translated
+msgid "Diameter / side (mm)"
+msgstr "Diámetro / lado (mm)"
+
+# AI Translated
+msgid "Depth (mm)"
+msgstr "Profundidad (mm)"
+
+# AI Translated
+msgid "Hole clearance (mm)"
+msgstr "Holgura del agujero (mm)"
+
+# AI Translated
+msgid "Straight connectors along the mean direction of the cut face, placed automatically where both parts have room for them. Two or more also keep the parts from turning."
+msgstr "Conectores rectos en la dirección media de la cara de corte, colocados automáticamente donde las dos partes tienen sitio. Con dos o más, además, las piezas no pueden girar."
+
+# AI Translated
+msgid "pin"
+msgstr "pasador"
+
+# AI Translated
+msgid "Connectors are only added once the cut separates the object."
+msgstr "Los conectores solo se añaden cuando el corte separa el objeto."
+
+# AI Translated
+#, boost-format
+msgid "Cut along path: only %1% of %2% connectors fit on the cut face."
+msgstr "Cortar por ruta: solo caben %1% de %2% conectores en la cara de corte."
