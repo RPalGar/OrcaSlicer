@@ -212,13 +212,17 @@ inline ConnectorResult place_connectors(const CutResult &cut, int from_level, co
     ConnectorResult res;
     error.clear();
     if (prm.type == ConnectorType::None || prm.count <= 0) return res;
+    if (!(prm.size > 0.) || !(prm.depth > 0.)) {
+        error = "No connectors fit: the cut face is too small or too thin for them. Make them smaller or shorter.";
+        return res;
+    }
     const indexed_triangle_set &m = cut.mesh;
 
     // Cut face of `from`: its triangles and their mean outward normal (pointing into `to`).
     std::vector<size_t> face;
     V3                  nsum;
     const double        area = cut_face(cut, from_level, &face, nsum);
-    if (face.empty() || nsum.norm() < 0.2 * area) {
+    if (face.empty() || !(area > 1e-9) || nsum.norm() <= 0.2 * area) {
         error = "No connectors fit: the cut face is too curved for a straight connector.";
         return res;
     }
@@ -237,20 +241,35 @@ inline ConnectorResult place_connectors(const CutResult &cut, int from_level, co
     const double ro    = rh + wall;                        // must be solid out to here around a hole
     const bool   dowel = prm.type == ConnectorType::Dowel;
 
-    // Candidates: cut face triangles, one per grid cell across the axis.
-    double cell = std::max(0.5 * r, 0.25);
+    // Candidates: points on the cut face, one per grid cell across the axis. Large cut face triangles
+    // (a flat cap is a few big ones) are sampled inside, not only at their centroid, so a spot that fits
+    // is not missed for lack of a candidate near it.
+    double cell = std::max(0.25 * r, 0.25);
     std::vector<V3> cand;
     for (int attempt = 0; attempt < 8; ++attempt, cell *= 1.6) {
         cand.clear();
         std::unordered_map<uint64_t, size_t> seen;
+        std::vector<double> off; // distance of each candidate to its cell centre: keep the closest
+        auto add = [&](const V3 &c) {
+            const V2       q   = f.to2d(c);
+            const double   gx = std::floor(q.x() / cell), gy = std::floor(q.y() / cell);
+            const uint64_t key = (uint64_t(uint32_t(int32_t(gx))) << 32) | uint32_t(int32_t(gy));
+            const double   d   = (q - V2((gx + 0.5) * cell, (gy + 0.5) * cell)).norm();
+            auto [it, ins]     = seen.emplace(key, cand.size());
+            if (ins) { cand.push_back(c); off.push_back(d); }
+            else if (d < off[it->second]) { cand[it->second] = c; off[it->second] = d; }
+        };
         for (size_t i : face) {
             const auto &t = m.indices[i];
-            const V3    c = (m.vertices[size_t(t[0])].cast<double>() + m.vertices[size_t(t[1])].cast<double>() + m.vertices[size_t(t[2])].cast<double>()) / 3.;
-            const V2    q = f.to2d(c);
-            const uint64_t key = (uint64_t(uint32_t(int32_t(std::floor(q.x() / cell)))) << 32) | uint32_t(int32_t(std::floor(q.y() / cell)));
-            if (seen.emplace(key, cand.size()).second) cand.push_back(c);
+            const V3    a = m.vertices[size_t(t[0])].cast<double>(), b = m.vertices[size_t(t[1])].cast<double>(), c = m.vertices[size_t(t[2])].cast<double>();
+            add((a + b + c) / 3.);
+            const double longest = std::max({(b - a).norm(), (c - b).norm(), (a - c).norm()});
+            const int    k       = std::min(64, int(longest / cell));
+            for (int u = 1; u < k; ++u)
+                for (int v = 1; u + v < k; ++v)
+                    add(a + (b - a) * (double(u) / k) + (c - a) * (double(v) / k));
         }
-        if (cand.size() <= 4000) break;
+        if (cand.size() <= 6000) break;
     }
 
     const detail::LineCaster cast_from(from, f), cast_to(to, f);

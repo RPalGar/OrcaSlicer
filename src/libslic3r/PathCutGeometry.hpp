@@ -20,6 +20,8 @@
 
 #include <admesh/stl.h>
 #include <earcut/earcut.hpp>
+#include <tbb/blocked_range.h>
+#include <tbb/parallel_for.h>
 #include <tbb/parallel_sort.h>
 #include <Eigen/Core>
 #include <Eigen/Geometry>
@@ -183,7 +185,18 @@ struct ViewCutter
     }
 
     // +1 left of the path, -1 right of it.
-    int side(const V3 &p) const { return point_in_polygon(left_side, frame.to2d(p)) ? 1 : -1; }
+    int side(const V3 &p) const { return exact_field(frame.to2d(p)) >= 0. ? 1 : -1; }
+    // Sign of the side of the nearest feature (segment normal, or the mean normal at a shared vertex).
+    double signed_from(const V2 &q, size_t bs, double bt, double best) const
+    {
+        auto nrm = [this](size_t i) { const V2 d = (path[i + 1] - path[i]).normalized(); return V2(-d.y(), d.x()); };
+        V2 n = nrm(bs);
+        if (bt <= 0. && bs > 0) n += nrm(bs - 1);
+        if (bt >= 1. && bs + 2 < path.size()) n += nrm(bs + 1);
+        const V2 foot = path[bs] + (path[bs + 1] - path[bs]) * bt;
+        return (q - foot).dot(n) >= 0. ? best : -best;
+    }
+    double exact_field(const V2 &q) const { size_t s = 0; double t = 0., d = 0.; nearest(q, s, t, d); return signed_from(q, s, t, d); }
 
     // Nearest point of the path to a point of the view plane: segment index and parameter.
     void nearest(const V2 &q, size_t &seg, double &t, double &dist) const
@@ -231,10 +244,13 @@ struct ViewCutter
                 }
         }
         cell_side.assign(size_t(nx) * ny, 0);
-        for (int y = 0; y < ny; ++y)
-            for (int x = 0; x < nx; ++x)
-                if (cell_segs[size_t(y) * nx + x].empty())
-                    cell_side[size_t(y) * nx + x] = point_in_polygon(left_side, grid_min + V2((x + 0.5) * cell, (y + 0.5) * cell)) ? 1 : -1;
+        // One exact (nearest segment) evaluation per empty cell: rows in parallel, each cell written once.
+        tbb::parallel_for(tbb::blocked_range<int>(0, ny), [this](const tbb::blocked_range<int> &rows) {
+            for (int y = rows.begin(); y < rows.end(); ++y)
+                for (int x = 0; x < nx; ++x)
+                    if (cell_segs[size_t(y) * nx + x].empty())
+                        cell_side[size_t(y) * nx + x] = exact_field(grid_min + V2((x + 0.5) * cell, (y + 0.5) * cell)) >= 0. ? 1 : -1;
+        });
     }
     // Nearest path segment among those listed in the grid cell of q; false when none is near.
     bool nearest_in_grid(const V2 &q, size_t &seg, double &t, double &d) const
@@ -256,11 +272,8 @@ struct ViewCutter
     {
         const V2  q = frame.to2d(p);
         const int x = int(std::floor((q.x() - grid_min.x()) / cell)), y = int(std::floor((q.y() - grid_min.y()) / cell));
-        if (x < 0 || y < 0 || x >= nx || y >= ny) {
-            size_t seg; double t, d;
-            nearest(q, seg, t, d);
-            return point_in_polygon(left_side, q) ? d : -d;
-        }
+        if (x < 0 || y < 0 || x >= nx || y >= ny)
+            return exact_field(q);
         const auto &segs = cell_segs[size_t(y) * nx + x];
         if (segs.empty())
             return cell_side[size_t(y) * nx + x] * reach;
@@ -272,8 +285,8 @@ struct ViewCutter
             const double d  = (q - (path[i] + ab * t)).norm();
             if (d < best) { best = d; bs = i; bt = t; }
         }
-        if (best > reach) // far from the path: exact side from the polygon
-            return point_in_polygon(left_side, q) ? best : -best;
+        if (best > reach)
+            return exact_field(q);
         // Side from the nearest feature: segment normal, or the mean normal at a shared vertex.
         auto nrm = [this](int i) { const V2 d = (path[i + 1] - path[i]).normalized(); return V2(-d.y(), d.x()); };
         V2 n = nrm(bs);
@@ -1316,22 +1329,40 @@ CutResult cut_with_slab(indexed_triangle_set its, const Cutter &cutter, bool bou
                 std::unordered_map<int, std::vector<size_t>> from;
                 for (size_t i = 0; i < gap.size(); ++i) from[gap[i].first].push_back(i);
                 std::vector<bool> done(gap.size(), false);
+                // A chain can pass a vertex twice (rings pinched in the chart): split it there into simple
+                // cycles, and fan each from a new centre vertex so no fan edge can duplicate an existing one.
+                auto close_cycle = [&](const int *c, size_t n) {
+                    if (n < 3) return;
+                    if (n == 3) { cap.emplace_back(c[0], c[1], c[2]); return; }
+                    V2 m = V2::Zero();
+                    for (size_t k = 0; k < n; ++k) m += uv[c[k]];
+                    m /= double(n);
+                    const int x = int(its.vertices.size());
+                    uv[x]       = m;
+                    its.vertices.emplace_back(cutter.lift(m, level).template cast<float>());
+                    for (size_t k = 0; k < n; ++k) cap.emplace_back(x, c[k], c[(k + 1) % n]);
+                };
                 for (size_t s0 = 0; s0 < gap.size(); ++s0) {
                     if (done[s0]) continue;
-                    std::vector<int> cyc;
+                    std::vector<int>                cyc;
+                    std::unordered_map<int, size_t> at;
                     size_t e = s0;
-                    bool   closed = false;
                     for (size_t guard = 0; guard <= gap.size(); ++guard) {
                         done[e] = true;
+                        at[gap[e].first] = cyc.size();
                         cyc.push_back(gap[e].first);
-                        if (gap[e].second == gap[s0].first) { closed = true; break; }
+                        const int w = gap[e].second;
+                        if (auto it = at.find(w); it != at.end()) {
+                            const size_t p = it->second;
+                            close_cycle(cyc.data() + p, cyc.size() - p);
+                            for (size_t k = p; k < cyc.size(); ++k) at.erase(cyc[k]);
+                            cyc.resize(p);
+                        }
                         size_t next = size_t(-1);
-                        for (size_t c : from[gap[e].second]) if (!done[c]) { next = c; break; }
+                        for (size_t c : from[w]) if (!done[c]) { next = c; break; }
                         if (next == size_t(-1)) break;
                         e = next;
                     }
-                    if (closed)
-                        for (size_t k = 1; k + 1 < cyc.size(); ++k) cap.emplace_back(cyc[0], cyc[k], cyc[k + 1]);
                 }
             }
             // Lifted chart position of each cap vertex (the boundary vertices themselves sit on the

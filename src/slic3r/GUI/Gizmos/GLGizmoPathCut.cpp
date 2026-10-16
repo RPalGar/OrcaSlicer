@@ -31,6 +31,7 @@
 #include <wx/glcanvas.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cfloat>
 #include <chrono>
 #include <cstdlib>
@@ -93,8 +94,20 @@ CommonGizmosDataID GLGizmoPathCut::on_get_requirements() const
                               int(CommonGizmosDataID::Raycaster) | int(CommonGizmosDataID::ObjectClipper));
 }
 
+static void abort_job(PathCutJob &job); // below, after PathCutJob
+
 void GLGizmoPathCut::on_set_state()
 {
+    if (m_state == Off) {
+        // A cut still running when the tool closes is cancelled, and its result dropped (it would
+        // otherwise apply later, on whatever the user is doing by then).
+        // (Its own flag, not the worker's cancel: that would hit whatever job is running at the time.)
+        ++m_generation;
+        if (m_running)
+            abort_job(*m_running);
+        m_running.reset();
+        m_busy = false;
+    }
     if (m_state == On || m_state == Off)
         reset_path();
     m_message.clear();
@@ -146,8 +159,12 @@ void GLGizmoPathCut::add_point(const Vec3d &hit)
         m_points.clear();
         m_object = mo;
     }
-    if (m_points.empty())
+    if (m_points.empty()) {
         m_view_dir = wxGetApp().plater()->get_camera().get_dir_forward();
+        const int inst = m_parent.get_selection().get_instance_idx();
+        if (inst >= 0 && inst < int(mo->instances.size()))
+            m_inst_matrix = mo->instances[inst]->get_matrix();
+    }
     clear_pending();
     m_points.push_back(hit);
     m_message.clear();
@@ -163,15 +180,18 @@ bool GLGizmoPathCut::on_mouse(const wxMouseEvent &mouse_event)
     if (mouse_event.LeftDown())
         m_press_on_object = m_orbiting = false; // a lost release must not leave a press behind
     if (mouse_event.LeftDown() && !mouse_event.CmdDown()) {
-        Vec3d hit;
-        if (!raycast(mouse_pos, hit))
-            return false; // empty space: the canvas orbits the view
-        // On the object: a click adds a point (on release), a drag orbits the view. The canvas must not
-        // see this press, or it would start moving the object.
-        m_press_on_object = true;
-        m_orbiting        = false;
+        Vec3d      hit;
+        const bool on_part = raycast(mouse_pos, hit);
+        // Empty space: the canvas orbits the view. On a modifier or negative volume (not cut, so no point)
+        // the press is still kept from the canvas, which would otherwise start moving the object.
+        if (!on_part && m_parent.get_first_hover_volume_idx() < 0)
+            return false;
+        // On the object: a click adds a point (on release), a drag orbits the view.
+        m_press_on_object  = true;
+        m_press_adds_point = on_part;
+        m_orbiting         = false;
         m_press_pos = m_last_pos = mouse_pos;
-        m_press_hit       = hit;
+        m_press_hit        = hit;
         return true;
     }
     if (m_press_on_object && mouse_event.Dragging() && mouse_event.LeftIsDown()) {
@@ -202,17 +222,26 @@ bool GLGizmoPathCut::on_mouse(const wxMouseEvent &mouse_event)
     }
     if (m_press_on_object && mouse_event.LeftUp()) {
         m_press_on_object = false;
-        if (!m_orbiting)
+        if (!m_orbiting && m_press_adds_point)
             add_point(m_press_hit);
         m_orbiting = false;
         return true;
     }
-    if (mouse_event.RightDown() && !m_points.empty()) {
-        clear_pending();
-        m_points.pop_back();
-        m_preview_dirty = true;
-        m_parent.set_as_dirty();
-        return true;
+    // Right click removes the last point; a right drag pans the view as usual.
+    if (mouse_event.RightDown()) {
+        m_right_press = true;
+        m_right_pos   = mouse_pos;
+        return false;
+    }
+    if (mouse_event.RightUp() && m_right_press) {
+        m_right_press = false;
+        if ((mouse_pos - m_right_pos).norm() <= 4. && !m_points.empty()) {
+            clear_pending();
+            m_points.pop_back();
+            m_preview_dirty = true;
+            m_parent.set_as_dirty();
+            return true;
+        }
     }
     return false;
 }
@@ -732,6 +761,7 @@ struct PathCutJob
     bool                     flat_cap{true};
     PathCut::ViewLimits      limits;
     PathCut::ConnectorParams conn;
+    std::atomic<bool>        abort{false}; // set when the tool closes
     // the object
     int          obj_idx{-1}, inst_idx{-1};
     ModelObject *mo{nullptr};
@@ -762,6 +792,8 @@ struct PathCutJob
     }
 };
 
+static void abort_job(PathCutJob &job) { job.abort = true; }
+
 void GLGizmoPathCut::clear_pending()
 {
     m_pending.reset();
@@ -785,7 +817,33 @@ void GLGizmoPathCut::perform_cut()
         reset_path();
         return;
     }
+    auto refuse = [this](const std::string &why) {
+        m_message          = why;
+        m_message_is_error = true;
+        m_parent.set_as_dirty();
+    };
+    // The cut replaces the object by its pieces, made from its model parts only. Refused where that would
+    // lose something: other copies of the object, other parts (with their own settings), modifiers,
+    // negative volumes (e.g. the holes of a plane cut) and support blockers/enforcers.
+    if (mo->instances.size() > 1) {
+        refuse(_u8L("This object has several copies. Cutting it would remove the other copies: make them separate "
+                    "objects first, then cut one of them."));
+        return;
+    }
+    size_t parts = 0, others = 0;
+    for (const ModelVolume *v : mo->volumes)
+        (v->is_model_part() ? parts : others) += 1;
+    if (parts != 1 || others != 0) {
+        refuse(_u8L("This object has several parts, modifiers or negative volumes. Cut along path only works on "
+                    "objects made of a single part, so they would be lost."));
+        return;
+    }
     const ModelInstance *mi = mo->instances[inst_idx];
+    if (!mi->get_matrix().isApprox(m_inst_matrix)) {
+        reset_path();
+        refuse(_u8L("The object was moved since the points were placed. Place them again."));
+        return;
+    }
 
     // Everything the background job needs is copied here; the job never touches the Model.
     auto st      = std::make_shared<PathCutJob>();
@@ -834,7 +892,7 @@ void GLGizmoPathCut::perform_cut()
             t0 = now;
         };
         const std::string status = _u8L("Cutting along path");
-        auto canceled = [&ctl]() { return ctl.was_canceled(); };
+        auto canceled = [&ctl, &st]() { return ctl.was_canceled() || st->abort; };
         BOOST_LOG_TRIVIAL(info) << "PathCut: " << st->src.indices.size() << " triangles";
         ctl.update_status(5, status);
         PathCut::make_edge_manifold(st->src);
@@ -904,8 +962,14 @@ void GLGizmoPathCut::perform_cut()
     };
 
     // Back on the UI thread.
-    auto finalize = [this, st](bool canceled, std::exception_ptr &eptr) {
+    const unsigned generation = m_generation;
+    auto finalize = [this, st, generation](bool canceled, std::exception_ptr &eptr) {
+        if (generation != m_generation || m_state != On) {
+            eptr = nullptr; // the tool was closed meanwhile: drop the result, whatever it is
+            return;
+        }
         m_busy = false;
+        m_running.reset();
         std::string error = st->error;
         if (eptr) {
             try {
@@ -958,10 +1022,39 @@ void GLGizmoPathCut::perform_cut()
         apply_cut(st);
     };
 
-    queue_job(plater->get_ui_job_worker(), std::move(process), std::move(finalize));
+    m_running = st;
+    if (!queue_job(plater->get_ui_job_worker(), std::move(process), std::move(finalize))) {
+        m_running.reset();
+        m_busy = false;
+        m_message.clear();
+    }
 }
 
+// An exception escaping here (UI thread, job finalize or CallAfter) would end the application.
 void GLGizmoPathCut::apply_cut(std::shared_ptr<PathCutJob> st)
+{
+    try {
+        do_apply_cut(st);
+    } catch (const std::exception &e) {
+        BOOST_LOG_TRIVIAL(error) << "PathCut: applying the cut failed: " << e.what();
+        cut_failed();
+    } catch (...) {
+        BOOST_LOG_TRIVIAL(error) << "PathCut: applying the cut failed";
+        cut_failed();
+    }
+}
+
+// The tool may already be closed at that point (applying closes it), so also as a notification.
+void GLGizmoPathCut::cut_failed()
+{
+    m_message          = _u8L("The cut could not be applied.");
+    m_message_is_error = true;
+    wxGetApp().plater()->get_notification_manager()->push_notification(
+        NotificationType::CustomNotification, NotificationManager::NotificationLevel::ErrorNotificationLevel, m_message);
+    m_parent.set_as_dirty();
+}
+
+void GLGizmoPathCut::do_apply_cut(const std::shared_ptr<PathCutJob> &st)
 {
     clear_pending();
     if (!st->object_unchanged()) {

@@ -52,6 +52,8 @@ private:
     PathCut::ViewLimits view_limits() const;
     void               add_point(const Vec3d &hit);
     void               apply_cut(std::shared_ptr<PathCutJob> job); // by value: callers pass m_pending
+    void               do_apply_cut(const std::shared_ptr<PathCutJob> &job);
+    void               cut_failed();
     void               clear_pending();
     void               rebuild_cutter_preview();
 
@@ -89,6 +91,12 @@ private:
     bool  m_orbiting{false};
     Vec2d m_press_pos{Vec2d::Zero()}, m_last_pos{Vec2d::Zero()};
     Vec3d m_press_hit{Vec3d::Zero()};
+    bool  m_press_adds_point{false};             // the press hit the part (not a modifier): a click adds a point
+    bool  m_right_press{false};                  // a right click (not a drag) removes the last point
+    Vec2d m_right_pos{Vec2d::Zero()};
+    Transform3d m_inst_matrix{Transform3d::Identity()}; // of the instance when the points were placed
+    unsigned    m_generation{0};                 // bumped when the tool closes: a cut finishing later is dropped
+    std::shared_ptr<PathCutJob> m_running;       // the cut in flight, to stop it when the tool closes
     bool    m_preview_dirty{true};
     bool    m_busy{false};                     // a cut job is running
     float   m_window_height{0.f};               // of the settings window, last frame

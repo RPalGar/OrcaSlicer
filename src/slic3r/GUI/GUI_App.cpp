@@ -478,8 +478,16 @@ public:
         rc.height = dc.GetTextExtent(m_text_version).GetHeight();
         dc.DrawLabel(m_text_version, rc, wxALIGN_CENTER);
 
+        // Path cut fork: which build this is, under the version number (the version itself is left alone,
+        // it drives updates and profile checks).
         dc.SetFont(m_font_action);
-        rc.y      = c_sz.GetHeight() * 0.85;
+        rc.y += rc.height + m_window->FromDIP(4);
+        rc.height = dc.GetTextExtent(m_text_edition).GetHeight();
+        dc.DrawLabel(m_text_edition, rc, wxALIGN_CENTER);
+        const int edition_bottom = rc.y + rc.height;
+
+        dc.SetFont(m_font_action);
+        rc.y      = std::max(int(c_sz.GetHeight() * 0.85), edition_bottom + m_window->FromDIP(4));
         rc.height = dc.GetTextExtent(m_text_action).GetHeight();
         dc.DrawLabel(m_text_action, rc, wxALIGN_CENTER);
 
@@ -547,6 +555,7 @@ private:
     wxColour m_progress_fg_color;
 
     wxString m_text_version = GUI_App::format_display_version();
+    wxString m_text_edition = wxString::FromUTF8("Versi\xC3\xB3n beta Adimaker26") /* "Versión", escaped: source charset independent */;
     wxString m_text_action  = _L("Loading configuration") + dots;
     int      m_progress     = 0;
     int      m_progress_h   = 6;

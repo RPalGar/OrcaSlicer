@@ -36391,17 +36391,11 @@ msgstr "Haz clic en puntos del objeto a lo largo de la línea por donde quieres 
 msgid "Click points on the surface all the way around the part to detach (e.g. an arm). The loop closes itself; a curved cap spanning it separates only that part."
 msgstr "Haz clic en puntos de la superficie alrededor de toda la parte que quieres separar (por ejemplo, un brazo). El lazo se cierra solo; una tapa curva que lo rellena separa únicamente esa parte."
 
-# AI Translated
-msgid "Right click removes the last point. Drag on empty space, or Ctrl + drag, to rotate the view."
-msgstr "Clic derecho elimina el último punto. Arrastra sobre el espacio vacío, o Ctrl + arrastrar, para girar la vista."
 
 # AI Translated
 msgid "Clearance (mm)"
 msgstr "Holgura (mm)"
 
-# AI Translated
-msgid "Cap margin (mm)"
-msgstr "Margen de la tapa (mm)"
 
 # AI Translated
 msgid "Points"
@@ -36571,3 +36565,19 @@ msgstr "Cara de corte plana"
 # AI Translated
 msgid "The path crosses itself seen from the view. Place the points in order along the cut line."
 msgstr "La ruta se cruza consigo misma vista desde la cámara. Coloca los puntos en orden a lo largo de la línea de corte."
+
+# AI Translated
+msgid "This object has several copies. Cutting it would remove the other copies: make them separate objects first, then cut one of them."
+msgstr "Este objeto tiene varias copias. Al cortarlo se eliminarían las demás: conviértelas primero en objetos independientes y corta uno de ellos."
+
+# AI Translated
+msgid "This object has several parts, modifiers or negative volumes. Cut along path only works on objects made of a single part, so they would be lost."
+msgstr "Este objeto tiene varias partes, modificadores o volúmenes negativos. Cortar por ruta solo funciona con objetos de una sola parte; si no, se perderían."
+
+# AI Translated
+msgid "The object was moved since the points were placed. Place them again."
+msgstr "El objeto se ha movido desde que se colocaron los puntos. Vuelve a colocarlos."
+
+# AI Translated
+msgid "The cut could not be applied."
+msgstr "No se ha podido aplicar el corte."
