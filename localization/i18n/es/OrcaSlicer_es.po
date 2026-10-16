@@ -36571,8 +36571,16 @@ msgid "This object has several copies. Cutting it would remove the other copies:
 msgstr "Este objeto tiene varias copias. Al cortarlo se eliminarían las demás: conviértelas primero en objetos independientes y corta uno de ellos."
 
 # AI Translated
-msgid "This object has several parts, modifiers or negative volumes. Cut along path only works on objects made of a single part, so they would be lost."
-msgstr "Este objeto tiene varias partes, modificadores o volúmenes negativos. Cortar por ruta solo funciona con objetos de una sola parte; si no, se perderían."
+msgid "This object has negative volumes. Cut along path cannot keep them, so the cut pieces would not match the object: remove them or cut the object before adding them."
+msgstr "Este objeto tiene volúmenes negativos. Cortar por ruta no puede conservarlos y las piezas no coincidirían con el objeto: quítalos o corta el objeto antes de añadirlos."
+
+# AI Translated
+msgid "Cut along path: the parts of the object were joined into one before cutting."
+msgstr "Cortar por ruta: las partes del objeto se han unido en una sola antes de cortar."
+
+# AI Translated
+msgid "Cut along path: the modifiers and support blockers/enforcers of the object were removed."
+msgstr "Cortar por ruta: se han quitado los modificadores, bloqueadores de soporte y forzados de soportes del objeto."
 
 # AI Translated
 msgid "The object was moved since the points were placed. Place them again."

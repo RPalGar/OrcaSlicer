@@ -762,6 +762,8 @@ struct PathCutJob
     PathCut::ViewLimits      limits;
     PathCut::ConnectorParams conn;
     std::atomic<bool>        abort{false}; // set when the tool closes
+    size_t                   merged_parts{0};  // model parts joined into one mesh for the cut
+    bool                     dropped_others{false}; // modifiers / support blockers or enforcers left out
     // the object
     int          obj_idx{-1}, inst_idx{-1};
     ModelObject *mo{nullptr};
@@ -822,21 +824,28 @@ void GLGizmoPathCut::perform_cut()
         m_message_is_error = true;
         m_parent.set_as_dirty();
     };
-    // The cut replaces the object by its pieces, made from its model parts only. Refused where that would
-    // lose something: other copies of the object, other parts (with their own settings), modifiers,
-    // negative volumes (e.g. the holes of a plane cut) and support blockers/enforcers.
+    // The cut replaces the object by its pieces. Its model parts are joined into one mesh and cut together
+    // (their own settings are lost, the result takes those of the first part); modifiers and support
+    // blockers/enforcers do not change the shape and are left out, with a warning once the cut is applied.
+    // Refused where the result would not match what is shown: other copies of the object would be removed,
+    // and negative volumes (e.g. the holes of an earlier cut) would be filled in.
     if (mo->instances.size() > 1) {
         refuse(_u8L("This object has several copies. Cutting it would remove the other copies: make them separate "
                     "objects first, then cut one of them."));
         return;
     }
-    size_t parts = 0, others = 0;
-    for (const ModelVolume *v : mo->volumes)
-        (v->is_model_part() ? parts : others) += 1;
-    if (parts != 1 || others != 0) {
-        refuse(_u8L("This object has several parts, modifiers or negative volumes. Cut along path only works on "
-                    "objects made of a single part, so they would be lost."));
-        return;
+    size_t parts = 0;
+    bool   others = false;
+    for (const ModelVolume *v : mo->volumes) {
+        if (v->is_negative_volume()) {
+            refuse(_u8L("This object has negative volumes. Cut along path cannot keep them, so the cut pieces would "
+                        "not match the object: remove them or cut the object before adding them."));
+            return;
+        }
+        if (v->is_model_part())
+            ++parts;
+        else
+            others = true;
     }
     const ModelInstance *mi = mo->instances[inst_idx];
     if (!mi->get_matrix().isApprox(m_inst_matrix)) {
@@ -875,6 +884,8 @@ void GLGizmoPathCut::perform_cut()
     st->flat_cap = m_flat_cap;
     st->limits   = view_limits();
     st->conn     = m_conn;
+    st->merged_parts   = parts;
+    st->dropped_others = others;
 
     m_busy             = true;
     m_message          = _u8L("Cutting, please wait...");
@@ -1168,6 +1179,10 @@ void GLGizmoPathCut::do_apply_cut(const std::shared_ptr<PathCutJob> &st)
         else if (int(conn.positions.size()) < st->conn.count)
             warn(GUI::format(_u8L("Cut along path: only %1% of %2% connectors fit on the cut face."), conn.positions.size(), st->conn.count));
     }
+    if (st->merged_parts > 1)
+        warn(_u8L("Cut along path: the parts of the object were joined into one before cutting."));
+    if (st->dropped_others)
+        warn(_u8L("Cut along path: the modifiers and support blockers/enforcers of the object were removed."));
     BOOST_LOG_TRIVIAL(info) << "PathCut: apply to model "
                             << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count()
                             << " ms";
