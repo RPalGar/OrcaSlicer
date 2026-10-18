@@ -68,6 +68,12 @@ static const ColorRGBA POINT_COLOR = {1.f, 0.55f, 0.f, 1.f};
     L("The path crosses itself seen from the view. Place the points in order along the cut line."),
     L("No connectors fit: the cut face is too curved for a straight connector."),
     L("No connectors fit: the cut face is too small or too thin for them. Make them smaller or shorter."),
+    L("The connector does not fit there: too close to the edge of the cut face."),
+    L("The connector does not fit there: the cut face is too steep or uneven under it."),
+    L("The connector does not fit there: the part is too thin for its depth. Make it shorter or try another spot."),
+    L("The connector does not fit there: it would run into a hole that is already there."),
+    L("The connector does not fit there: too close to another connector."),
+    L("Click on the cut face to place a connector."),
 };
 
 GLGizmoPathCut::GLGizmoPathCut(GLCanvas3D &parent, const std::string &icon_filename, unsigned int sprite_id)
@@ -181,7 +187,7 @@ bool GLGizmoPathCut::on_mouse(const wxMouseEvent &mouse_event)
         m_press_on_object = m_orbiting = false; // a lost release must not leave a press behind
     if (mouse_event.LeftDown() && !mouse_event.CmdDown()) {
         Vec3d      hit;
-        const bool on_part = raycast(mouse_pos, hit);
+        const bool on_part = m_placing ? raycast_face(mouse_pos, hit) : raycast(mouse_pos, hit);
         // Empty space: the canvas orbits the view. On a modifier or negative volume (not cut, so no point)
         // the press is still kept from the canvas, which would otherwise start moving the object.
         if (!on_part && m_parent.get_first_hover_volume_idx() < 0)
@@ -222,8 +228,12 @@ bool GLGizmoPathCut::on_mouse(const wxMouseEvent &mouse_event)
     }
     if (m_press_on_object && mouse_event.LeftUp()) {
         m_press_on_object = false;
-        if (!m_orbiting && m_press_adds_point)
-            add_point(m_press_hit);
+        if (!m_orbiting && m_press_adds_point) {
+            if (m_placing)
+                add_connector(m_press_hit);
+            else
+                add_point(m_press_hit);
+        }
         m_orbiting = false;
         return true;
     }
@@ -235,6 +245,15 @@ bool GLGizmoPathCut::on_mouse(const wxMouseEvent &mouse_event)
     }
     if (mouse_event.RightUp() && m_right_press) {
         m_right_press = false;
+        if ((mouse_pos - m_right_pos).norm() <= 4. && m_placing) {
+            if (!m_spots.empty()) {
+                m_spots.pop_back();
+                rebuild_connector_preview();
+                m_message.clear();
+                m_parent.set_as_dirty();
+            }
+            return true;
+        }
         if ((mouse_pos - m_right_pos).norm() <= 4. && !m_points.empty()) {
             clear_pending();
             m_points.pop_back();
@@ -398,7 +417,27 @@ void GLGizmoPathCut::on_render()
     const Camera &camera = wxGetApp().plater()->get_camera();
     glsafe(::glDisable(GL_DEPTH_TEST));
 
-    if (m_cutter.is_initialized()) {
+    if (m_placing && m_pending) {
+        if (GLShaderProgram *shader = wxGetApp().get_shader("flat")) {
+            glsafe(::glDisable(GL_CULL_FACE));
+            glsafe(::glEnable(GL_BLEND));
+            glsafe(::glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA));
+            shader->start_using();
+            shader->set_uniform("view_model_matrix", camera.get_view_matrix() * Geometry::translation_transform(m_placing_offset));
+            shader->set_uniform("projection_matrix", camera.get_projection_matrix());
+            if (m_face_model.is_initialized()) {
+                m_face_model.set_color(ColorRGBA(1.f, 0.55f, 0.f, 0.55f));
+                m_face_model.render();
+            }
+            if (m_conn_model.is_initialized()) {
+                m_conn_model.set_color(ColorRGBA(0.1f, 0.85f, 0.3f, 0.85f));
+                m_conn_model.render();
+            }
+            shader->stop_using();
+            glsafe(::glDisable(GL_BLEND));
+            glsafe(::glEnable(GL_CULL_FACE));
+        }
+    } else if (m_cutter.is_initialized()) {
         if (GLShaderProgram *shader = wxGetApp().get_shader("flat")) {
             glsafe(::glDisable(GL_CULL_FACE));
             glsafe(::glEnable(GL_BLEND));
@@ -485,7 +524,7 @@ void GLGizmoPathCut::on_render_input_window(float x, float y, float bottom_limit
     float       label_w = 0.f, check_w = 0.f;
     for (const std::string &l : {_u8L("Clearance (mm)"), _u8L("Min. cap margin (mm)"), _u8L("Cut direction"), _u8L("Turn (deg)"),
                                  _u8L("Tilt (deg)"), _u8L("Connectors"), _u8L("Shape"), _u8L("Number of connectors"),
-                                 _u8L("Diameter / side (mm)"), _u8L("Depth (mm)"), _u8L("Hole clearance (mm)")})
+                                 _u8L("Diameter / side (mm)"), _u8L("Depth (mm)"), _u8L("Hole clearance (mm)"), _u8L("Placement")})
         label_w = std::max(label_w, ImGui::CalcTextSize(l.c_str()).x);
     for (const std::string &l : {_u8L("Limit in front (mm)"), _u8L("Limit behind (mm)"), _u8L("Limit past the first point (mm)"),
                                  _u8L("Limit past the last point (mm)")})
@@ -541,9 +580,32 @@ void GLGizmoPathCut::on_render_input_window(float x, float y, float bottom_limit
             wxGetApp().plater()->get_ui_job_worker().cancel();
     }
 
-    if (m_pending && !m_busy) {
+    if (m_pending && !m_busy && !m_placing) {
         if (m_imgui->button(_L("Apply this cut anyway")))
             wxGetApp().CallAfter([this]() { if (m_pending) apply_cut(m_pending); });
+    }
+    if (m_placing && m_pending && !m_busy) {
+        // Manual connectors: the cut is computed, the user clicks on the cut face where each one goes.
+        ImGui::Separator();
+        ImGui::PushTextWrapPos(ImGui::GetFontSize() * 26.f);
+        m_imgui->text(_u8L("Click on the cut face (orange) where each connector should go. Right click removes the last one. "
+                           "Then apply the cut."));
+        ImGui::PopTextWrapPos();
+        m_imgui->text(_u8L("Connectors placed") + ": " + std::to_string(m_spots.size()));
+        if (m_imgui->button(_L("Undo connector"), ImVec2(0, 0), !m_spots.empty())) {
+            m_spots.pop_back();
+            rebuild_connector_preview();
+            m_message.clear();
+        }
+        ImGui::SameLine();
+        if (m_imgui->button(_L("Apply cut")))
+            wxGetApp().CallAfter([this]() { if (m_pending && m_placing) apply_cut(m_pending); });
+        ImGui::SameLine();
+        if (m_imgui->button(_L("Cancel"))) {
+            clear_pending();
+            m_message.clear();
+            m_preview_dirty = true;
+        }
     }
     if (!m_message.empty()) {
         ImGui::PushTextWrapPos(ImGui::GetFontSize() * 26.f);
@@ -627,7 +689,14 @@ void GLGizmoPathCut::on_render_input_window(float x, float y, float bottom_limit
         limit_row(_L("Limit past the last point (mm)"), m_lim_end, "##pathcut_end");
     }
 
-    // Connectors: straight, along the mean direction of the cut face, placed where they fit.
+    // Connectors: straight, along the mean direction of the cut face, placed where they fit. Edited while
+    // placing them by hand, the cut is kept and only the connectors are checked again.
+    auto conn_changed = [&]() {
+        if (m_placing)
+            connectors_changed();
+        else
+            settings_changed();
+    };
     ImGui::Separator();
     ImGui::AlignTextToFramePadding();
     m_imgui->text(_u8L("Connectors"));
@@ -640,7 +709,7 @@ void GLGizmoPathCut::on_render_input_window(float x, float y, float bottom_limit
             for (int i = 0; i < int(types.size()); ++i)
                 if (ImGui::Selectable(types[size_t(i)].c_str(), i == type) && i != type) {
                     m_conn.type = PathCut::ConnectorType(i);
-                    settings_changed();
+                    conn_changed();
                 }
             ImGui::EndCombo();
         }
@@ -653,13 +722,13 @@ void GLGizmoPathCut::on_render_input_window(float x, float y, float bottom_limit
         if (m_imgui->bbl_radio_button(_u8L("Cylinder").c_str(), m_conn.shape == PathCut::ConnectorShape::Cylinder) &&
             m_conn.shape != PathCut::ConnectorShape::Cylinder) {
             m_conn.shape = PathCut::ConnectorShape::Cylinder;
-            settings_changed();
+            conn_changed();
         }
         ImGui::SameLine();
         if (m_imgui->bbl_radio_button(_u8L("Square").c_str(), m_conn.shape == PathCut::ConnectorShape::Square) &&
             m_conn.shape != PathCut::ConnectorShape::Square) {
             m_conn.shape = PathCut::ConnectorShape::Square;
-            settings_changed();
+            conn_changed();
         }
         auto float_row = [&](const std::string &label, const char *id, double &value, float step, float lo, float hi, const char *fmt) {
             ImGui::AlignTextToFramePadding();
@@ -668,22 +737,41 @@ void GLGizmoPathCut::on_render_input_window(float x, float y, float bottom_limit
             float v = float(value);
             if (ImGui::InputFloat(id, &v, step, step * 5.f, fmt)) {
                 value = std::clamp(v, lo, hi);
-                settings_changed();
+                conn_changed();
             }
         };
         ImGui::AlignTextToFramePadding();
-        m_imgui->text(_u8L("Number of connectors"));
+        m_imgui->text(_u8L("Placement"));
         ImGui::SameLine(field_x);
-        if (ImGui::InputInt("##pathcut_conn_count", &m_conn.count, 1, 1)) {
-            m_conn.count = std::clamp(m_conn.count, 1, 8);
+        if (m_imgui->bbl_radio_button(_u8L("Automatic").c_str(), !m_conn_manual) && m_conn_manual) {
+            m_conn_manual = false;
             settings_changed();
+        }
+        ImGui::SameLine();
+        if (m_imgui->bbl_radio_button(_u8L("Manual").c_str(), m_conn_manual) && !m_conn_manual) {
+            m_conn_manual = true;
+            settings_changed();
+        }
+        if (!m_conn_manual) {
+            ImGui::AlignTextToFramePadding();
+            m_imgui->text(_u8L("Number of connectors"));
+            ImGui::SameLine(field_x);
+            if (ImGui::InputInt("##pathcut_conn_count", &m_conn.count, 1, 1)) {
+                m_conn.count = std::clamp(m_conn.count, 1, 8);
+                settings_changed();
+            }
         }
         float_row(_u8L("Diameter / side (mm)"), "##pathcut_conn_size", m_conn.size, 0.5f, 1.f, 50.f, "%.1f");
         float_row(_u8L("Depth (mm)"), "##pathcut_conn_depth", m_conn.depth, 0.5f, 1.f, 50.f, "%.1f");
         float_row(_u8L("Hole clearance (mm)"), "##pathcut_conn_tol", m_conn.clearance, 0.05f, 0.f, 1.f, "%.2f");
         ImGui::PushTextWrapPos(ImGui::GetFontSize() * 26.f);
-        m_imgui->text(_u8L("Straight connectors along the mean direction of the cut face, placed automatically where both parts "
-                           "have room for them. Two or more also keep the parts from turning."));
+        if (m_conn_manual)
+            m_imgui->text(_u8L("Straight connectors along the mean direction of the cut face. After the cut is computed, click on "
+                               "the cut face where each one should go: each spot is checked for room in both parts. Two or more "
+                               "also keep the parts from turning."));
+        else
+            m_imgui->text(_u8L("Straight connectors along the mean direction of the cut face, placed automatically where both parts "
+                               "have room for them. Two or more also keep the parts from turning."));
         ImGui::PopTextWrapPos();
     }
     ImGui::PopItemWidth();
@@ -763,7 +851,13 @@ struct PathCutJob
     PathCut::ConnectorParams conn;
     std::atomic<bool>        abort{false}; // set when the tool closes
     size_t                   merged_parts{0};  // model parts joined into one mesh for the cut
-    bool                     dropped_others{false}; // modifiers / support blockers or enforcers left out
+    bool                     conn_manual{false};
+    // Volumes that are not cut (negative volumes, modifiers, support blockers / enforcers): each goes to
+    // the pieces it overlaps, both if the cut runs through it. A negative volume only removes material of
+    // its own part, so keeping a whole hole in both pieces is exactly the hole cut in two.
+    struct Extra { size_t volume_idx; indexed_triangle_set mesh; };
+    std::vector<Extra>       extras;           // object coordinates
+    indexed_triangle_set     removed;          // the negative volumes joined: no new connector runs into them
     // the object
     int          obj_idx{-1}, inst_idx{-1};
     ModelObject *mo{nullptr};
@@ -776,6 +870,9 @@ struct PathCutJob
     bool                                      joined{false}; // the sides still touch elsewhere
     std::vector<std::vector<PathCut::V3>>     routes;        // ... along these, object coordinates
     PathCut::ConnectorResult                  connectors;    // object coordinates
+    // Manual connectors: the cut is kept to place them (and to check them again when their settings change).
+    std::unique_ptr<PathCut::CutResult>       cut;
+    std::unique_ptr<PathCut::ConnectorPlacer> placer;        // refers to grouped and removed
     bool                                      connectors_from_a{false}; // pegs stick out of side_a
     std::string                               connector_error;
     std::string                               error;
@@ -801,6 +898,116 @@ void GLGizmoPathCut::clear_pending()
     m_pending.reset();
     m_routes.clear();
     m_routes_model.reset();
+    m_placing = false;
+    m_spots.clear();
+    m_face_model.reset();
+    m_conn_model.reset();
+    m_face_raycaster.reset();
+}
+
+// The cut separated the object and the connectors go where the user clicks: show the cut face.
+void GLGizmoPathCut::start_placing(const std::shared_ptr<PathCutJob> &st)
+{
+    m_pending        = st;
+    m_placing        = true;
+    m_spots.clear();
+    m_placing_offset = st->offset;
+    const indexed_triangle_set &face = st->placer->face();
+    GLModel::Geometry           g;
+    g.format = {GLModel::Geometry::EPrimitiveType::Triangles, GLModel::Geometry::EVertexLayout::P3};
+    for (const auto &v : face.vertices) g.add_vertex(Vec3f(v));
+    for (const auto &t : face.indices) g.add_triangle(unsigned(t[0]), unsigned(t[1]), unsigned(t[2]));
+    m_face_model.reset();
+    if (g.vertices_count() > 0)
+        m_face_model.init_from(std::move(g));
+    m_face_raycaster = std::make_shared<MeshRaycaster>(TriangleMesh(face));
+    rebuild_connector_preview();
+    m_message          = _u8L("The cut is ready. Click on the cut face (orange) where each connector should go, then apply the cut.");
+    m_message_is_error = false;
+    m_parent.set_as_dirty();
+}
+
+bool GLGizmoPathCut::raycast_face(const Vec2d &mouse_pos, Vec3d &hit_world) const
+{
+    if (!m_face_raycaster)
+        return false;
+    const Camera     &camera = wxGetApp().plater()->get_camera();
+    const Transform3d trafo  = Geometry::translation_transform(m_placing_offset);
+    Vec3f             hit, normal;
+    if (!m_face_raycaster->unproject_on_mesh(mouse_pos, trafo, camera, hit, normal, nullptr, nullptr, false))
+        return false;
+    hit_world = trafo * hit.cast<double>();
+    return true;
+}
+
+void GLGizmoPathCut::add_connector(const Vec3d &hit_world)
+{
+    if (!m_pending || !m_pending->placer)
+        return;
+    PathCut::ConnectorSpot   spot;
+    const PathCut::ConnectorFit why = m_pending->placer->try_at(PathCut::V3(hit_world - m_placing_offset), spot, m_spots);
+    if (why == PathCut::ConnectorFit::Ok) {
+        m_spots.push_back(spot);
+        rebuild_connector_preview();
+        m_message.clear();
+    } else {
+        m_message          = _u8L(PathCut::connector_fit_message(why));
+        m_message_is_error = true;
+    }
+    m_parent.set_as_dirty();
+}
+
+// The connector settings changed while placing: check the placed ones again with the new settings and
+// keep those that still fit. Switching connectors off drops the pending cut.
+void GLGizmoPathCut::connectors_changed()
+{
+    if (!m_pending || !m_pending->cut || m_conn.type == PathCut::ConnectorType::None) {
+        clear_pending();
+        m_preview_dirty = true;
+        return;
+    }
+    PathCutJob &st = *m_pending;
+    st.conn        = m_conn;
+    const indexed_triangle_set &from = st.connectors_from_a ? st.grouped.side_a : st.grouped.side_b;
+    const indexed_triangle_set &to   = st.connectors_from_a ? st.grouped.side_b : st.grouped.side_a;
+    st.placer = std::make_unique<PathCut::ConnectorPlacer>(*st.cut, st.connectors_from_a ? 1 : -1, from, to, st.conn,
+                                                           st.removed.indices.empty() ? nullptr : &st.removed);
+    if (!st.placer->error().empty()) {
+        m_spots.clear();
+        m_message          = _u8L(st.placer->error().c_str());
+        m_message_is_error = true;
+    } else {
+        std::vector<PathCut::ConnectorSpot> kept;
+        for (const PathCut::ConnectorSpot &old : m_spots) {
+            PathCut::ConnectorSpot spot;
+            if (st.placer->try_at(old.p, spot, kept) == PathCut::ConnectorFit::Ok)
+                kept.push_back(spot);
+        }
+        if (kept.size() < m_spots.size()) {
+            m_message          = GUI::format(_u8L("%1% of the placed connectors no longer fit with these settings and were removed."),
+                                             m_spots.size() - kept.size());
+            m_message_is_error = true;
+        }
+        m_spots = std::move(kept);
+    }
+    rebuild_connector_preview();
+    m_parent.set_as_dirty();
+}
+
+void GLGizmoPathCut::rebuild_connector_preview()
+{
+    m_conn_model.reset();
+    if (!m_pending || !m_pending->placer || m_spots.empty())
+        return;
+    const PathCut::ConnectorResult c = m_pending->placer->build(m_spots);
+    // What sticks out of / goes into the parts: the pegs, or the holes of the pins.
+    const indexed_triangle_set &shown = c.pegs.indices.empty() ? c.holes_to : c.pegs;
+    GLModel::Geometry           g;
+    g.format = {GLModel::Geometry::EPrimitiveType::Triangles, GLModel::Geometry::EVertexLayout::P3};
+    for (const auto &v : shown.vertices) g.add_vertex(Vec3f(v));
+    for (const auto &t : shown.indices) g.add_triangle(unsigned(t[0]), unsigned(t[1]), unsigned(t[2]));
+    if (g.vertices_count() > 0)
+        m_conn_model.init_from(std::move(g));
 }
 
 void GLGizmoPathCut::perform_cut()
@@ -825,28 +1032,18 @@ void GLGizmoPathCut::perform_cut()
         m_parent.set_as_dirty();
     };
     // The cut replaces the object by its pieces. Its model parts are joined into one mesh and cut together
-    // (their own settings are lost, the result takes those of the first part); modifiers and support
-    // blockers/enforcers do not change the shape and are left out, with a warning once the cut is applied.
-    // Refused where the result would not match what is shown: other copies of the object would be removed,
-    // and negative volumes (e.g. the holes of an earlier cut) would be filled in.
+    // (their own settings are lost, the result takes those of the first part). The other volumes (negative
+    // volumes such as the holes of an earlier cut, modifiers, support blockers/enforcers) are not cut: each
+    // goes to the pieces it overlaps. Refused when other copies of the object would be removed.
     if (mo->instances.size() > 1) {
         refuse(_u8L("This object has several copies. Cutting it would remove the other copies: make them separate "
                     "objects first, then cut one of them."));
         return;
     }
     size_t parts = 0;
-    bool   others = false;
-    for (const ModelVolume *v : mo->volumes) {
-        if (v->is_negative_volume()) {
-            refuse(_u8L("This object has negative volumes. Cut along path cannot keep them, so the cut pieces would "
-                        "not match the object: remove them or cut the object before adding them."));
-            return;
-        }
+    for (const ModelVolume *v : mo->volumes)
         if (v->is_model_part())
             ++parts;
-        else
-            others = true;
-    }
     const ModelInstance *mi = mo->instances[inst_idx];
     if (!mi->get_matrix().isApprox(m_inst_matrix)) {
         reset_path();
@@ -866,12 +1063,17 @@ void GLGizmoPathCut::perform_cut()
 
     // Work in millimetres as printed: bake instance rotation/scale into the mesh, keep the offset.
     const Transform3d inst_no_offset = mi->get_transformation().get_matrix_no_offset();
-    for (const ModelVolume *v : mo->volumes) {
-        if (!v->is_model_part())
-            continue;
+    for (size_t i = 0; i < mo->volumes.size(); ++i) {
+        const ModelVolume   *v   = mo->volumes[i];
         indexed_triangle_set its = v->mesh().its;
         its_transform(its, inst_no_offset * v->get_matrix(), true);
-        its_merge(st->src, its);
+        if (v->is_model_part())
+            its_merge(st->src, its);
+        else {
+            if (v->is_negative_volume())
+                its_merge(st->removed, its);
+            st->extras.push_back({i, std::move(its)});
+        }
     }
     if (st->src.indices.empty())
         return;
@@ -885,7 +1087,7 @@ void GLGizmoPathCut::perform_cut()
     st->limits   = view_limits();
     st->conn     = m_conn;
     st->merged_parts   = parts;
-    st->dropped_others = others;
+    st->conn_manual    = m_conn_manual;
 
     m_busy             = true;
     m_message          = _u8L("Cutting, please wait...");
@@ -966,7 +1168,17 @@ void GLGizmoPathCut::perform_cut()
             st->connectors_from_a = PathCut::peg_side(res, st->grouped.side_a, st->grouped.side_b) == 1;
             const indexed_triangle_set &from = st->connectors_from_a ? st->grouped.side_a : st->grouped.side_b;
             const indexed_triangle_set &to   = st->connectors_from_a ? st->grouped.side_b : st->grouped.side_a;
-            st->connectors = PathCut::place_connectors(res, st->connectors_from_a ? 1 : -1, from, to, st->conn, st->connector_error, canceled);
+            st->placer = std::make_unique<PathCut::ConnectorPlacer>(res, st->connectors_from_a ? 1 : -1, from, to, st->conn,
+                                                                    st->removed.indices.empty() ? nullptr : &st->removed);
+            if (!st->placer->error().empty()) {
+                st->connector_error = st->placer->error();
+                st->placer.reset();
+            } else if (!st->conn_manual) {
+                const std::vector<PathCut::ConnectorSpot> spots = st->placer->auto_place(st->conn.count, st->connector_error, canceled);
+                st->connectors = st->placer->build(spots);
+                st->placer.reset();
+            } else
+                st->cut = std::make_unique<PathCut::CutResult>(std::move(res)); // to check the connectors again on edits
             lap("connectors");
         }
         ctl.update_status(100, status);
@@ -1030,6 +1242,17 @@ void GLGizmoPathCut::perform_cut()
             m_parent.set_as_dirty();
             return;
         }
+        if (st->placer) {
+            if (!st->object_unchanged()) {
+                m_message          = _u8L("The object was changed while it was being cut. Cut it again.");
+                m_message_is_error = true;
+                reset_path();
+                m_parent.set_as_dirty();
+                return;
+            }
+            start_placing(st);
+            return;
+        }
         apply_cut(st);
     };
 
@@ -1067,6 +1290,7 @@ void GLGizmoPathCut::cut_failed()
 
 void GLGizmoPathCut::do_apply_cut(const std::shared_ptr<PathCutJob> &st)
 {
+    const std::vector<PathCut::ConnectorSpot> spots = m_placing ? m_spots : std::vector<PathCut::ConnectorSpot>{};
     clear_pending();
     if (!st->object_unchanged()) {
         m_message          = _u8L("The object was changed while it was being cut. Cut it again.");
@@ -1093,6 +1317,10 @@ void GLGizmoPathCut::do_apply_cut(const std::shared_ptr<PathCutJob> &st)
     if (sides[0]->indices.empty())
         sides.erase(sides.begin());
 
+    if (st->placer) { // manual connectors: the ones the user placed (possibly none)
+        st->connectors = st->placer->build(spots);
+        st->placer.reset();
+    }
     const PathCut::ConnectorResult &conn       = st->connectors;
     const bool                      connectors = sides.size() == 2 && !conn.positions.empty();
     const indexed_triangle_set     *from_side  = st->connectors_from_a ? &grouped.side_a : &grouped.side_b;
@@ -1126,9 +1354,31 @@ void GLGizmoPathCut::do_apply_cut(const std::shared_ptr<PathCutJob> &st)
         no->invalidate_bounding_box();
         no->ensure_on_bed();
     };
+    // The volumes that are not cut go to the pieces they overlap (bounding boxes, taken before the meshes move).
+    auto bbox_of = [](const indexed_triangle_set &its) {
+        BoundingBoxf3 bb;
+        for (const auto &v : its.vertices) bb.merge(v.cast<double>());
+        return bb;
+    };
+    std::vector<BoundingBoxf3> side_bb, extra_bb;
+    for (const indexed_triangle_set *side : sides) side_bb.push_back(bbox_of(*side));
+    for (const PathCutJob::Extra &e : st->extras) extra_bb.push_back(bbox_of(e.mesh));
+    auto overlaps = [](const BoundingBoxf3 &a, const BoundingBoxf3 &b) {
+        constexpr double eps = 0.01;
+        return a.defined && b.defined && a.min.x() <= b.max.x() + eps && b.min.x() <= a.max.x() + eps && a.min.y() <= b.max.y() + eps &&
+               b.min.y() <= a.max.y() + eps && a.min.z() <= b.max.z() + eps && b.min.z() <= a.max.z() + eps;
+    };
     for (size_t i = 0; i < sides.size(); ++i) {
         const bool   is_from = sides[i] == from_side;
         ModelObject *no      = new_object(mo->name + " - " + suffix[i], std::move(*sides[i]));
+        for (size_t k = 0; k < st->extras.size(); ++k) {
+            if (!overlaps(side_bb[i], extra_bb[k]))
+                continue;
+            const ModelVolume *src = mo->volumes[st->extras[k].volume_idx]; // unchanged: checked above
+            ModelVolume       *nv  = no->add_volume(TriangleMesh(st->extras[k].mesh), src->type());
+            nv->name               = src->name;
+            nv->config.apply(src->config);
+        }
         if (connectors) {
             const std::string name = _u8L("Connector");
             if (is_from) {
@@ -1176,13 +1426,11 @@ void GLGizmoPathCut::do_apply_cut(const std::shared_ptr<PathCutJob> &st)
     } else if (st->conn.type != PathCut::ConnectorType::None) {
         if (!st->connector_error.empty())
             warn(_u8L("Cut along path") + ": " + _u8L(st->connector_error.c_str()));
-        else if (int(conn.positions.size()) < st->conn.count)
+        else if (!st->conn_manual && int(conn.positions.size()) < st->conn.count)
             warn(GUI::format(_u8L("Cut along path: only %1% of %2% connectors fit on the cut face."), conn.positions.size(), st->conn.count));
     }
     if (st->merged_parts > 1)
         warn(_u8L("Cut along path: the parts of the object were joined into one before cutting."));
-    if (st->dropped_others)
-        warn(_u8L("Cut along path: the modifiers and support blockers/enforcers of the object were removed."));
     BOOST_LOG_TRIVIAL(info) << "PathCut: apply to model "
                             << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count()
                             << " ms";

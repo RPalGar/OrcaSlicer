@@ -24,6 +24,7 @@
 #include <cstdint>
 #include <functional>
 #include <limits>
+#include <memory>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -143,11 +144,12 @@ private:
 };
 
 // A closed prism (cylinder with `sides` sides, or a square for 4) around the frame axis through q,
-// from height h0 to h1 above the frame origin. `radius` is the circumradius.
-inline void append_prism(indexed_triangle_set &its, const Frame &f, const V2 &q, double radius, double h0, double h1, int sides)
+// from height h0 to h1 above the frame origin. `radius` is the circumradius; `turn` turns it about the axis.
+inline void append_prism(indexed_triangle_set &its, const Frame &f, const V2 &q, double radius, double h0, double h1, int sides,
+                         double turn = 0.)
 {
     const int    base = int(its.vertices.size());
-    const double rot  = sides == 4 ? PI_ / 4. : 0.;
+    const double rot  = (sides == 4 ? PI_ / 4. : 0.) + turn;
     for (int k = 0; k < 2; ++k)
         for (int i = 0; i < sides; ++i) {
             const double a = rot + 2. * PI_ * i / sides;
@@ -203,168 +205,345 @@ inline int peg_side(const CutResult &cut, const indexed_triangle_set &side_a, co
     return std::abs(signed_volume(side_a)) >= std::abs(signed_volume(side_b)) ? 1 : -1;
 }
 
-// Places connectors across the cut face between `from` and `to`, the two sides of `cut` (cut faces with
-// level `from_level` belong to `from`). Pegs (Plug) stick out of `from` into holes of `to`.
-// `error` is set when not a single connector fits; fewer than asked is not an error.
-inline ConnectorResult place_connectors(const CutResult &cut, int from_level, const indexed_triangle_set &from, const indexed_triangle_set &to,
-                                        const ConnectorParams &prm, std::string &error, const std::function<bool()> &canceled = {})
+// A place where a connector fits, with the faces measured along its axis: heights relative to p of the
+// face of `from` and of `to` on the axis, the highest point of the face of `from` around it, the turn of
+// a square about the axis, and how much room is left (larger = roomier).
+struct ConnectorSpot
 {
-    ConnectorResult res;
-    error.clear();
-    if (prm.type == ConnectorType::None || prm.count <= 0) return res;
-    if (!(prm.size > 0.) || !(prm.depth > 0.)) {
-        error = "No connectors fit: the cut face is too small or too thin for them. Make them smaller or shorter.";
-        return res;
+    V3     p{V3::Zero()};
+    double from_face{0.}, to_face{0.}, from_top{0.};
+    double angle{0.};
+    double slack{0.};
+};
+
+// Why a connector does not fit at a given place.
+enum class ConnectorFit : int {
+    Ok = 0,
+    Edge,      // too close to the edge of the cut face: a side has no material all around it
+    Slope,     // the cut face is too steep or uneven under it
+    ThinFrom,  // the part the peg stands in (or the pin's first hole) is too thin there
+    ThinTo,    // the part with the hole is too thin there for the depth
+    Hole,      // it would run into a negative volume already there (e.g. a hole of an earlier cut)
+    Overlap,   // too close to another connector
+    OffFace,   // not on the cut face
+};
+
+inline const char *connector_fit_message(ConnectorFit why)
+{
+    switch (why) {
+    case ConnectorFit::Edge: return "The connector does not fit there: too close to the edge of the cut face.";
+    case ConnectorFit::Slope: return "The connector does not fit there: the cut face is too steep or uneven under it.";
+    case ConnectorFit::ThinFrom:
+    case ConnectorFit::ThinTo: return "The connector does not fit there: the part is too thin for its depth. Make it shorter or try another spot.";
+    case ConnectorFit::Hole: return "The connector does not fit there: it would run into a hole that is already there.";
+    case ConnectorFit::Overlap: return "The connector does not fit there: too close to another connector.";
+    case ConnectorFit::OffFace: return "Click on the cut face to place a connector.";
+    default: return "";
     }
-    const indexed_triangle_set &m = cut.mesh;
+}
 
-    // Cut face of `from`: its triangles and their mean outward normal (pointing into `to`).
-    std::vector<size_t> face;
-    V3                  nsum;
-    const double        area = cut_face(cut, from_level, &face, nsum);
-    if (face.empty() || !(area > 1e-9) || nsum.norm() <= 0.2 * area) {
-        error = "No connectors fit: the cut face is too curved for a straight connector.";
-        return res;
-    }
-    const V3    axis = nsum.normalized();
-    const Frame f    = frame_from_normal(axis, V3::Zero());
-    res.axis         = axis;
-
-    const int    sides = prm.shape == ConnectorShape::Square ? 4 : 32;
-    const double r     = 0.5 * prm.size;
-    const double rc    = prm.shape == ConnectorShape::Square ? r * std::sqrt(2.) : r; // circumradius
-    const double tol   = std::max(prm.clearance, 0.);
-    const double rh    = rc + (prm.shape == ConnectorShape::Square ? tol * std::sqrt(2.) : tol); // hole circumradius
-    const double wall  = std::max(prm.wall, 0.);
-    const double depth = prm.depth;
-    const double embed = std::clamp(0.4 * depth, 1., 3.); // peg base sunk into `from` below the face
-    const double ro    = rh + wall;                        // must be solid out to here around a hole
-    const bool   dowel = prm.type == ConnectorType::Dowel;
-
-    // Candidates: points on the cut face, one per grid cell across the axis. Large cut face triangles
-    // (a flat cap is a few big ones) are sampled inside, not only at their centroid, so a spot that fits
-    // is not missed for lack of a candidate near it.
-    double cell = std::max(0.25 * r, 0.25);
-    std::vector<V3> cand;
-    for (int attempt = 0; attempt < 8; ++attempt, cell *= 1.6) {
-        cand.clear();
-        std::unordered_map<uint64_t, size_t> seen;
-        std::vector<double> off; // distance of each candidate to its cell centre: keep the closest
-        auto add = [&](const V3 &c) {
-            const V2       q   = f.to2d(c);
-            const double   gx = std::floor(q.x() / cell), gy = std::floor(q.y() / cell);
-            const uint64_t key = (uint64_t(uint32_t(int32_t(gx))) << 32) | uint32_t(int32_t(gy));
-            const double   d   = (q - V2((gx + 0.5) * cell, (gy + 0.5) * cell)).norm();
-            auto [it, ins]     = seen.emplace(key, cand.size());
-            if (ins) { cand.push_back(c); off.push_back(d); }
-            else if (d < off[it->second]) { cand[it->second] = c; off[it->second] = d; }
-        };
-        for (size_t i : face) {
-            const auto &t = m.indices[i];
-            const V3    a = m.vertices[size_t(t[0])].cast<double>(), b = m.vertices[size_t(t[1])].cast<double>(), c = m.vertices[size_t(t[2])].cast<double>();
-            add((a + b + c) / 3.);
-            const double longest = std::max({(b - a).norm(), (c - b).norm(), (a - c).norm()});
-            const int    k       = std::min(64, int(longest / cell));
-            for (int u = 1; u < k; ++u)
-                for (int v = 1; u + v < k; ++v)
-                    add(a + (b - a) * (double(u) / k) + (c - a) * (double(v) / k));
+// Places straight connectors across the cut face between `from` and `to`, the two sides of `cut` (cut
+// faces with level `from_level` belong to `from`): automatically, or one by one where the user asks.
+// Pegs (Plug) stick out of `from` into holes of `to`. `avoid` (optional, closed) is material that is
+// already removed (negative volumes): no connector runs into it.
+// Keeps references to `from`, `to` and `avoid`: they must outlive the placer.
+class ConnectorPlacer
+{
+public:
+    ConnectorPlacer(const CutResult &cut, int from_level, const indexed_triangle_set &from, const indexed_triangle_set &to,
+                    const ConnectorParams &prm, const indexed_triangle_set *avoid = nullptr)
+        : m_prm(prm)
+    {
+        if (!(prm.size > 0.) || !(prm.depth > 0.)) {
+            m_error = "No connectors fit: the cut face is too small or too thin for them. Make them smaller or shorter.";
+            return;
         }
-        if (cand.size() <= 6000) break;
+        const indexed_triangle_set &m = cut.mesh;
+        // Cut face of `from`: its triangles and their mean outward normal (pointing into `to`).
+        V3           nsum;
+        const double area = cut_face(cut, from_level, &m_face_idx, nsum);
+        if (m_face_idx.empty() || !(area > 1e-9) || nsum.norm() <= 0.2 * area) {
+            m_error = "No connectors fit: the cut face is too curved for a straight connector.";
+            return;
+        }
+        m_axis  = nsum.normalized();
+        m_frame = frame_from_normal(m_axis, V3::Zero());
+        // A copy of the face, for display and picking.
+        std::unordered_map<int, int> vmap;
+        for (size_t i : m_face_idx) {
+            stl_triangle_vertex_indices t;
+            for (int k = 0; k < 3; ++k) {
+                const int v       = m.indices[i][k];
+                auto [it, ins]    = vmap.emplace(v, int(m_face.vertices.size()));
+                if (ins) m_face.vertices.push_back(m.vertices[size_t(v)]);
+                t[k] = it->second;
+            }
+            m_face.indices.push_back(t);
+        }
+        m_square = prm.shape == ConnectorShape::Square;
+        m_r      = 0.5 * prm.size;
+        m_tol    = std::max(prm.clearance, 0.);
+        m_wall   = std::max(prm.wall, 0.);
+        m_embed  = std::clamp(0.4 * prm.depth, 1., 3.);
+        m_dowel  = prm.type == ConnectorType::Dowel;
+        // Outer extent that must be solid: the hole plus the wall, as a radius (circle) or half side (square).
+        m_outer   = m_r + m_tol + m_wall;
+        m_min_gap = 2. * m_outer * (m_square ? std::sqrt(2.) : 1.) + 1.;
+        m_from    = std::make_unique<detail::LineCaster>(from, m_frame);
+        m_to      = std::make_unique<detail::LineCaster>(to, m_frame);
+        if (avoid && !avoid->indices.empty()) m_avoid = std::make_unique<detail::LineCaster>(*avoid, m_frame);
     }
 
-    const detail::LineCaster cast_from(from, f), cast_to(to, f);
-    std::vector<double>      hits;
-    // Solid interval of a side along the line through q, as heights relative to the face point at h:
-    // the one whose top (bottom for `to`) is nearest the face.
-    auto interval = [&](const detail::LineCaster &lc, const V2 &q, double h, bool top, double &lo, double &hi) {
-        if (!lc.crossings(q, hits) || hits.empty()) return false;
+    // Non-empty when no connector can go anywhere (cut face too curved, bad sizes).
+    const std::string          &error() const { return m_error; }
+    const V3                   &axis() const { return m_axis; }
+    const indexed_triangle_set &face() const { return m_face; }
+    double                      min_gap() const { return m_min_gap; }
+
+    // Tries a connector at p, a point on the cut face (as picked on face()). `placed` are connectors
+    // already there, kept at a distance. A square is turned about the axis to the orientation with the most room.
+    ConnectorFit try_at(const V3 &p, ConnectorSpot &spot, const std::vector<ConnectorSpot> &placed = {}) const
+    {
+        if (!m_error.empty()) return ConnectorFit::OffFace;
+        const V2 q = m_frame.to2d(p);
+        for (const ConnectorSpot &o : placed)
+            if ((m_frame.to2d(o.p) - q).norm() < m_min_gap) return ConnectorFit::Overlap;
+        ConnectorFit first = ConnectorFit::Ok;
+        bool         found = false;
+        const int    turns = m_square ? 6 : 1; // 0, 15, ..., 75 degrees: a square repeats every 90
+        for (int k = 0; k < turns; ++k) {
+            ConnectorSpot s;
+            const ConnectorFit why = fits(p, PI_ / 12. * k, s);
+            if (why == ConnectorFit::Ok) {
+                if (!found || s.slack > spot.slack) spot = s;
+                found = true;
+            } else if (k == 0)
+                first = why;
+        }
+        return found ? ConnectorFit::Ok : first;
+    }
+
+    // Up to `count` connectors spread over the cut face: the roomiest spot first, then each next one as
+    // far as possible from those already placed. `error` is set when not a single one fits.
+    std::vector<ConnectorSpot> auto_place(int count, std::string &error, const std::function<bool()> &canceled = {}) const
+    {
+        std::vector<ConnectorSpot> placed;
+        error = m_error;
+        if (!error.empty() || count <= 0) return placed;
+        const std::vector<V3> cand = candidates();
+        std::vector<ConnectorSpot> ok;
+        for (size_t i = 0; i < cand.size(); ++i) {
+            if ((i & 63) == 0 && canceled && canceled()) return {};
+            ConnectorSpot s;
+            if (try_at(cand[i], s) == ConnectorFit::Ok) ok.push_back(s);
+        }
+        if (ok.empty()) {
+            error = "No connectors fit: the cut face is too small or too thin for them. Make them smaller or shorter.";
+            return placed;
+        }
+        std::vector<double> dist(ok.size(), std::numeric_limits<double>::max());
+        size_t pick = 0;
+        for (size_t i = 1; i < ok.size(); ++i)
+            if (ok[i].slack > ok[pick].slack) pick = i;
+        while (int(placed.size()) < count) {
+            placed.push_back(ok[pick]);
+            const V2 last = m_frame.to2d(ok[pick].p);
+            double   best = -1.;
+            for (size_t i = 0; i < ok.size(); ++i) {
+                dist[i] = std::min(dist[i], (m_frame.to2d(ok[i].p) - last).norm());
+                if (dist[i] >= m_min_gap && dist[i] > best) { best = dist[i]; pick = i; }
+            }
+            if (best < 0.) break;
+        }
+        return placed;
+    }
+
+    // The connector volumes for the given spots.
+    ConnectorResult build(const std::vector<ConnectorSpot> &spots) const
+    {
+        ConnectorResult res;
+        res.axis = m_axis;
+        if (!m_error.empty()) return res;
+        const int    sides = m_square ? 4 : 32;
+        const double rc    = m_square ? m_r * std::sqrt(2.) : m_r;                         // circumradius
+        const double rh    = m_square ? (m_r + m_tol) * std::sqrt(2.) : m_r + m_tol;       // hole circumradius
+        const double depth = m_prm.depth;
+        // Depths count from each side's own face (the faces are a kerf apart): a pin of 2 x depth fits two
+        // holes of depth + clearance, a peg reaching depth into `to` a hole of depth + clearance.
+        for (const ConnectorSpot &s : spots) {
+            res.positions.push_back(s.p);
+            const V2     q = m_frame.to2d(s.p);
+            const double h = m_frame.height(s.p);
+            // Holes start below / end above the face they open on everywhere around (negative volumes only
+            // remove material of their own part, so overshooting into the gap is harmless).
+            detail::append_prism(res.holes_to, m_frame, q, rh, h - m_embed - 1., h + s.to_face + depth + m_tol, sides, s.angle);
+            if (m_dowel)
+                detail::append_prism(res.holes_from, m_frame, q, rh, h + s.from_face - depth - m_tol, h + s.from_top + 1., sides, s.angle);
+            else
+                detail::append_prism(res.pegs, m_frame, q, rc, h - m_embed, h + s.to_face + depth, sides, s.angle);
+        }
+        if (m_dowel && !spots.empty()) {
+            Frame up;
+            detail::append_prism(res.pin, up, V2::Zero(), rc, 0., 2. * depth, sides);
+        }
+        return res;
+    }
+
+private:
+    // Points on the cut face, one per grid cell across the axis. Large cut face triangles (a flat cap is a
+    // few big ones) are sampled inside, not only at their centroid, so a spot that fits is not missed for
+    // lack of a candidate near it.
+    std::vector<V3> candidates() const
+    {
+        double          cell = std::max(0.25 * m_r, 0.25);
+        std::vector<V3> cand;
+        for (int attempt = 0; attempt < 8; ++attempt, cell *= 1.6) {
+            cand.clear();
+            std::unordered_map<uint64_t, size_t> seen;
+            std::vector<double> off; // distance of each candidate to its cell centre: keep the closest
+            auto add = [&](const V3 &c) {
+                const V2       q   = m_frame.to2d(c);
+                const double   gx = std::floor(q.x() / cell), gy = std::floor(q.y() / cell);
+                const uint64_t key = (uint64_t(uint32_t(int32_t(gx))) << 32) | uint32_t(int32_t(gy));
+                const double   d   = (q - V2((gx + 0.5) * cell, (gy + 0.5) * cell)).norm();
+                auto [it, ins]     = seen.emplace(key, cand.size());
+                if (ins) { cand.push_back(c); off.push_back(d); }
+                else if (d < off[it->second]) { cand[it->second] = c; off[it->second] = d; }
+            };
+            for (const auto &t : m_face.indices) {
+                const V3 a = m_face.vertices[size_t(t[0])].cast<double>(), b = m_face.vertices[size_t(t[1])].cast<double>(),
+                         c = m_face.vertices[size_t(t[2])].cast<double>();
+                add((a + b + c) / 3.);
+                const double longest = std::max({(b - a).norm(), (c - b).norm(), (a - c).norm()});
+                const int    k       = std::min(64, int(longest / cell));
+                for (int u = 1; u < k; ++u)
+                    for (int v = 1; u + v < k; ++v)
+                        add(a + (b - a) * (double(u) / k) + (c - a) * (double(v) / k));
+            }
+            if (cand.size() <= 6000) break;
+        }
+        return cand;
+    }
+
+    // Solid interval of a side along the line through q, as heights relative to the face point at h: the
+    // one whose top (bottom for `to`) is nearest the face.
+    bool interval(const detail::LineCaster &lc, const V2 &q, double h, bool top, double &lo, double &hi) const
+    {
+        if (!lc.crossings(q, m_hits) || m_hits.empty()) return false;
         double best = std::numeric_limits<double>::max();
-        for (size_t i = 0; i + 1 < hits.size(); i += 2) {
-            const double a = hits[i] - h, b = hits[i + 1] - h, d = std::abs(top ? b : a);
+        for (size_t i = 0; i + 1 < m_hits.size(); i += 2) {
+            const double a = m_hits[i] - h, b = m_hits[i + 1] - h, d = std::abs(top ? b : a);
             if (d < best) { best = d; lo = a; hi = b; }
         }
         return true;
-    };
-    // A place that fits, with the faces measured along its axis: heights relative to p of the face of
-    // `from` and of `to` on the axis, and the highest point of the face of `from` around it.
-    struct Spot { V3 p; double from_face, to_face, from_top; };
-    const int ring_n = 24;
-    auto fits = [&](const V3 &p, Spot &spot, double &slack) {
-        const V2     q = f.to2d(p);
-        const double h = f.height(p);
-        spot           = {p, 0., 0., -std::numeric_limits<double>::max()};
-        slack          = std::numeric_limits<double>::max();
-        for (int ring = 0; ring < 3; ++ring) {
-            const double rr = ring == 0 ? 0. : ring == 1 ? 0.5 * ro : ro;
-            const int    n  = ring == 0 ? 1 : ring == 1 ? ring_n / 2 : ring_n;
+    }
+
+    // Offsets across the axis where both sides are probed: the centre, then the outline of the hole plus
+    // its wall (a circle, or the turned square) at half and full size.
+    std::vector<V2> probes(double angle) const
+    {
+        std::vector<V2> out{V2::Zero()};
+        constexpr int   n = 24;
+        for (double scale : {0.5, 1.}) {
+            const double e = scale * m_outer;
             for (int i = 0; i < n; ++i) {
-                const double a  = 2. * PI_ * i / n;
-                const V2     qq = q + rr * V2(std::cos(a), std::sin(a));
-                double a0 = 0., a1 = 0., b0 = 0., b1 = 0.;
-                if (!interval(cast_from, qq, h, true, a0, a1) || !interval(cast_to, qq, h, false, b0, b1)) return false;
-                if (ring == 0) { spot.from_face = a1; spot.to_face = b0; }
-                spot.from_top = std::max(spot.from_top, a1);
-                // `from`: the face is near p (not sloping past the sunk base) and solid down to the peg base,
-                // or past the bottom of the hole of a pin.
-                const double need_from = dowel ? spot.from_face - depth - tol - wall : -embed - 0.2;
-                if (a1 < -embed + 0.3 || a1 > 0.5 * depth || a0 > need_from) return false;
-                // `to`: its face is above the peg base and the peg goes in at least half way; solid past
-                // the bottom of the hole, which is `depth` (+ clearance) into `to`, from its face.
-                const double need_to = spot.to_face + depth + tol + wall;
-                if (b0 < -embed || b0 > 0.5 * depth || b1 < need_to) return false;
-                slack = std::min({slack, need_from - a0, b1 - need_to, a1 + embed - 0.3});
+                V2 o;
+                if (!m_square) {
+                    const double a = 2. * PI_ * i / n;
+                    o              = e * V2(std::cos(a), std::sin(a));
+                } else { // along the 4 edges of a square of half side e, 6 points each, from a corner
+                    const int    edge = i / 6;
+                    const double t    = (i % 6) / 6.;
+                    const V2     c0   = e * V2(edge == 0 || edge == 3 ? 1. : -1., edge < 2 ? 1. : -1.);
+                    const V2     c1   = e * V2(edge == 2 || edge == 3 ? 1. : -1., edge == 0 || edge == 3 ? 1. : -1.);
+                    o                 = c0 + (c1 - c0) * t;
+                }
+                const double ca = std::cos(angle), sa = std::sin(angle);
+                out.emplace_back(ca * o.x() - sa * o.y(), sa * o.x() + ca * o.y());
             }
         }
-        return true;
-    };
+        return out;
+    }
 
-    std::vector<Spot>   ok;
-    std::vector<double> ok_slack;
-    for (size_t i = 0; i < cand.size(); ++i) {
-        if ((i & 63) == 0 && canceled && canceled()) return res;
-        Spot   spot;
-        double s;
-        if (fits(cand[i], spot, s)) { ok.push_back(spot); ok_slack.push_back(s); }
-    }
-    if (ok.empty()) {
-        error = "No connectors fit: the cut face is too small or too thin for them. Make them smaller or shorter.";
-        return res;
-    }
-    // First the roomiest spot, then each next one as far as possible from those already placed.
-    const double  min_gap = 2. * ro + 1.;
-    std::vector<double> dist(ok.size(), std::numeric_limits<double>::max());
-    size_t pick = size_t(std::max_element(ok_slack.begin(), ok_slack.end()) - ok_slack.begin());
-    std::vector<Spot> placed;
-    while (int(placed.size()) < prm.count) {
-        placed.push_back(ok[pick]);
-        res.positions.push_back(ok[pick].p);
-        const V2 last = f.to2d(ok[pick].p);
-        double   best = -1.;
-        for (size_t i = 0; i < ok.size(); ++i) {
-            dist[i] = std::min(dist[i], (f.to2d(ok[i].p) - last).norm());
-            if (dist[i] >= min_gap && dist[i] > best) { best = dist[i]; pick = i; }
+    // All probes are checked, and the most telling reason is reported: the edge of the face first (moving
+    // the connector inwards is what helps), then a hole in the way, the slope, and the thickness.
+    ConnectorFit fits(const V3 &p, double angle, ConnectorSpot &spot) const
+    {
+        const V2     q     = m_frame.to2d(p);
+        const double h     = m_frame.height(p);
+        const double depth = m_prm.depth;
+        spot               = {p, 0., 0., -std::numeric_limits<double>::max(), angle, std::numeric_limits<double>::max()};
+        ConnectorFit worst = ConnectorFit::Ok;
+        auto rank = [](ConnectorFit w) {
+            switch (w) {
+            case ConnectorFit::Edge: return 4;
+            case ConnectorFit::Hole: return 3;
+            case ConnectorFit::Slope: return 2;
+            case ConnectorFit::ThinFrom:
+            case ConnectorFit::ThinTo: return 1;
+            default: return 0;
+            }
+        };
+        auto fail = [&](ConnectorFit w) { if (rank(w) > rank(worst)) worst = w; };
+        const std::vector<V2> pr = probes(angle);
+        for (size_t i = 0; i < pr.size(); ++i) {
+            const V2 qq = q + pr[i];
+            double   a0 = 0., a1 = 0., b0 = 0., b1 = 0.;
+            if (!interval(*m_from, qq, h, true, a0, a1) || !interval(*m_to, qq, h, false, b0, b1)) return ConnectorFit::Edge;
+            if (i == 0) { spot.from_face = a1; spot.to_face = b0; }
+            spot.from_top = std::max(spot.from_top, a1);
+            // `from`: the face is near p (not sloping past the sunk base) and solid down to the peg base,
+            // or past the bottom of the hole of a pin.
+            if (a1 < -m_embed + 0.3 || a1 > 0.5 * depth) fail(ConnectorFit::Slope);
+            const double need_from = m_dowel ? spot.from_face - depth - m_tol - m_wall : -m_embed - 0.2;
+            if (a0 > need_from) fail(ConnectorFit::ThinFrom);
+            // `to`: its face is above the peg base and the peg goes in at least half way; solid past the
+            // bottom of the hole, which is `depth` (+ clearance) into `to`, from its face.
+            if (b0 < -m_embed || b0 > 0.5 * depth) fail(ConnectorFit::Slope);
+            const double need_to = spot.to_face + depth + m_tol + m_wall;
+            if (b1 < need_to) fail(ConnectorFit::ThinTo);
+            // Clear of material removed already, over the whole height the connector and its holes take.
+            if (m_avoid) {
+                const double lo = (m_dowel ? need_from : -m_embed - 1.) - 0.1, hi = need_to + 0.1;
+                if (!m_avoid->crossings(qq, m_hits))
+                    fail(ConnectorFit::Hole); // odd count: be safe
+                else
+                    for (size_t k = 0; k + 1 < m_hits.size(); k += 2)
+                        if (m_hits[k] - h < hi && m_hits[k + 1] - h > lo) { fail(ConnectorFit::Hole); break; }
+            }
+            spot.slack = std::min({spot.slack, need_from - a0, b1 - need_to, a1 + m_embed - 0.3});
         }
-        if (best < 0.) break;
+        return worst;
     }
 
-    // Depths count from each side's own face (the faces are a kerf apart): a pin of 2 x depth fits two
-    // holes of depth + clearance, a peg reaching depth into `to` a hole of depth + clearance.
-    for (const Spot &s : placed) {
-        const V2     q = f.to2d(s.p);
-        const double h = f.height(s.p);
-        // Holes start below / end above the face they open on everywhere around (negative volumes only
-        // remove material of their own part, so overshooting into the gap is harmless).
-        detail::append_prism(res.holes_to, f, q, rh, h - embed - 1., h + s.to_face + depth + tol, sides);
-        if (dowel)
-            detail::append_prism(res.holes_from, f, q, rh, h + s.from_face - depth - tol, h + s.from_top + 1., sides);
-        else
-            detail::append_prism(res.pegs, f, q, rc, h - embed, h + s.to_face + depth, sides);
+    ConnectorParams                     m_prm;
+    std::string                         m_error;
+    V3                                  m_axis{V3::Zero()};
+    Frame                               m_frame;
+    std::vector<size_t>                 m_face_idx;
+    indexed_triangle_set                m_face;
+    bool                                m_square{false}, m_dowel{false};
+    double                              m_r{0.}, m_tol{0.}, m_wall{0.}, m_embed{0.}, m_outer{0.}, m_min_gap{0.};
+    std::unique_ptr<detail::LineCaster> m_from, m_to, m_avoid;
+    mutable std::vector<double>         m_hits;
+};
+
+// Places up to prm.count connectors automatically (see ConnectorPlacer). `error` is set when not a
+// single connector fits; fewer than asked is not an error.
+inline ConnectorResult place_connectors(const CutResult &cut, int from_level, const indexed_triangle_set &from, const indexed_triangle_set &to,
+                                        const ConnectorParams &prm, std::string &error, const std::function<bool()> &canceled = {},
+                                        const indexed_triangle_set *avoid = nullptr)
+{
+    error.clear();
+    if (prm.type == ConnectorType::None || prm.count <= 0) return {};
+    const ConnectorPlacer placer(cut, from_level, from, to, prm, avoid);
+    const std::vector<ConnectorSpot> spots = placer.auto_place(prm.count, error, canceled);
+    if (spots.empty()) {
+        ConnectorResult r;
+        r.axis = placer.axis();
+        return r;
     }
-    if (dowel) {
-        Frame up;
-        detail::append_prism(res.pin, up, V2::Zero(), rc, 0., 2. * depth, sides);
-    }
-    return res;
+    return placer.build(spots);
 }
 
 }} // namespace Slic3r::PathCut

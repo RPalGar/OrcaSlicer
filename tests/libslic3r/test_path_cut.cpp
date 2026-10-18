@@ -5,6 +5,7 @@
 #include <libslic3r/PathCutGeometry.hpp>
 #include <libslic3r/TriangleMesh.hpp>
 
+#include <algorithm>
 #include <cmath>
 #include <map>
 #include <vector>
@@ -290,4 +291,113 @@ TEST_CASE("Curls from hand jitter are cut out of a view path; a path doubling ba
         const std::vector<PathCut::V3> pts{{-2., 0., 10.}, {15., 0., 10.}, {5., 0., 12.}, {22., 0., 8.}};
         CHECK_FALSE(PathCut::make_view_cutter(pts, PathCut::V3::UnitY(), PathCut::V3::Zero(), PathCut::V3::Constant(20.), 0.2).valid());
     }
+}
+
+namespace {
+
+// 12 x 12 x 40 bar cut by a wavy path around z = 20 seen from the front; the lower part gets the pegs.
+struct BarCut
+{
+    PathCut::CutResult res;
+    PathCut::Grouped   g;
+    int                level{0};
+    const indexed_triangle_set &from() const { return level == 1 ? g.side_a : g.side_b; }
+    const indexed_triangle_set &to() const { return level == 1 ? g.side_b : g.side_a; }
+    // The centroid of the cut face triangle of `from` closest to (x, y) across the bar.
+    PathCut::V3 face_point(const PathCut::ConnectorPlacer &pl, double x, double y) const
+    {
+        PathCut::V3 best = PathCut::V3::Zero();
+        double      bd   = 1e9;
+        for (const auto &t : pl.face().indices) {
+            const PathCut::V3 c = (pl.face().vertices[t[0]].cast<double>() + pl.face().vertices[t[1]].cast<double>() +
+                                   pl.face().vertices[t[2]].cast<double>()) / 3.;
+            const double d = std::hypot(c.x() - x, c.y() - y);
+            if (d < bd) { bd = d; best = c; }
+        }
+        return best;
+    }
+};
+
+BarCut cut_bar()
+{
+    BarCut b;
+    const indexed_triangle_set     bar = its_make_cube(12., 12., 40.);
+    const std::vector<PathCut::V3> pts{{-2., 0., 19.}, {6., 0., 21.}, {14., 0., 19.5}};
+    const PathCut::ViewCutter vc = PathCut::make_view_cutter(pts, PathCut::V3::UnitY(), PathCut::V3::Zero(), PathCut::V3(12., 12., 40.), 0.2);
+    REQUIRE(vc.valid());
+    b.res = PathCut::cut_with_slab(bar, vc, false);
+    REQUIRE(b.res.error.empty());
+    bool joined = true;
+    b.g         = PathCut::group_cut(b.res, [&vc](const PathCut::V3 &p) { return vc.side(p); }, false, &joined);
+    REQUIRE_FALSE(joined);
+    b.level = PathCut::peg_side(b.res, b.g.side_a, b.g.side_b);
+    return b;
+}
+
+} // namespace
+
+TEST_CASE("A square connector is checked by its own outline, not the circle around its corners", "[PathCut]")
+{
+    // A 7.2 mm square needs 3.6 + clearance + wall = 4.8 mm of room each way on a 12 mm wide face: it fits.
+    // The circle through its corners plus the wall (6.4 mm) would not.
+    const BarCut             b = cut_bar();
+    PathCut::ConnectorParams prm;
+    prm.type  = PathCut::ConnectorType::Plug;
+    prm.shape = PathCut::ConnectorShape::Square;
+    prm.count = 1;
+    prm.size  = 7.2;
+    std::string                    error;
+    const PathCut::ConnectorResult c = PathCut::place_connectors(b.res, b.level, b.from(), b.to(), prm, error);
+    CHECK(error.empty());
+    REQUIRE(c.positions.size() == 1);
+    require_closed_parts({c.pegs, c.holes_to});
+
+    prm.size = 10.5; // 5.25 + 1.2 = 6.45 > 6: does not fit
+    const PathCut::ConnectorResult big = PathCut::place_connectors(b.res, b.level, b.from(), b.to(), prm, error);
+    CHECK(big.positions.empty());
+    CHECK_FALSE(error.empty());
+}
+
+TEST_CASE("Connectors placed by hand are checked spot by spot", "[PathCut]")
+{
+    const BarCut             b = cut_bar();
+    PathCut::ConnectorParams prm;
+    prm.type = PathCut::ConnectorType::Plug;
+    prm.size = 4.;
+    const PathCut::ConnectorPlacer pl(b.res, b.level, b.from(), b.to(), prm);
+    REQUIRE(pl.error().empty());
+
+    std::vector<PathCut::ConnectorSpot> placed;
+    PathCut::ConnectorSpot              spot;
+    CHECK(pl.try_at(b.face_point(pl, 6., 6.), spot, placed) == PathCut::ConnectorFit::Ok);
+    placed.push_back(spot);
+    CHECK(pl.try_at(b.face_point(pl, 6.5, 6.), spot, placed) == PathCut::ConnectorFit::Overlap);
+    CHECK(pl.try_at(b.face_point(pl, 0.5, 6.), spot, {}) == PathCut::ConnectorFit::Edge);
+
+    const PathCut::ConnectorResult c = pl.build(placed);
+    REQUIRE(c.positions.size() == 1);
+    require_closed_parts({c.pegs, c.holes_to});
+}
+
+TEST_CASE("New connectors keep clear of holes already in the part", "[PathCut]")
+{
+    // A 2 x 2 mm negative volume crossing the cut face near a corner.
+    const BarCut         b    = cut_bar();
+    indexed_triangle_set hole = its_make_cube(2., 2., 10.);
+    for (auto &v : hole.vertices) v += Vec3f(3.f, 3.f, 15.f);
+    PathCut::ConnectorParams prm;
+    prm.type  = PathCut::ConnectorType::Plug;
+    prm.size  = 4.;
+    prm.count = 1;
+    const PathCut::ConnectorPlacer pl(b.res, b.level, b.from(), b.to(), prm, &hole);
+    PathCut::ConnectorSpot         spot;
+    CHECK(pl.try_at(b.face_point(pl, 4., 4.), spot) == PathCut::ConnectorFit::Hole);
+
+    std::string                    error;
+    const PathCut::ConnectorResult c = PathCut::place_connectors(b.res, b.level, b.from(), b.to(), prm, error, {}, &hole);
+    REQUIRE(c.positions.size() == 1);
+    const PathCut::V3 &p = c.positions.front();
+    // The hole plus its clearance and wall (2 + 0.2 + 1) stays clear of the 2 x 2 hole.
+    const double dx = std::max({0., 3. - p.x(), p.x() - 5.}), dy = std::max({0., 3. - p.y(), p.y() - 5.});
+    CHECK(std::hypot(dx, dy) > 3.2);
 }

@@ -36589,3 +36589,55 @@ msgstr "El objeto se ha movido desde que se colocaron los puntos. Vuelve a coloc
 # AI Translated
 msgid "The cut could not be applied."
 msgstr "No se ha podido aplicar el corte."
+
+# AI Translated
+msgid "The connector does not fit there: too close to the edge of the cut face."
+msgstr "El conector no cabe ahí: está demasiado cerca del borde de la cara de corte."
+
+# AI Translated
+msgid "The connector does not fit there: the cut face is too steep or uneven under it."
+msgstr "El conector no cabe ahí: la cara de corte es demasiado inclinada o irregular en ese punto."
+
+# AI Translated
+msgid "The connector does not fit there: the part is too thin for its depth. Make it shorter or try another spot."
+msgstr "El conector no cabe ahí: la pieza es demasiado fina para su profundidad. Hazlo más corto o prueba en otro punto."
+
+# AI Translated
+msgid "The connector does not fit there: it would run into a hole that is already there."
+msgstr "El conector no cabe ahí: chocaría con un agujero que ya existe."
+
+# AI Translated
+msgid "The connector does not fit there: too close to another connector."
+msgstr "El conector no cabe ahí: está demasiado cerca de otro conector."
+
+# AI Translated
+msgid "Click on the cut face to place a connector."
+msgstr "Haz clic en la cara de corte para colocar un conector."
+
+# AI Translated
+msgid "Click on the cut face (orange) where each connector should go. Right click removes the last one. Then apply the cut."
+msgstr "Haz clic en la cara de corte (naranja) donde quieras cada conector. El clic derecho quita el último. Después aplica el corte."
+
+# AI Translated
+msgid "Connectors placed"
+msgstr "Conectores colocados"
+
+# AI Translated
+msgid "Undo connector"
+msgstr "Deshacer conector"
+
+# AI Translated
+msgid "Apply cut"
+msgstr "Aplicar corte"
+
+# AI Translated
+msgid "Straight connectors along the mean direction of the cut face. After the cut is computed, click on the cut face where each one should go: each spot is checked for room in both parts. Two or more also keep the parts from turning."
+msgstr "Conectores rectos en la dirección media de la cara de corte. Cuando el corte esté calculado, haz clic en la cara de corte donde quieras cada uno: se comprueba que haya sitio en las dos piezas. Con dos o más, además, las piezas no pueden girar."
+
+# AI Translated
+msgid "The cut is ready. Click on the cut face (orange) where each connector should go, then apply the cut."
+msgstr "El corte está listo. Haz clic en la cara de corte (naranja) donde quieras cada conector y después aplica el corte."
+
+# AI Translated
+msgid "%1% of the placed connectors no longer fit with these settings and were removed."
+msgstr "%1% de los conectores colocados ya no caben con estos ajustes y se han quitado."

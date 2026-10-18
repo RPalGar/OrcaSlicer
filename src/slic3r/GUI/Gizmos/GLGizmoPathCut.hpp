@@ -16,6 +16,7 @@ class ModelObject;
 namespace GUI {
 
 struct PathCutJob;
+class MeshRaycaster;
 
 // Cut an object along a user-drawn path instead of a plane.
 //  * View path: pick points on the object from one view; the smoothed path is extruded along the
@@ -56,6 +57,12 @@ private:
     void               cut_failed();
     void               clear_pending();
     void               rebuild_cutter_preview();
+    // Manual connectors: after the cut, the cut face is shown and each click on it places a connector.
+    void               start_placing(const std::shared_ptr<PathCutJob> &job);
+    bool               raycast_face(const Vec2d &mouse_pos, Vec3d &hit_world) const;
+    void               add_connector(const Vec3d &hit_world);
+    void               connectors_changed(); // connector settings edited while placing
+    void               rebuild_connector_preview();
 
     Mode               m_mode{Mode::ViewPath};
     std::vector<Vec3d> m_points;                 // picked points, world coordinates
@@ -72,6 +79,7 @@ private:
     Limit              m_lim_front, m_lim_back{false, 20.f}, m_lim_start, m_lim_end;
     // Straight connectors across the cut face (pegs into holes, or separate pins), placed automatically.
     PathCut::ConnectorParams m_conn;
+    bool               m_conn_manual{false};     // the user clicks where each connector goes
     std::string        m_message;
     bool               m_message_is_error{false};
     const ModelObject *m_object{nullptr};        // object the points were picked on
@@ -85,6 +93,13 @@ private:
     // applied only on request.
     std::shared_ptr<PathCutJob>     m_pending;
     std::vector<std::vector<Vec3d>> m_routes;
+    // Placing connectors by hand on the cut face of m_pending.
+    bool                                m_placing{false};
+    std::vector<PathCut::ConnectorSpot> m_spots;          // object coordinates (m_pending's)
+    GLModel                             m_face_model;     // the cut face, object coordinates
+    GLModel                             m_conn_model;     // the connectors placed so far
+    std::shared_ptr<MeshRaycaster>      m_face_raycaster; // picks on the cut face
+    Vec3d                               m_placing_offset{Vec3d::Zero()}; // object coordinates -> world
 
     // A left press on the object adds a point on release, unless the mouse was dragged: then it orbits.
     bool  m_press_on_object{false};
