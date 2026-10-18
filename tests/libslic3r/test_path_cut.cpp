@@ -102,6 +102,33 @@ TEST_CASE("A view path limited in depth cuts the front box and leaves the one be
     }
 }
 
+TEST_CASE("A loop cap leaves other parts of the model next to the loop uncut", "[PathCut]")
+{
+    // Cylinder r = 5 (the limb) and a 5 x 10 x 30 box 2 mm beside it, both crossing the plane of a loop
+    // around the cylinder at z = 15. Only the cylinder is cut; the box lies outside the loop.
+    const double         r = 5.;
+    indexed_triangle_set model = its_make_cylinder(r, 30.);
+    indexed_triangle_set box   = its_make_cube(5., 10., 30.);
+    for (Vec3f &v : box.vertices) v += Vec3f(7.f, -5.f, 0.f);
+    its_merge(model, box);
+    std::vector<PathCut::V3> loop;
+    for (int i = 0; i < 12; ++i) {
+        const double a = 2. * PI * i / 12.;
+        loop.emplace_back(r * std::cos(a), r * std::sin(a), 15.);
+    }
+    PathCut::LoopCutter lc = PathCut::make_loop_cutter(loop, 0.2, 1.5, [](const PathCut::V3 &p) { return p; });
+    REQUIRE(lc.valid());
+    REQUIRE(PathCut::fit_loop_margin(model, lc));
+
+    const PathCut::CutResult res = PathCut::cut_with_slab(model, lc, true);
+    REQUIRE(res.error.empty());
+    const auto parts = its_split(res.mesh);
+    REQUIRE(parts.size() == 3);
+    require_closed_parts(parts);
+    const bool box_whole = std::any_of(parts.begin(), parts.end(), [](const indexed_triangle_set &p) { return std::abs(its_volume(p) - 1500.) < 1.; });
+    CHECK(box_whole);
+}
+
 TEST_CASE("A tilted loop around a cylinder detaches its end", "[PathCut]")
 {
     // Cylinder r = 5, h = 30, loop around it tilted between z = 13 and z = 17.

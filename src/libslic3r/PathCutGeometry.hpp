@@ -520,6 +520,7 @@ struct LoopCutter
     std::vector<double> hloop;  // loop height above the mean plane per spoke
     double              hmean{0.};
     double              margin{0.};
+    double              reach{0.};  // the margin the user asked for: surface crossing the cap further out than this is left alone
     double              kerf{0.};
     std::vector<V3>     loop;   // dense loop (for display)
     std::string         error;
@@ -563,6 +564,8 @@ struct LoopCutter
     double field(const V3 &p) const { return frame.height(p) - cap_height(frame.to2d(p)); }
     double outside(const V3 &p) const { double o; cap_height(frame.to2d(p), &o); return o; }
     V2     chart(const V3 &p, int) const { return frame.to2d(p); }
+    // How far a point lies outside the loop itself (radially, in the cap plane), negative inside.
+    double beyond_loop(const V3 &p) const { return outside(p) + margin; }
     // The cap is smooth (see make_loop_cutter), it has no kinks.
     std::vector<std::pair<V2, V2>> kinks(int, double) const { return {}; }
     V3     lift(const V2 &q, int level) const { return frame.to3d(q, cap_height(q) + 0.5 * kerf * level); }
@@ -588,6 +591,7 @@ LoopCutter make_loop_cutter(const std::vector<V3> &loop_points, double kerf, dou
     LoopCutter lc;
     lc.kerf   = kerf;
     lc.margin = margin;
+    lc.reach  = margin;
     std::vector<V3> pts = remove_close_points(loop_points, 1e-3, true);
     if (pts.size() < 3) {
         lc.error = "The loop needs at least three points.";
@@ -696,6 +700,63 @@ LoopCutter make_loop_cutter(const std::vector<V3> &loop_points, double kerf, dou
     return lc;
 }
 
+inline uint64_t edge_key(int a, int b) { return a < b ? (uint64_t(uint32_t(a)) << 32) | uint32_t(b) : (uint64_t(uint32_t(b)) << 32) | uint32_t(a); }
+
+// The cap only cuts the part the loop goes around. Where another part of the model (the torso next to an
+// arm, a neighbouring leg) crosses the cap inside its footprint, that crossing is a separate band of
+// triangles touching the slab; it is left uncut unless it comes within `reach` of the loop itself.
+// f: field per vertex, out: distance outside the footprint per vertex (< 0 inside).
+// Returns per triangle 1 when it belongs to a band to leave alone.
+inline std::vector<char> foreign_bands(const indexed_triangle_set &its, const std::vector<double> &f, const std::vector<double> &out,
+                                       double hk, const LoopCutter &lc)
+{
+    const size_t      nt = its.indices.size();
+    std::vector<char> skip(nt, 0);
+    std::vector<int>  comp(nt, -1);
+    auto in_slab = [&](size_t ti) {
+        const auto &t = its.indices[ti];
+        if (out[t[0]] >= 0. || out[t[1]] >= 0. || out[t[2]] >= 0.) return false;
+        const double f0 = f[t[0]], f1 = f[t[1]], f2 = f[t[2]];
+        return !(std::min({f0, f1, f2}) >= hk || std::max({f0, f1, f2}) <= -hk);
+    };
+    std::unordered_map<uint64_t, std::vector<uint32_t>> by_edge;
+    for (size_t ti = 0; ti < nt; ++ti)
+        if (in_slab(ti)) {
+            comp[ti] = -2;
+            const auto &t = its.indices[ti];
+            for (int e = 0; e < 3; ++e) by_edge[edge_key(t[e], t[(e + 1) % 3])].push_back(uint32_t(ti));
+        }
+    std::vector<double> dist; // per band: closest approach to the loop
+    std::vector<size_t> stack;
+    for (size_t s = 0; s < nt; ++s) {
+        if (comp[s] != -2) continue;
+        const int c = int(dist.size());
+        double    d = std::numeric_limits<double>::max();
+        comp[s]     = c;
+        stack.assign(1, s);
+        while (!stack.empty()) {
+            const size_t ti = stack.back(); stack.pop_back();
+            const auto  &t  = its.indices[ti];
+            for (int e = 0; e < 3; ++e) {
+                d = std::min(d, lc.beyond_loop(its.vertices[t[e]].cast<double>()));
+                for (uint32_t n : by_edge[edge_key(t[e], t[(e + 1) % 3])])
+                    if (comp[n] == -2) { comp[n] = c; stack.push_back(n); }
+            }
+        }
+        dist.push_back(d);
+    }
+    if (dist.empty()) return skip;
+    const double closest = *std::min_element(dist.begin(), dist.end());
+    for (size_t ti = 0; ti < nt; ++ti)
+        if (comp[ti] >= 0 && dist[comp[ti]] > std::max(lc.reach, closest) + 1e-6) skip[ti] = 1;
+    return skip;
+}
+template<class Cutter>
+std::vector<char> foreign_bands(const indexed_triangle_set &, const std::vector<double> &, const std::vector<double> &, double, const Cutter &)
+{
+    return {}; // view cutters: the wall cuts everything it meets
+}
+
 // Picked loops are coarse, so the surface often bulges a few millimetres past the smoothed loop (ribs,
 // folds, fingers). Widens the cap margin, starting from the requested one, to the first ring around the
 // loop where the surface does not cross the cap, so the cap rim stays in empty space.
@@ -711,12 +772,19 @@ inline bool fit_loop_margin(const indexed_triangle_set &its, LoopCutter &lc, dou
         const double rr = o + lc.margin; // distance outside the loop itself
         if (rr >= 0. && rr < max_margin) ++hits[size_t(rr / bin)];
     };
-    std::vector<double> f(its.vertices.size());
-    for (size_t i = 0; i < f.size(); ++i) f[i] = lc.field(its.vertices[i].cast<double>());
+    std::vector<double> f(its.vertices.size()), out(its.vertices.size());
+    for (size_t i = 0; i < f.size(); ++i) {
+        const V3 p = its.vertices[i].cast<double>();
+        f[i]       = lc.field(p);
+        out[i]     = lc.beyond_loop(p) - max_margin;
+    }
     const double band = 0.5 * lc.kerf;
+    const std::vector<char> skip = foreign_bands(its, f, out, band, lc);
     // Where the surface meets the cap: vertices inside the slab, and the crossings of the cap's
     // mid-surface sampled along each triangle (faces of low-poly models are much larger than a bin).
-    for (const auto &t : its.indices) {
+    for (size_t ti = 0; ti < its.indices.size(); ++ti) {
+        if (skip[ti]) continue;
+        const auto  &t  = its.indices[ti];
         const double f0 = f[t[0]], f1 = f[t[1]], f2 = f[t[2]];
         if (std::min({f0, f1, f2}) > band || std::max({f0, f1, f2}) < -band) continue;
         V3  x[2]; int nx = 0;
@@ -744,7 +812,6 @@ inline bool fit_loop_margin(const indexed_triangle_set &its, LoopCutter &lc, dou
 }
 
 // ------------------------------------------------------------------------------------------------ cleanup
-inline uint64_t edge_key(int a, int b) { return a < b ? (uint64_t(uint32_t(a)) << 32) | uint32_t(b) : (uint64_t(uint32_t(b)) << 32) | uint32_t(a); }
 
 // Sculpted / AI meshes often carry zero-thickness sheets (the same triangle twice with opposite
 // winding) and surfaces pinched along an edge. Removes duplicate faces and detaches the extra faces
@@ -1116,7 +1183,13 @@ CutResult cut_with_slab(indexed_triangle_set its, const Cutter &cutter, bool bou
         const double x = level > 0 ? f[v] - hk : -f[v] - hk;
         return std::abs(x) < 1e-5 ? 1e-5 : x;
     };
-    auto active = [&](const stl_triangle_vertex_indices &t) { return !bounded || (out[t[0]] < 0. && out[t[1]] < 0. && out[t[2]] < 0.); };
+    // Parts of the model that cross a loop cap away from the loop are not cut (see foreign_bands).
+    std::vector<char> foreign;
+    if (bounded) foreign = foreign_bands(its, f, out, hk, cutter);
+    auto active_t = [&](size_t ti) {
+        const auto &t = its.indices[ti];
+        return !bounded || (out[t[0]] < 0. && out[t[1]] < 0. && out[t[2]] < 0. && (foreign.empty() || !foreign[ti]));
+    };
     std::unordered_map<uint64_t, int> cross[2];
     auto crossing = [&](int a, int b, int level) {
         auto &m      = cross[level > 0 ? 0 : 1];
@@ -1150,7 +1223,7 @@ CutResult cut_with_slab(indexed_triangle_set its, const Cutter &cutter, bool bou
     std::unordered_map<uint64_t, int>    removed; // bounded cut only, values unused
     for (size_t ti = 0; ti < its.indices.size(); ++ti) {
         const auto &t = its.indices[ti];
-        if (!active(t)) {
+        if (!active_t(ti)) {
             kept.push_back(t);
             inactive_touching.push_back(ti);
             continue;
