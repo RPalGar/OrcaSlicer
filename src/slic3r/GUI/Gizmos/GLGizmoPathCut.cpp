@@ -2,6 +2,7 @@
 
 #include "slic3r/GUI/3DScene.hpp"
 #include "slic3r/GUI/Camera.hpp"
+#include "slic3r/GUI/CameraUtils.hpp"
 #include "libslic3r/AppConfig.hpp"
 #include "slic3r/GUI/GLCanvas3D.hpp"
 #include "slic3r/GUI/GLShader.hpp"
@@ -426,7 +427,7 @@ void GLGizmoPathCut::on_render()
             shader->set_uniform("view_model_matrix", camera.get_view_matrix() * Geometry::translation_transform(m_placing_offset));
             shader->set_uniform("projection_matrix", camera.get_projection_matrix());
             if (m_face_model.is_initialized()) {
-                m_face_model.set_color(ColorRGBA(1.f, 0.55f, 0.f, 0.55f));
+                m_face_model.set_color(ColorRGBA(1.f, 0.55f, 0.f, 0.7f));
                 m_face_model.render();
             }
             if (m_conn_model.is_initialized()) {
@@ -857,6 +858,7 @@ struct PathCutJob
     // its own part, so keeping a whole hole in both pieces is exactly the hole cut in two.
     struct Extra { size_t volume_idx; indexed_triangle_set mesh; };
     std::vector<Extra>       extras;           // object coordinates
+    std::vector<unsigned char> extra_sides;    // per extra: 1 = in side_a, 2 = in side_b (bits), from the cut
     indexed_triangle_set     removed;          // the negative volumes joined: no new connector runs into them
     // the object
     int          obj_idx{-1}, inst_idx{-1};
@@ -893,6 +895,55 @@ struct PathCutJob
 
 static void abort_job(PathCutJob &job) { job.abort = true; }
 
+// Which pieces each volume that is not cut belongs to: those with material where it is. Its surface is
+// sampled (vertices, and a grid inside each triangle) and each sample tested inside each piece by
+// counting the crossings of a vertical line above it. A hole is partly in the material it removes, a
+// modifier partly in the part it changes; one in neither piece (e.g. only in the gap) is dropped.
+// (Bounding boxes are not enough: the box of a piece easily overlaps a hole of the other one, which then
+// came along with the wrong piece, floating away from it once the pieces were placed apart.)
+static std::vector<unsigned char> extras_in_sides(const std::vector<PathCutJob::Extra> &extras, const indexed_triangle_set &side_a,
+                                                  const indexed_triangle_set &side_b)
+{
+    const PathCut::Frame up = PathCut::frame_from_normal(PathCut::V3::UnitZ(), PathCut::V3::Zero());
+    std::vector<std::unique_ptr<PathCut::detail::LineCaster>> casters;
+    for (const indexed_triangle_set *side : {&side_a, &side_b})
+        casters.push_back(side->indices.empty() ? nullptr : std::make_unique<PathCut::detail::LineCaster>(*side, up));
+    std::vector<double> hits;
+    auto inside = [&](const PathCut::detail::LineCaster &lc, const PathCut::V3 &p) {
+        if (!lc.crossings(up.to2d(p), hits))
+            return false;
+        const double h     = up.height(p);
+        size_t       above = 0;
+        for (double x : hits)
+            if (x > h) ++above;
+        return (above & 1) == 1;
+    };
+    std::vector<unsigned char> out(extras.size(), 0);
+    for (size_t k = 0; k < extras.size(); ++k) {
+        const indexed_triangle_set &m = extras[k].mesh;
+        std::vector<PathCut::V3>    samples;
+        for (const auto &v : m.vertices) samples.emplace_back(v.cast<double>());
+        constexpr int n = 4;
+        for (const auto &t : m.indices) {
+            const PathCut::V3 a = m.vertices[size_t(t[0])].cast<double>(), b = m.vertices[size_t(t[1])].cast<double>(),
+                              c = m.vertices[size_t(t[2])].cast<double>();
+            for (int u = 0; u <= n; ++u)
+                for (int w = 0; u + w <= n; ++w)
+                    samples.push_back(a + (b - a) * (double(u) / n) + (c - a) * (double(w) / n));
+        }
+        for (size_t s = 0; s < 2; ++s) {
+            if (!casters[s])
+                continue;
+            for (const PathCut::V3 &p : samples)
+                if (inside(*casters[s], p)) {
+                    out[k] |= (unsigned char)(1u << s);
+                    break;
+                }
+        }
+    }
+    return out;
+}
+
 void GLGizmoPathCut::clear_pending()
 {
     m_pending.reset();
@@ -902,7 +953,7 @@ void GLGizmoPathCut::clear_pending()
     m_spots.clear();
     m_face_model.reset();
     m_conn_model.reset();
-    m_face_raycaster.reset();
+    m_face_aabb.reset();
 }
 
 // The cut separated the object and the connectors go where the user clicks: show the cut face.
@@ -920,24 +971,29 @@ void GLGizmoPathCut::start_placing(const std::shared_ptr<PathCutJob> &st)
     m_face_model.reset();
     if (g.vertices_count() > 0)
         m_face_model.init_from(std::move(g));
-    m_face_raycaster = std::make_shared<MeshRaycaster>(TriangleMesh(face));
+    m_face_aabb = std::make_shared<AABBMesh>(face);
     rebuild_connector_preview();
     m_message          = _u8L("The cut is ready. Click on the cut face (orange) where each connector should go, then apply the cut.");
     m_message_is_error = false;
     m_parent.set_as_dirty();
 }
 
+// The cut face is an open surface, seen from either side and through the object (it is drawn on top):
+// the first hit along the mouse ray counts. (MeshRaycaster::unproject_on_mesh is for closed meshes: it
+// takes an odd number of hits for a ray starting inside, so it never picks a single surface.)
 bool GLGizmoPathCut::raycast_face(const Vec2d &mouse_pos, Vec3d &hit_world) const
 {
-    if (!m_face_raycaster)
+    if (!m_face_aabb)
         return false;
-    const Camera     &camera = wxGetApp().plater()->get_camera();
-    const Transform3d trafo  = Geometry::translation_transform(m_placing_offset);
-    Vec3f             hit, normal;
-    if (!m_face_raycaster->unproject_on_mesh(mouse_pos, trafo, camera, hit, normal, nullptr, nullptr, false))
-        return false;
-    hit_world = trafo * hit.cast<double>();
-    return true;
+    Vec3d point, dir;
+    CameraUtils::ray_from_screen_pos(wxGetApp().plater()->get_camera(), mouse_pos, point, dir);
+    const std::vector<AABBMesh::hit_result> hits = m_face_aabb->query_ray_hits(point - m_placing_offset, dir);
+    for (const AABBMesh::hit_result &h : hits)
+        if (h.is_hit()) {
+            hit_world = h.position() + m_placing_offset;
+            return true;
+        }
+    return false;
 }
 
 void GLGizmoPathCut::add_connector(const Vec3d &hit_world)
@@ -1159,6 +1215,10 @@ void GLGizmoPathCut::perform_cut()
         ctl.update_status(80, status);
         st->grouped = PathCut::group_cut(res, side, st->mode == GLGizmoPathCut::Mode::Loop, &st->joined);
         lap("grouping");
+        if (!st->extras.empty()) {
+            st->extra_sides = extras_in_sides(st->extras, st->grouped.side_a, st->grouped.side_b);
+            lap("volumes kept");
+        }
         if (st->joined) {
             st->routes = PathCut::joined_routes(res, 3, -1., canceled);
             lap("connection routes");
@@ -1354,25 +1414,13 @@ void GLGizmoPathCut::do_apply_cut(const std::shared_ptr<PathCutJob> &st)
         no->invalidate_bounding_box();
         no->ensure_on_bed();
     };
-    // The volumes that are not cut go to the pieces they overlap (bounding boxes, taken before the meshes move).
-    auto bbox_of = [](const indexed_triangle_set &its) {
-        BoundingBoxf3 bb;
-        for (const auto &v : its.vertices) bb.merge(v.cast<double>());
-        return bb;
-    };
-    std::vector<BoundingBoxf3> side_bb, extra_bb;
-    for (const indexed_triangle_set *side : sides) side_bb.push_back(bbox_of(*side));
-    for (const PathCutJob::Extra &e : st->extras) extra_bb.push_back(bbox_of(e.mesh));
-    auto overlaps = [](const BoundingBoxf3 &a, const BoundingBoxf3 &b) {
-        constexpr double eps = 0.01;
-        return a.defined && b.defined && a.min.x() <= b.max.x() + eps && b.min.x() <= a.max.x() + eps && a.min.y() <= b.max.y() + eps &&
-               b.min.y() <= a.max.y() + eps && a.min.z() <= b.max.z() + eps && b.min.z() <= a.max.z() + eps;
-    };
     for (size_t i = 0; i < sides.size(); ++i) {
         const bool   is_from = sides[i] == from_side;
+        // The volumes that are not cut go to the pieces they are in (decided by the cut job).
+        const unsigned char bit = sides[i] == &grouped.side_a ? 1 : 2;
         ModelObject *no      = new_object(mo->name + " - " + suffix[i], std::move(*sides[i]));
         for (size_t k = 0; k < st->extras.size(); ++k) {
-            if (!overlaps(side_bb[i], extra_bb[k]))
+            if (k >= st->extra_sides.size() || !(st->extra_sides[k] & bit))
                 continue;
             const ModelVolume *src = mo->volumes[st->extras[k].volume_idx]; // unchanged: checked above
             ModelVolume       *nv  = no->add_volume(TriangleMesh(st->extras[k].mesh), src->type());

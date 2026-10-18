@@ -13,10 +13,10 @@
 
 namespace Slic3r {
 class ModelObject;
+class AABBMesh;
 namespace GUI {
 
 struct PathCutJob;
-class MeshRaycaster;
 
 // Cut an object along a user-drawn path instead of a plane.
 //  * View path: pick points on the object from one view; the smoothed path is extruded along the
@@ -98,7 +98,7 @@ private:
     std::vector<PathCut::ConnectorSpot> m_spots;          // object coordinates (m_pending's)
     GLModel                             m_face_model;     // the cut face, object coordinates
     GLModel                             m_conn_model;     // the connectors placed so far
-    std::shared_ptr<MeshRaycaster>      m_face_raycaster; // picks on the cut face
+    std::shared_ptr<AABBMesh>           m_face_aabb;      // picks on the cut face (an open surface: first hit)
     Vec3d                               m_placing_offset{Vec3d::Zero()}; // object coordinates -> world
 
     // A left press on the object adds a point on release, unless the mouse was dragged: then it orbits.
