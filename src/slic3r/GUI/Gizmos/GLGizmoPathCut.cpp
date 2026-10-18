@@ -15,8 +15,6 @@
 #include "slic3r/GUI/PartPlate.hpp"
 #include "slic3r/GUI/Plater.hpp"
 #include "slic3r/GUI/Selection.hpp"
-#include "slic3r/GUI/Jobs/Job.hpp"
-#include "slic3r/GUI/Jobs/Worker.hpp"
 
 #include "libslic3r/AABBMesh.hpp"
 #include "libslic3r/BoundingBox.hpp"
@@ -29,6 +27,7 @@
 #include <boost/log/trivial.hpp>
 #include <glad/gl.h>
 #include <imgui/imgui.h>
+#include <wx/app.h>
 #include <wx/glcanvas.h>
 
 #include <algorithm>
@@ -42,6 +41,7 @@
 #include <memory>
 #include <utility>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace Slic3r {
@@ -500,11 +500,6 @@ void GLGizmoPathCut::on_render()
 
 void GLGizmoPathCut::on_render_input_window(float x, float y, float bottom_limit)
 {
-    // A job dropped from the queue (another tool cleared it) never reports back.
-    if (m_busy && wxGetApp().plater()->get_ui_job_worker().is_idle()) {
-        m_busy = false;
-        m_message.clear();
-    }
     // A pending cut was computed with the old settings: drop it when they change.
     auto settings_changed = [this]() {
         clear_pending();
@@ -577,8 +572,16 @@ void GLGizmoPathCut::on_render_input_window(float x, float y, float bottom_limit
         wxGetApp().CallAfter([this]() { perform_cut(); });
     if (m_busy) {
         ImGui::SameLine();
-        if (m_imgui->button(_L("Cancel")))
-            wxGetApp().plater()->get_ui_job_worker().cancel();
+        // Frees the tool at once, whatever the cut is doing: its result is dropped when it ends.
+        if (m_imgui->button(_L("Cancel"))) {
+            if (m_running)
+                abort_job(*m_running);
+            m_running.reset();
+            ++m_generation;
+            m_busy             = false;
+            m_message          = _u8L("Cut cancelled.");
+            m_message_is_error = false;
+        }
     }
 
     if (m_pending && !m_busy && !m_placing) {
@@ -850,7 +853,8 @@ struct PathCutJob
     bool                     flat_cap{true};
     PathCut::ViewLimits      limits;
     PathCut::ConnectorParams conn;
-    std::atomic<bool>        abort{false}; // set when the tool closes
+    std::atomic<bool>        abort{false}; // set when the tool closes or the cut is cancelled
+    std::exception_ptr       eptr;         // what the cut threw, handed to the UI thread
     size_t                   merged_parts{0};  // model parts joined into one mesh for the cut
     bool                     conn_manual{false};
     // Volumes that are not cut (negative volumes, modifiers, support blockers / enforcers): each goes to
@@ -1151,7 +1155,7 @@ void GLGizmoPathCut::perform_cut()
     m_parent.set_as_dirty();
 
     // Runs on the UI job worker thread, so the UI stays responsive and the job can be cancelled.
-    auto process = [st](Job::Ctl &ctl) {
+    auto process = [st]() {
         using clk = std::chrono::steady_clock;
         auto t0   = clk::now();
         auto lap  = [&t0](const char *what) {
@@ -1160,10 +1164,8 @@ void GLGizmoPathCut::perform_cut()
                                     << std::chrono::duration_cast<std::chrono::milliseconds>(now - t0).count() << " ms";
             t0 = now;
         };
-        const std::string status = _u8L("Cutting along path");
-        auto canceled = [&ctl, &st]() { return ctl.was_canceled() || st->abort; };
+        auto canceled = [&st]() { return st->abort.load(); };
         BOOST_LOG_TRIVIAL(info) << "PathCut: " << st->src.indices.size() << " triangles";
-        ctl.update_status(5, status);
         PathCut::make_edge_manifold(st->src);
         lap("make_edge_manifold");
         PathCut::V3 mn = PathCut::V3::Constant(std::numeric_limits<double>::max()), mx = -mn;
@@ -1171,7 +1173,6 @@ void GLGizmoPathCut::perform_cut()
             mn = mn.cwiseMin(PathCut::V3(v.cast<double>()));
             mx = mx.cwiseMax(PathCut::V3(v.cast<double>()));
         }
-        ctl.update_status(20, status);
         PathCut::CutResult                      res;
         std::function<int(const PathCut::V3 &)> side;
         PathCut::ViewCutter                     vc;
@@ -1206,13 +1207,12 @@ void GLGizmoPathCut::perform_cut()
             side = [&lc](const PathCut::V3 &p) { return lc.side(p); };
         }
         lap("cut");
-        if (ctl.was_canceled())
+        if (canceled())
             return;
         if (!res.error.empty()) {
             st->error = res.error;
             return;
         }
-        ctl.update_status(80, status);
         st->grouped = PathCut::group_cut(res, side, st->mode == GLGizmoPathCut::Mode::Loop, &st->joined);
         lap("grouping");
         if (!st->extras.empty()) {
@@ -1224,7 +1224,6 @@ void GLGizmoPathCut::perform_cut()
             lap("connection routes");
         } else if (st->conn.type != PathCut::ConnectorType::None && !st->grouped.side_a.indices.empty() &&
                    !st->grouped.side_b.indices.empty()) {
-            ctl.update_status(90, status);
             st->connectors_from_a = PathCut::peg_side(res, st->grouped.side_a, st->grouped.side_b) == 1;
             const indexed_triangle_set &from = st->connectors_from_a ? st->grouped.side_a : st->grouped.side_b;
             const indexed_triangle_set &to   = st->connectors_from_a ? st->grouped.side_b : st->grouped.side_a;
@@ -1241,8 +1240,7 @@ void GLGizmoPathCut::perform_cut()
                 st->cut = std::make_unique<PathCut::CutResult>(std::move(res)); // to check the connectors again on edits
             lap("connectors");
         }
-        ctl.update_status(100, status);
-    };
+        };
 
     // Back on the UI thread.
     const unsigned generation = m_generation;
@@ -1316,12 +1314,23 @@ void GLGizmoPathCut::perform_cut()
         apply_cut(st);
     };
 
+    // The cut runs on a thread of its own, not on the shared UI job worker: a cut stuck in a phase that
+    // does not check for cancelling would otherwise keep the worker (and its progress bar) busy until the
+    // application is closed. Cancelling frees the tool at once; a cut still running is just left to end
+    // and its result dropped (the generation no longer matches).
     m_running = st;
-    if (!queue_job(plater->get_ui_job_worker(), std::move(process), std::move(finalize))) {
-        m_running.reset();
-        m_busy = false;
-        m_message.clear();
-    }
+    std::thread([st, process, finalize]() {
+        try {
+            process();
+        } catch (...) {
+            st->eptr = std::current_exception();
+        }
+        if (wxTheApp)
+            wxTheApp->CallAfter([st, finalize]() {
+                std::exception_ptr e = st->eptr;
+                finalize(st->abort.load(), e);
+            });
+    }).detach();
 }
 
 // An exception escaping here (UI thread, job finalize or CallAfter) would end the application.

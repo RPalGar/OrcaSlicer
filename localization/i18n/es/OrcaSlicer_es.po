@@ -36430,8 +36430,8 @@ msgid "Cut direction"
 msgstr "Dirección del corte"
 
 # AI Translated
-msgid "Cutting along path"
-msgstr "Cortando por ruta"
+msgid "Cut cancelled."
+msgstr "Corte cancelado."
 
 # AI Translated
 msgid "Cutting, please wait..."
