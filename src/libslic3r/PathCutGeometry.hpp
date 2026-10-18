@@ -1602,13 +1602,13 @@ inline CutResult cut_along_loop(indexed_triangle_set its, const LoopCutter &lc, 
     if (stop()) return {};
 
     // Distance from a point to the picked loop.
-    const std::vector<V3> &L = lc.loop;
-    V3 bmin = L.front(), bmax = L.front();
-    for (const V3 &p : L) { bmin = bmin.cwiseMin(p); bmax = bmax.cwiseMax(p); }
+    const std::vector<V3> &lp = lc.loop;
+    V3 bmin = lp.front(), bmax = lp.front();
+    for (const V3 &p : lp) { bmin = bmin.cwiseMin(p); bmax = bmax.cwiseMax(p); }
     auto loop_dist = [&](const V3 &p) {
         double best = std::numeric_limits<double>::max();
-        for (size_t i = 0; i < L.size(); ++i) {
-            const V3 &a = L[i], &b = L[(i + 1) % L.size()];
+        for (size_t i = 0; i < lp.size(); ++i) {
+            const V3 &a = lp[i], &b = lp[(i + 1) % lp.size()];
             const V3  ab = b - a;
             const double t = std::clamp(ab.squaredNorm() > 1e-18 ? (p - a).dot(ab) / ab.squaredNorm() : 0., 0., 1.);
             best = std::min(best, (a + ab * t - p).squaredNorm());
@@ -1626,8 +1626,8 @@ inline CutResult cut_along_loop(indexed_triangle_set its, const LoopCutter &lc, 
         if ((g[t[0]] > 0.) == (g[t[1]] > 0.) && (g[t[1]] > 0.) == (g[t[2]] > 0.)) continue;
         std::array<uint64_t, 2> ek{};
         int  nx = 0;
-        bool far = false;
-        for (int e = 0; e < 3 && !far; ++e) {
+        bool too_far = false; // (not `far`: windows.h defines it as a macro)
+        for (int e = 0; e < 3 && !too_far; ++e) {
             const int a = t[e], b = t[(e + 1) % 3];
             if ((g[a] > 0.) == (g[b] > 0.)) continue;
             const uint64_t k = edge_key(a, b);
@@ -1639,10 +1639,10 @@ inline CutResult cut_along_loop(indexed_triangle_set its, const LoopCutter &lc, 
                 it = xpos.emplace(k, p).first;
                 xdist[k] = in_box ? loop_dist(p) : std::numeric_limits<double>::max();
             }
-            far |= xdist[k] > tmax;
+            too_far |= xdist[k] > tmax;
             if (nx < 2) ek[size_t(nx++)] = k;
         }
-        if (!far && nx == 2) segs.emplace_back(ti, ek);
+        if (!too_far && nx == 2) segs.emplace_back(ti, ek);
         if ((ti & 0xffff) == 0 && stop()) return {};
     }
 
