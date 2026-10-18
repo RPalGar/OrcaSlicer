@@ -64,6 +64,8 @@ static const ColorRGBA POINT_COLOR = {1.f, 0.55f, 0.f, 1.f};
     L("The model has holes along the cut, so the cut faces cannot be closed. Repair the model first."),
     L("The cap spanning the loop runs into another part of the model. Place the loop where the part is free all around."),
     L("The object was changed while it was being cut. Cut it again."),
+    L("The cut could not follow the loop along the surface. Place more points, closer together, along the line where you want to cut, or raise the margin."),
+    L("The loop does not detach anything: the part is still connected around it. Place the loop all the way around the part."),
     L("The cut failed. Try a simpler path or a lower resolution model."),
     L("The cut ends inside the object. Increase or remove the limits, or start and end the path beyond the part."),
     L("The path crosses itself seen from the view. Place the points in order along the cut line."),
@@ -390,7 +392,8 @@ void GLGizmoPathCut::rebuild_cutter_preview()
                 const double a = 2. * PI * j / sectors;
                 double       r, h;
                 lc.spoke_at(a, r, h);
-                const double            rr = k <= rings ? r * k / rings : r + lc.margin;
+                // The flat cap reaches past the loop; the exact cut stops at the loop.
+                const double            rr = k <= rings ? r * k / rings : r + (m_flat_cap ? lc.margin : 0.);
                 const PathCut::V2 q  = lc.center2d + PathCut::V2(std::cos(a), std::sin(a)) * rr;
                 g.add_vertex(Vec3f(lc.frame.to3d(q, lc.cap_height(q)).cast<float>()));
             }
@@ -518,7 +521,7 @@ void GLGizmoPathCut::on_render_input_window(float x, float y, float bottom_limit
     // longer than the English text), so no label runs under a field.
     const float gap = ImGui::GetStyle().ItemSpacing.x * 2.f;
     float       label_w = 0.f, check_w = 0.f;
-    for (const std::string &l : {_u8L("Clearance (mm)"), _u8L("Min. cap margin (mm)"), _u8L("Cut direction"), _u8L("Turn (deg)"),
+    for (const std::string &l : {_u8L("Clearance (mm)"), _u8L("Min. cap margin (mm)"), _u8L("Max. deviation (mm)"), _u8L("Cut direction"), _u8L("Turn (deg)"),
                                  _u8L("Tilt (deg)"), _u8L("Connectors"), _u8L("Shape"), _u8L("Number of connectors"),
                                  _u8L("Diameter / side (mm)"), _u8L("Depth (mm)"), _u8L("Hole clearance (mm)"), _u8L("Placement")})
         label_w = std::max(label_w, ImGui::CalcTextSize(l.c_str()).x);
@@ -632,7 +635,7 @@ void GLGizmoPathCut::on_render_input_window(float x, float y, float bottom_limit
     m_kerf = std::clamp(m_kerf, 0.02f, 2.f);
     if (m_mode == Mode::Loop) {
         ImGui::AlignTextToFramePadding();
-        m_imgui->text(_u8L("Min. cap margin (mm)"));
+        m_imgui->text(m_flat_cap ? _u8L("Min. cap margin (mm)") : _u8L("Max. deviation (mm)"));
         ImGui::SameLine(field_x);
         if (ImGui::InputFloat("##pathcut_margin", &m_margin, 0.1f, 0.5f, "%.1f"))
             settings_changed();
@@ -1198,12 +1201,18 @@ void GLGizmoPathCut::perform_cut()
                 st->error = lc.error;
                 return;
             }
-            if (!PathCut::fit_loop_margin(st->src, lc)) {
-                st->error = "The cap spanning the loop runs into another part of the model. Place the loop where the part is free all around.";
-                return;
+            if (!st->flat_cap) {
+                // Exactly along the loop: only the surface the loop runs on is cut (folds, creases).
+                res = PathCut::cut_along_loop(std::move(st->src), lc, st->margin, canceled);
+            } else {
+                // Flat cut face: a slab through the mean plane of the loop, widened past bulges near it.
+                if (!PathCut::fit_loop_margin(st->src, lc)) {
+                    st->error = "The cap spanning the loop runs into another part of the model. Place the loop where the part is free all around.";
+                    return;
+                }
+                BOOST_LOG_TRIVIAL(info) << "PathCut: cap margin " << lc.margin << " mm";
+                res = PathCut::cut_with_slab(std::move(st->src), lc, true, 0.5, canceled);
             }
-            BOOST_LOG_TRIVIAL(info) << "PathCut: cap margin " << lc.margin << " mm";
-            res  = PathCut::cut_with_slab(std::move(st->src), lc, true, 0.5, canceled);
             side = [&lc](const PathCut::V3 &p) { return lc.side(p); };
         }
         lap("cut");

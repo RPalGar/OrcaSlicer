@@ -68,8 +68,8 @@ private:
     std::vector<Vec3d> m_points;                 // picked points, world coordinates
     Vec3d              m_view_dir{Vec3d::UnitY()}; // locked at the first point (view path mode)
     float              m_kerf{0.2f};             // clearance between parts [mm]
-    float              m_margin{1.5f};           // minimum reach of the loop cap past the loop, widened as needed [mm]
-    bool               m_flat_cap{true};         // loop: flat cut face (mean plane) instead of following the loop
+    float              m_margin{1.5f};           // loop: how far the cut may run from the loop (exact) / min. cap reach past it (flat) [mm]
+    bool               m_flat_cap{false};        // loop: flat cut face through the mean plane (a slab) instead of exactly along the loop
     enum class Sweep : int { View = 0, Level = 1, Vertical = 2, Custom = 3 };
     Sweep              m_sweep{Sweep::View};     // view path: direction the path is swept along
     float              m_turn{0.f}, m_tilt{0.f}; // custom sweep: around the vertical axis / below horizontal [deg]

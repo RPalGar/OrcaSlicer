@@ -36641,3 +36641,12 @@ msgstr "El corte está listo. Haz clic en la cara de corte (naranja) donde quier
 # AI Translated
 msgid "%1% of the placed connectors no longer fit with these settings and were removed."
 msgstr "%1% de los conectores colocados ya no caben con estos ajustes y se han quitado."
+
+msgid "Max. deviation (mm)"
+msgstr "Desviación máx. (mm)"
+
+msgid "The cut could not follow the loop along the surface. Place more points, closer together, along the line where you want to cut, or raise the margin."
+msgstr "El corte no ha podido seguir el lazo por la superficie. Pon más puntos, más juntos, a lo largo de la línea por donde quieres cortar, o aumenta la desviación máxima."
+
+msgid "The loop does not detach anything: the part is still connected around it. Place the loop all the way around the part."
+msgstr "El lazo no separa nada: la parte sigue unida alrededor de él. Coloca el lazo rodeando la parte por completo."

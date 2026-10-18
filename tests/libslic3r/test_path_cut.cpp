@@ -129,6 +129,38 @@ TEST_CASE("A loop cap leaves other parts of the model next to the loop uncut", "
     CHECK(box_whole);
 }
 
+TEST_CASE("A cut exactly along a loop splits only the surface the loop runs on", "[PathCut]")
+{
+    // Cylinder r = 5 with a wavy loop around it, and a box 2 mm beside it crossing the loop's height.
+    const double         r = 5.;
+    indexed_triangle_set model = its_make_cylinder(r, 30.);
+    indexed_triangle_set box   = its_make_cube(5., 10., 30.);
+    for (Vec3f &v : box.vertices) v += Vec3f(7.f, -5.f, 0.f);
+    its_merge(model, box);
+    std::vector<PathCut::V3> loop;
+    for (int i = 0; i < 12; ++i) {
+        const double a = 2. * PI * i / 12.;
+        loop.emplace_back(r * std::cos(a), r * std::sin(a), 15. + std::sin(2. * a));
+    }
+    const PathCut::LoopCutter lc = PathCut::make_loop_cutter(loop, 0.2, 1.5, [](const PathCut::V3 &p) { return p; }, false);
+    REQUIRE(lc.valid());
+
+    const PathCut::CutResult res = PathCut::cut_along_loop(model, lc, 1.5);
+    REQUIRE(res.error.empty());
+    const auto parts = its_split(res.mesh);
+    REQUIRE(parts.size() == 3);
+    require_closed_parts(parts);
+    const bool box_whole = std::any_of(parts.begin(), parts.end(), [](const indexed_triangle_set &p) { return std::abs(its_volume(p) - 1500.) < 1.; });
+    CHECK(box_whole);
+
+    bool joined = false;
+    const PathCut::Grouped g = PathCut::group_cut(res, [](const PathCut::V3 &) { return 0; }, true, &joined);
+    CHECK_FALSE(joined);
+    // The cylinder is split about its middle; the box, untouched, stays with the lower part.
+    const double half = PI * r * r * 15.;
+    CHECK_THAT(std::min(its_volume(g.side_a), its_volume(g.side_b)), WithinAbs(half, 0.1 * half));
+}
+
 TEST_CASE("A tilted loop around a cylinder detaches its end", "[PathCut]")
 {
     // Cylinder r = 5, h = 30, loop around it tilted between z = 13 and z = 17.

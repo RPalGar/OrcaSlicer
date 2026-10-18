@@ -1578,6 +1578,211 @@ struct Grouped
     size_t               n_a{0}, n_b{0}, n_small{0};
 };
 
+// Cuts a closed mesh exactly along a loop picked on its surface: the surface is split where it meets the
+// cap (the curve through the picked points) and nowhere else, and both openings are closed with the cap
+// spanning the loop. Unlike cut_with_slab, nothing outside the loop is touched, so the cut can run along a
+// fold or crease and stay hidden there.
+//  lc:        a loop cutter that follows the loop's heights (not flat), built from points on the surface.
+//  tolerance: how far from the picked loop the cut line may run [mm]; tried doubled twice if needed.
+// The cut faces are pulled apart by the kerf away from the rim; the pieces touch along the loop itself.
+inline CutResult cut_along_loop(indexed_triangle_set its, const LoopCutter &lc, double tolerance,
+                                const std::function<bool()> &canceled = {})
+{
+    CutResult res;
+    auto stop = [&]() { return canceled && canceled(); };
+    auto pos  = [&](int v) -> V3 { return its.vertices[size_t(v)].template cast<double>(); };
+    const size_t nv0 = its.vertices.size();
+
+    // Field per vertex, never exactly zero (a tiny shift, not a move) so every crossing is inside its edge.
+    std::vector<double> g(nv0);
+    for (size_t v = 0; v < nv0; ++v) {
+        g[v] = lc.field(pos(int(v)));
+        if (std::abs(g[v]) < 1e-7) g[v] = 1e-7;
+    }
+    if (stop()) return {};
+
+    // Distance from a point to the picked loop.
+    const std::vector<V3> &L = lc.loop;
+    V3 bmin = L.front(), bmax = L.front();
+    for (const V3 &p : L) { bmin = bmin.cwiseMin(p); bmax = bmax.cwiseMax(p); }
+    auto loop_dist = [&](const V3 &p) {
+        double best = std::numeric_limits<double>::max();
+        for (size_t i = 0; i < L.size(); ++i) {
+            const V3 &a = L[i], &b = L[(i + 1) % L.size()];
+            const V3  ab = b - a;
+            const double t = std::clamp(ab.squaredNorm() > 1e-18 ? (p - a).dot(ab) / ab.squaredNorm() : 0., 0., 1.);
+            best = std::min(best, (a + ab * t - p).squaredNorm());
+        }
+        return std::sqrt(best);
+    };
+
+    // Crossings of the cap near the loop: the edge points and, per crossed triangle, the segment joining them.
+    const double tmax = 4. * tolerance;
+    std::unordered_map<uint64_t, V3>     xpos;  // crossed edge -> crossing point
+    std::unordered_map<uint64_t, double> xdist; // crossed edge -> distance to the loop
+    std::vector<std::pair<size_t, std::array<uint64_t, 2>>> segs; // triangle, its two crossed edges
+    for (size_t ti = 0; ti < its.indices.size(); ++ti) {
+        const auto &t = its.indices[ti];
+        if ((g[t[0]] > 0.) == (g[t[1]] > 0.) && (g[t[1]] > 0.) == (g[t[2]] > 0.)) continue;
+        std::array<uint64_t, 2> ek{};
+        int  nx = 0;
+        bool far = false;
+        for (int e = 0; e < 3 && !far; ++e) {
+            const int a = t[e], b = t[(e + 1) % 3];
+            if ((g[a] > 0.) == (g[b] > 0.)) continue;
+            const uint64_t k = edge_key(a, b);
+            auto it = xpos.find(k);
+            if (it == xpos.end()) {
+                const int lo = std::min(a, b), hi = std::max(a, b);
+                const V3  p  = pos(lo) + (pos(hi) - pos(lo)) * (g[lo] / (g[lo] - g[hi]));
+                const bool in_box = (p.array() >= (bmin.array() - tmax)).all() && (p.array() <= (bmax.array() + tmax)).all();
+                it = xpos.emplace(k, p).first;
+                xdist[k] = in_box ? loop_dist(p) : std::numeric_limits<double>::max();
+            }
+            far |= xdist[k] > tmax;
+            if (nx < 2) ek[size_t(nx++)] = k;
+        }
+        if (!far && nx == 2) segs.emplace_back(ti, ek);
+        if ((ti & 0xffff) == 0 && stop()) return {};
+    }
+
+    // Closed chains of segments within the tolerance; the one winding once around the loop's centre and
+    // closest to the loop is the cut line.
+    std::vector<size_t> chain_tris;   // triangles of the chosen chain
+    std::vector<uint64_t> chain_edges; // its crossed edges, in order
+    for (double tol = tolerance; tol <= tmax + 1e-9 && chain_edges.empty(); tol *= 2.) {
+        std::unordered_map<uint64_t, std::vector<size_t>> at; // crossed edge -> segments using it
+        for (size_t s = 0; s < segs.size(); ++s)
+            if (xdist[segs[s].second[0]] <= tol && xdist[segs[s].second[1]] <= tol)
+                for (uint64_t k : segs[s].second) at[k].push_back(s);
+        std::unordered_set<size_t> used;
+        double best = std::numeric_limits<double>::max();
+        for (const auto &[k0, list] : at) {
+            if (list.size() != 2 || used.count(list[0])) continue;
+            std::vector<size_t>   tris;
+            std::vector<uint64_t> edges;
+            size_t   s  = list[0];
+            uint64_t k  = k0;
+            bool     ok = true;
+            while (true) {
+                used.insert(s);
+                tris.push_back(segs[s].first);
+                edges.push_back(k);
+                k = segs[s].second[0] == k ? segs[s].second[1] : segs[s].second[0];
+                const auto &nx = at.find(k)->second; // every edge of a kept segment is in `at`
+                if (nx.size() != 2) { ok = false; break; }
+                const size_t n = nx[0] == s ? nx[1] : nx[0];
+                if (k == k0) break;
+                if (used.count(n)) { ok = false; break; }
+                s = n;
+            }
+            if (!ok || edges.size() < 3) continue;
+            double wind = 0., mean = 0.;
+            for (size_t i = 0; i < edges.size(); ++i) {
+                const V2 a = lc.frame.to2d(xpos[edges[i]]) - lc.center2d, b = lc.frame.to2d(xpos[edges[(i + 1) % edges.size()]]) - lc.center2d;
+                wind += std::atan2(a.x() * b.y() - a.y() * b.x(), a.dot(b));
+                mean += xdist[edges[i]];
+            }
+            mean /= double(edges.size());
+            if (std::abs(std::abs(wind) - 2. * PI_) > 0.5 || mean >= best) continue;
+            best        = mean;
+            chain_tris  = std::move(tris);
+            chain_edges = std::move(edges);
+        }
+    }
+    if (chain_edges.empty()) {
+        res.error = "The cut could not follow the loop along the surface. Place more points, closer together, along the line "
+                    "where you want to cut, or raise the margin.";
+        return res;
+    }
+    if (stop()) return {};
+
+    // Split the surface along the chain: every crossed edge gets one vertex per side.
+    std::unordered_map<uint64_t, std::array<int, 2>> xv; // [0]: positive side, [1]: negative side
+    for (uint64_t k : chain_edges) {
+        const int a = int(its.vertices.size());
+        its.vertices.emplace_back(xpos[k].template cast<float>());
+        its.vertices.emplace_back(xpos[k].template cast<float>());
+        xv[k] = {a, a + 1};
+    }
+    std::vector<stl_triangle_vertex_indices> split;
+    for (size_t ti : chain_tris) {
+        const auto t = its.indices[ti];
+        int lone = 0; // the vertex alone on its side
+        for (int e = 0; e < 3; ++e)
+            if ((g[t[e]] > 0.) != (g[t[(e + 1) % 3]] > 0.) && (g[t[e]] > 0.) != (g[t[(e + 2) % 3]] > 0.)) lone = e;
+        const int  v0 = t[lone], v1 = t[(lone + 1) % 3], v2 = t[(lone + 2) % 3];
+        const int  s0 = g[v0] > 0. ? 0 : 1, s1 = 1 - s0;
+        const auto &x01 = xv[edge_key(v0, v1)], &x02 = xv[edge_key(v0, v2)];
+        its.indices[ti] = stl_triangle_vertex_indices(v0, x01[s0], x02[s0]);
+        split.emplace_back(x01[s1], v1, v2);
+        split.emplace_back(x01[s1], v2, x02[s1]);
+    }
+    for (const auto &t : split) its.indices.push_back(t);
+
+    // The two pieces of surface next to the chain must be apart, or the loop does not detach anything.
+    std::vector<int> dsu(its.vertices.size());
+    for (size_t i = 0; i < dsu.size(); ++i) dsu[i] = int(i);
+    auto find = [&dsu](int x) { while (dsu[x] != x) x = dsu[x] = dsu[dsu[x]]; return x; };
+    for (const auto &t : its.indices) { dsu[find(t[0])] = find(t[1]); dsu[find(t[1])] = find(t[2]); }
+    if (find(xv[chain_edges[0]][0]) == find(xv[chain_edges[0]][1])) {
+        res.error = "The loop does not detach anything: the part is still connected around it. Place the loop all the way around the part.";
+        return res;
+    }
+
+    // Caps: rings shrinking from the chain to the loop's centre, on the cap surface, moved by half the kerf
+    // towards their own piece away from the rim.
+    const size_t n = chain_edges.size();
+    double       rmax = 0.;
+    for (uint64_t k : chain_edges) rmax = std::max(rmax, (lc.frame.to2d(xpos[k]) - lc.center2d).norm());
+    const int rings = std::clamp(int(rmax / 1.5), 2, 40);
+    res.first_cap   = its.indices.size();
+    res.level.assign(its.vertices.size(), 0);
+    for (uint64_t k : chain_edges) { res.level[size_t(xv[k][0])] = 1; res.level[size_t(xv[k][1])] = -1; }
+    for (int side = 0; side < 2; ++side) {
+        const int    level = side == 0 ? 1 : -1;
+        const size_t first = its.indices.size();
+        std::vector<int> prev(n);
+        for (size_t i = 0; i < n; ++i) prev[i] = xv[chain_edges[i]][side];
+        for (int r = rings - 1; r >= 0; --r) {
+            const double f = double(r) / double(rings);
+            std::vector<int> cur(n);
+            if (r == 0) {
+                const int c = int(its.vertices.size());
+                its.vertices.emplace_back(lc.lift(lc.center2d, level).template cast<float>());
+                std::fill(cur.begin(), cur.end(), c);
+            } else
+                for (size_t i = 0; i < n; ++i) {
+                    const V2 q = lc.center2d + (lc.frame.to2d(xpos[chain_edges[i]]) - lc.center2d) * f;
+                    cur[i]     = int(its.vertices.size());
+                    its.vertices.emplace_back(lc.lift(q, level).template cast<float>());
+                }
+            for (size_t i = 0; i < n; ++i) {
+                const size_t j = (i + 1) % n;
+                its.indices.emplace_back(prev[i], prev[j], cur[j]);
+                if (cur[i] != cur[j]) its.indices.emplace_back(prev[i], cur[j], cur[i]);
+            }
+            prev = std::move(cur);
+        }
+        res.level.resize(its.vertices.size(), 0);
+        for (size_t v = res.level.size(); v-- > 0 && res.level[v] == 0 && v >= nv0 + 2 * n;) res.level[v] = static_cast<signed char>(level);
+        // Orient the cap with the surface it closes: each chain edge must be walked opposite to the surface.
+        std::unordered_set<uint64_t> surf_dir;
+        const int a0 = xv[chain_edges[0]][side], a1 = xv[chain_edges[1 % n]][side];
+        for (size_t ti = 0; ti < first; ++ti) {
+            const auto &t = its.indices[ti];
+            for (int e = 0; e < 3; ++e)
+                if (t[e] == a0 && t[(e + 1) % 3] == a1) {
+                    for (size_t c = first; c < its.indices.size(); ++c) std::swap(its.indices[c][1], its.indices[c][2]);
+                    break;
+                }
+        }
+    }
+    res.cap_triangles = its.indices.size() - res.first_cap;
+    res.mesh          = std::move(its);
+    return res;
+}
+
 inline void its_append(indexed_triangle_set &dst, const indexed_triangle_set &src)
 {
     const int off = int(dst.vertices.size());
