@@ -161,6 +161,23 @@ TEST_CASE("A cut exactly along a loop splits only the surface the loop runs on",
     CHECK_THAT(std::min(its_volume(g.side_a), its_volume(g.side_b)), WithinAbs(half, 0.1 * half));
 }
 
+TEST_CASE("The preview draws the detached piece apart from the rest", "[PathCut]")
+{
+    // A 10 mm cube resting on top of a 20 mm one: drawn 3 mm (the minimum) further up.
+    indexed_triangle_set stay  = its_make_cube(20., 20., 20.);
+    indexed_triangle_set moved = its_make_cube(10., 10., 10.);
+    for (Vec3f &v : moved.vertices) v += Vec3f(5.f, 5.f, 20.f);
+    const PathCut::V3 shift = PathCut::preview_shift(moved, stay);
+    CHECK_THAT(shift.norm(), WithinAbs(3., 1e-9));
+    CHECK(shift.z() > 0.);
+    CHECK_THAT(shift.x(), WithinAbs(0., 1e-9));
+    // A large detached piece goes 5 % of its size, at most 15 mm; an empty piece is not moved.
+    indexed_triangle_set big = its_make_cube(400., 400., 400.);
+    for (Vec3f &v : big.vertices) v += Vec3f(0.f, 0.f, 20.f);
+    CHECK_THAT(PathCut::preview_shift(big, stay).norm(), WithinAbs(15., 1e-9));
+    CHECK(PathCut::preview_shift(indexed_triangle_set{}, stay).norm() == 0.);
+}
+
 TEST_CASE("A tilted loop around a cylinder detaches its end", "[PathCut]")
 {
     // Cylinder r = 5, h = 30, loop around it tilted between z = 13 and z = 17.

@@ -49,6 +49,10 @@ namespace GUI {
 
 static const ColorRGBA PATH_COLOR  = {0.f, 0.588f, 0.533f, 1.f}; // Orca teal
 static const ColorRGBA POINT_COLOR = {1.f, 0.55f, 0.f, 1.f};
+// Preview: the piece that stays, the detached one (drawn apart) and the connectors.
+static const ColorRGBA PREVIEW_STAY_COLOR  = {0.55f, 0.72f, 0.70f, 1.f};
+static const ColorRGBA PREVIEW_MOVED_COLOR = {0.95f, 0.62f, 0.25f, 1.f};
+static const ColorRGBA PREVIEW_PEG_COLOR   = {0.15f, 0.75f, 0.35f, 1.f};
 
 // Messages produced by libslic3r/PathCutGeometry.hpp, listed here so xgettext picks them up.
 [[maybe_unused]] static const char *const PATH_CUT_MESSAGES[] = {
@@ -104,6 +108,7 @@ CommonGizmosDataID GLGizmoPathCut::on_get_requirements() const
 }
 
 static void abort_job(PathCutJob &job); // below, after PathCutJob
+static bool job_object_unchanged(const PathCutJob &job);
 
 void GLGizmoPathCut::on_set_state()
 {
@@ -197,7 +202,7 @@ bool GLGizmoPathCut::on_mouse(const wxMouseEvent &mouse_event)
             return false;
         // On the object: a click adds a point (on release), a drag orbits the view.
         m_press_on_object  = true;
-        m_press_adds_point = on_part;
+        m_press_adds_point = on_part && !previewing(); // the preview is changed with "Edit", not by clicks
         m_orbiting         = false;
         m_press_pos = m_last_pos = mouse_pos;
         m_press_hit        = hit;
@@ -257,7 +262,7 @@ bool GLGizmoPathCut::on_mouse(const wxMouseEvent &mouse_event)
             }
             return true;
         }
-        if ((mouse_pos - m_right_pos).norm() <= 4. && !m_points.empty()) {
+        if ((mouse_pos - m_right_pos).norm() <= 4. && !m_points.empty() && !previewing()) {
             clear_pending();
             m_points.pop_back();
             m_preview_dirty = true;
@@ -441,6 +446,28 @@ void GLGizmoPathCut::on_render()
             glsafe(::glDisable(GL_BLEND));
             glsafe(::glEnable(GL_CULL_FACE));
         }
+    } else if (previewing()) {
+        if (GLShaderProgram *shader = wxGetApp().get_shader("gouraud_light")) {
+            shader->start_using();
+            shader->set_uniform("projection_matrix", camera.get_projection_matrix());
+            shader->set_uniform("emission_factor", 0.1f);
+            const Transform3d &view = camera.get_view_matrix();
+            auto draw = [&](GLModel &m, const Vec3d &shift, const ColorRGBA &color) {
+                if (!m.is_initialized())
+                    return;
+                const Transform3d model = Geometry::translation_transform(m_preview_offset + shift);
+                shader->set_uniform("view_model_matrix", view * model);
+                shader->set_uniform("view_normal_matrix", Matrix3d(view.matrix().block(0, 0, 3, 3)));
+                m.set_color(color);
+                m.render();
+            };
+            glsafe(::glEnable(GL_DEPTH_TEST));
+            draw(m_piece_stay, Vec3d::Zero(), PREVIEW_STAY_COLOR);
+            draw(m_piece_moved, m_piece_shift, PREVIEW_MOVED_COLOR);
+            draw(m_preview_pegs, m_pegs_on_moved ? m_piece_shift : Vec3d::Zero(), PREVIEW_PEG_COLOR);
+            glsafe(::glDisable(GL_DEPTH_TEST));
+            shader->stop_using();
+        }
     } else if (m_cutter.is_initialized()) {
         if (GLShaderProgram *shader = wxGetApp().get_shader("flat")) {
             glsafe(::glDisable(GL_CULL_FACE));
@@ -561,18 +588,37 @@ void GLGizmoPathCut::on_render_input_window(float x, float y, float bottom_limit
 
     // (button() disables itself, so these take !m_busy as their enable flag rather than nesting
     // inside the disabled block above)
-    const size_t min_pts = m_mode == Mode::Loop ? 3 : 2;
-    if (m_imgui->button(_L("Undo point"), ImVec2(0, 0), !m_points.empty() && !m_busy)) {
+    // Moving the object (or editing it elsewhere) while its preview is shown drops the preview: only
+    // what is shown may be applied.
+    if (m_pending && !m_busy && !job_object_unchanged(*m_pending)) {
         clear_pending();
-        m_points.pop_back();
-        settings_changed();
+        m_message          = _u8L("The object was changed during the preview. Make the preview again.");
+        m_message_is_error = true;
+        m_preview_dirty    = true;
     }
-    ImGui::SameLine();
-    if (m_imgui->button(_L("Clear"), ImVec2(0, 0), !m_points.empty() && !m_busy))
-        reset_path();
-    ImGui::SameLine();
-    if (m_imgui->button(_L("Perform cut"), ImVec2(0, 0), m_points.size() >= min_pts && !m_busy))
-        wxGetApp().CallAfter([this]() { perform_cut(); });
+    const size_t min_pts = m_mode == Mode::Loop ? 3 : 2;
+    if (!previewing() && !m_placing) {
+        // Editing: place points, then compute the preview. The cut is only performed from the preview.
+        if (m_imgui->button(_L("Undo point"), ImVec2(0, 0), !m_points.empty() && !m_busy)) {
+            clear_pending();
+            m_points.pop_back();
+            settings_changed();
+        }
+        ImGui::SameLine();
+        if (m_imgui->button(_L("Clear"), ImVec2(0, 0), !m_points.empty() && !m_busy))
+            reset_path();
+        ImGui::SameLine();
+        if (m_imgui->button(_L("Preview cut"), ImVec2(0, 0), m_points.size() >= min_pts && !m_busy))
+            wxGetApp().CallAfter([this]() { perform_cut(); });
+        ImGui::SameLine();
+        m_imgui->button(_L("Perform cut"), ImVec2(0, 0), false);
+    } else if (previewing() && !m_busy) {
+        if (m_imgui->button(_L("Edit cut")))
+            back_to_edit();
+        ImGui::SameLine();
+        if (m_imgui->button(_L("Perform cut")))
+            wxGetApp().CallAfter([this]() { if (previewing()) apply_cut(m_pending); });
+    }
     if (m_busy) {
         ImGui::SameLine();
         // Frees the tool at once, whatever the cut is doing: its result is dropped when it ends.
@@ -587,10 +633,6 @@ void GLGizmoPathCut::on_render_input_window(float x, float y, float bottom_limit
         }
     }
 
-    if (m_pending && !m_busy && !m_placing) {
-        if (m_imgui->button(_L("Apply this cut anyway")))
-            wxGetApp().CallAfter([this]() { if (m_pending) apply_cut(m_pending); });
-    }
     if (m_placing && m_pending && !m_busy) {
         // Manual connectors: the cut is computed, the user clicks on the cut face where each one goes.
         ImGui::Separator();
@@ -901,6 +943,7 @@ struct PathCutJob
 };
 
 static void abort_job(PathCutJob &job) { job.abort = true; }
+static bool job_object_unchanged(const PathCutJob &job) { return job.object_unchanged(); }
 
 // Which pieces each volume that is not cut belongs to: those with material where it is. Its surface is
 // sampled (vertices, and a grid inside each triangle) and each sample tested inside each piece by
@@ -961,6 +1004,98 @@ void GLGizmoPathCut::clear_pending()
     m_face_model.reset();
     m_conn_model.reset();
     m_face_aabb.reset();
+    m_piece_stay.reset();
+    m_piece_moved.reset();
+    m_preview_pegs.reset();
+    show_object(true);
+}
+
+// While the preview is shown, the object itself is hidden so only the pieces are seen. (Shown again the
+// way the tool shows it when it opens: only the selected instance of the selected object.)
+void GLGizmoPathCut::show_object(bool show)
+{
+    if (show == !m_object_hidden)
+        return;
+    const Selection &selection = m_parent.get_selection();
+    const int        obj_idx   = selection.get_object_idx();
+    const int        inst_idx  = selection.get_instance_idx();
+    const Model     &model     = wxGetApp().plater()->model();
+    const ModelObject *mo = obj_idx >= 0 && obj_idx < int(model.objects.size()) ? model.objects[obj_idx] : nullptr;
+    if (show) {
+        // While the tool is open only the selected instance is shown (InstancesHider); once closed, all.
+        if (m_state == On && mo != nullptr) {
+            m_parent.toggle_model_objects_visibility(false);
+            m_parent.toggle_model_objects_visibility(true, mo, inst_idx);
+        } else
+            m_parent.toggle_model_objects_visibility(true);
+        m_object_hidden = false;
+    } else if (mo != nullptr) {
+        m_parent.toggle_model_objects_visibility(false, mo, inst_idx);
+        m_object_hidden = true;
+    }
+    m_parent.set_as_dirty();
+}
+
+void GLGizmoPathCut::back_to_edit()
+{
+    clear_pending();
+    m_message.clear();
+    m_preview_dirty = true;
+    m_parent.set_as_dirty();
+}
+
+bool GLGizmoPathCut::on_enter_key()
+{
+    const size_t min_pts = m_mode == Mode::Loop ? 3 : 2;
+    if (m_busy || previewing() || m_placing || m_points.size() < min_pts)
+        return false;
+    wxGetApp().CallAfter([this]() { perform_cut(); });
+    return true;
+}
+
+bool GLGizmoPathCut::on_escape_key()
+{
+    if (m_busy || !m_pending)
+        return false; // Esc closes the tool, as before
+    back_to_edit();   // the preview (or placing connectors) is left; the points and settings stay
+    return true;
+}
+
+// The cut is computed: show the pieces apart, the smaller one (the piece that is detached when the cut
+// is performed) moved away from the other along the line between their centres.
+void GLGizmoPathCut::enter_preview(const std::shared_ptr<PathCutJob> &st)
+{
+    m_pending        = st;
+    m_placing        = false;
+    m_preview_offset = st->offset;
+    rebuild_pieces_preview();
+    show_object(false);
+    m_parent.set_as_dirty();
+}
+
+void GLGizmoPathCut::rebuild_pieces_preview()
+{
+    m_piece_stay.reset();
+    m_piece_moved.reset();
+    m_preview_pegs.reset();
+    m_piece_shift   = Vec3d::Zero();
+    m_pegs_on_moved = false;
+    if (!m_pending)
+        return;
+    const PathCutJob &st = *m_pending;
+    // The detached piece is the smaller one, as when the cut is performed.
+    const bool a_moves = std::abs(its_volume(st.grouped.side_a)) <= std::abs(its_volume(st.grouped.side_b));
+    const indexed_triangle_set &moved = a_moves ? st.grouped.side_a : st.grouped.side_b;
+    const indexed_triangle_set &stay  = a_moves ? st.grouped.side_b : st.grouped.side_a;
+    if (!stay.indices.empty())
+        m_piece_stay.init_from(stay);
+    if (!moved.indices.empty())
+        m_piece_moved.init_from(moved);
+    if (!st.connectors.pegs.indices.empty()) {
+        m_preview_pegs.init_from(st.connectors.pegs);
+        m_pegs_on_moved = st.connectors_from_a == a_moves;
+    }
+    m_piece_shift = PathCut::preview_shift(moved, stay);
 }
 
 // The cut separated the object and the connectors go where the user clicks: show the cut face.
@@ -1296,14 +1431,14 @@ void GLGizmoPathCut::perform_cut()
                 m_parent.set_as_dirty();
                 return;
             }
-            // Show where it is still connected and let the user decide.
-            m_pending = st;
+            // Show where it is still connected and let the user decide: a preview with a warning.
+            enter_preview(st);
             for (const auto &route : st->routes) {
                 m_routes.emplace_back();
                 for (const PathCut::V3 &p : route) m_routes.back().push_back(p + st->offset);
             }
-            m_message          = _u8L("The cut does not separate the object: it is still connected along the red lines. Cut there too, "
-                                      "or apply this cut now and cut the connection next.");
+            m_message          = _u8L("The cut does not separate the object: it is still connected along the red lines. Edit the cut, "
+                                      "or perform it now and cut the connection next.");
             m_message_is_error = true;
             m_preview_dirty    = true;
             m_parent.set_as_dirty();
@@ -1320,7 +1455,17 @@ void GLGizmoPathCut::perform_cut()
             start_placing(st);
             return;
         }
-        apply_cut(st);
+        if (!st->object_unchanged()) {
+            m_message          = _u8L("The object was changed while it was being cut. Cut it again.");
+            m_message_is_error = true;
+            reset_path();
+            m_parent.set_as_dirty();
+            return;
+        }
+        // Nothing changes yet: the pieces are shown and the user performs the cut or edits it.
+        enter_preview(st);
+        m_message          = _u8L("Preview: the pieces are shown apart. Perform the cut if it is right, or edit it.");
+        m_message_is_error = false;
     };
 
     // The cut runs on a thread of its own, not on the shared UI job worker: a cut stuck in a phase that

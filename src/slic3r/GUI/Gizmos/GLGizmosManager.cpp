@@ -875,12 +875,22 @@ bool GLGizmosManager::on_char(wxKeyEvent& evt)
             if (m_current != Undefined) {
                 if ((m_current == Measure || m_current == Assembly) && gizmo_event(SLAGizmoEventType::Escape)) {
                     // do nothing
+                } else if (m_current == PathCut && static_cast<GLGizmoPathCut *>(get_current())->on_escape_key()) {
+                    // back from the preview to editing the cut
                 } else
                 //if ((m_current != SlaSupports) || !gizmo_event(SLAGizmoEventType::DiscardChanges))
                     reset_all_states();
 
                 processed = true;
             }
+            break;
+        }
+        case WXK_RETURN:
+        case WXK_NUMPAD_ENTER:
+        {
+            // Cut along path: Enter computes the preview of the cut.
+            if (m_current == PathCut && static_cast<GLGizmoPathCut *>(get_current())->on_enter_key())
+                processed = true;
             break;
         }
         //case WXK_RETURN:

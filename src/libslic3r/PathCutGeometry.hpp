@@ -1783,6 +1783,26 @@ inline CutResult cut_along_loop(indexed_triangle_set its, const LoopCutter &lc, 
     return res;
 }
 
+// Preview of a cut: how far, and which way, the detached piece is drawn apart from the piece that stays,
+// along the line between their bounding box centres (straight up when they share a centre): 5 % of the
+// detached piece's size, between 3 and 15 mm. Zero when either piece is empty.
+inline V3 preview_shift(const indexed_triangle_set &moved, const indexed_triangle_set &stay)
+{
+    if (moved.indices.empty() || stay.indices.empty())
+        return V3::Zero();
+    auto box = [](const indexed_triangle_set &its, V3 &mn, V3 &mx) {
+        mn = mx = its.vertices.front().cast<double>();
+        for (const auto &v : its.vertices) { mn = mn.cwiseMin(v.cast<double>()); mx = mx.cwiseMax(v.cast<double>()); }
+    };
+    V3 m0, m1, s0, s1;
+    box(moved, m0, m1);
+    box(stay, s0, s1);
+    V3 dir = (m0 + m1) * 0.5 - (s0 + s1) * 0.5;
+    if (dir.norm() < 1e-6)
+        dir = V3::UnitZ();
+    return dir.normalized() * std::clamp(0.05 * (m1 - m0).norm(), 3., 15.);
+}
+
 inline void its_append(indexed_triangle_set &dst, const indexed_triangle_set &src)
 {
     const int off = int(dst.vertices.size());

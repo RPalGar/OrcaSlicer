@@ -36650,3 +36650,18 @@ msgstr "El corte no ha podido seguir el lazo por la superficie. Pon más puntos,
 
 msgid "The loop does not detach anything: the part is still connected around it. Place the loop all the way around the part."
 msgstr "El lazo no separa nada: la parte sigue unida alrededor de él. Coloca el lazo rodeando la parte por completo."
+
+msgid "Preview cut"
+msgstr "Vista previa"
+
+msgid "Edit cut"
+msgstr "Editar"
+
+msgid "The object was changed during the preview. Make the preview again."
+msgstr "El objeto ha cambiado durante la vista previa. Vuelve a hacer la vista previa."
+
+msgid "Preview: the pieces are shown apart. Perform the cut if it is right, or edit it."
+msgstr "Vista previa: las piezas se muestran separadas. Realiza el corte si está bien o edítalo."
+
+msgid "The cut does not separate the object: it is still connected along the red lines. Edit the cut, or perform it now and cut the connection next."
+msgstr "El corte no separa el objeto: sigue unido por las líneas rojas. Edita el corte, o realízalo ahora y corta después esa unión."

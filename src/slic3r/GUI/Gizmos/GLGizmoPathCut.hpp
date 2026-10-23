@@ -33,6 +33,10 @@ public:
 
     bool on_mouse(const wxMouseEvent &mouse_event) override;
     std::string get_tooltip() const override;
+    // Keyboard (from GLGizmosManager): Enter computes the preview, Esc goes back to editing.
+    // Return false when the key is not used here (Esc then closes the tool, as before).
+    bool on_enter_key();
+    bool on_escape_key();
 
 protected:
     bool               on_init() override;
@@ -63,6 +67,13 @@ private:
     void               add_connector(const Vec3d &hit_world);
     void               connectors_changed(); // connector settings edited while placing
     void               rebuild_connector_preview();
+    // Preview: the cut is computed and shown with the pieces apart; the object is untouched until
+    // "Perform cut" applies exactly what is shown. Editing (any change) drops it.
+    void               enter_preview(const std::shared_ptr<PathCutJob> &job);
+    void               rebuild_pieces_preview();
+    void               back_to_edit();
+    bool               previewing() const { return m_pending != nullptr && !m_placing; }
+    void               show_object(bool show);
 
     Mode               m_mode{Mode::ViewPath};
     std::vector<Vec3d> m_points;                 // picked points, world coordinates
@@ -88,6 +99,12 @@ private:
     GLModel m_sphere;
     GLModel m_cutter;                            // translucent preview of the wall / loop cap
     GLModel m_routes_model;                      // where a cut that did not separate is still connected
+    GLModel m_piece_stay, m_piece_moved;         // preview: the remaining piece and the detached one, object coordinates
+    GLModel m_preview_pegs;                      // preview: the automatic connectors, on the piece they stick out of
+    bool    m_pegs_on_moved{false};
+    Vec3d   m_piece_shift{Vec3d::Zero()};        // preview: how far the detached piece is drawn apart
+    Vec3d   m_preview_offset{Vec3d::Zero()};     // preview: object coordinates -> world
+    bool    m_object_hidden{false};              // the object is hidden while its preview is shown
 
     // A finished cut that leaves the sides connected elsewhere: shown with its connection routes,
     // applied only on request.
