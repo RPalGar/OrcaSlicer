@@ -499,35 +499,58 @@ void GLGizmoPathCut::on_render()
         }
     }
 
-    if (m_curve.is_initialized()) {
-        if (GLShaderProgram *shader = wxGetApp().get_shader("flat")) {
+    // The path and its points are drawn twice: faint through everything, so the whole path stays
+    // readable, then solid where nothing is in front of them, so a point behind the object is told
+    // from one in front at a glance. The path lies on the surface: the solid pass is drawn a hair towards the viewer, so the surface
+    // it runs on does not hide it.
+    const BoundingBoxf3 sel_bb   = m_parent.get_selection().get_bounding_box();
+    const Vec3d         toward   = -camera.get_dir_forward() * std::clamp(sel_bb.size().norm() * 0.003, 0.05, 0.6);
+    glsafe(::glEnable(GL_BLEND));
+    glsafe(::glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA));
+    for (const bool hidden_pass : {true, false}) {
+        const Transform3d bias = hidden_pass ? Transform3d::Identity() : Transform3d(Geometry::translation_transform(toward));
+        if (hidden_pass)
+            glsafe(::glDisable(GL_DEPTH_TEST));
+        else
+            glsafe(::glEnable(GL_DEPTH_TEST));
+        const float alpha = hidden_pass ? 0.25f : 1.f;
+        if (m_curve.is_initialized()) {
+            if (GLShaderProgram *shader = wxGetApp().get_shader("flat")) {
+                shader->start_using();
+                shader->set_uniform("view_model_matrix", camera.get_view_matrix() * bias);
+                shader->set_uniform("projection_matrix", camera.get_projection_matrix());
+                shader->set_uniform("width", 0.4f);
+                m_curve.set_color(ColorRGBA(PATH_COLOR.r(), PATH_COLOR.g(), PATH_COLOR.b(), alpha));
+                m_curve.render();
+                shader->stop_using();
+            }
+        }
+        if (GLShaderProgram *shader = wxGetApp().get_shader("gouraud_light")) {
             shader->start_using();
-            shader->set_uniform("view_model_matrix", camera.get_view_matrix());
             shader->set_uniform("projection_matrix", camera.get_projection_matrix());
-            shader->set_uniform("width", 0.4f);
-            m_curve.set_color(PATH_COLOR);
-            m_curve.render();
+            shader->set_uniform("emission_factor", 0.5f);
+            const Transform3d &view = camera.get_view_matrix();
+            const Matrix4d    &proj = camera.get_projection_matrix().matrix();
+            const double       vp_h = std::max(1, int(camera.get_viewport()[3]));
+            // A few pixels across however far the view is zoomed in (never larger than before, on a small
+            // part seen from far away).
+            const double max_r = std::clamp(sel_bb.size().norm() * 0.004, 0.15, 1.2);
+            m_sphere.set_color(ColorRGBA(POINT_COLOR.r(), POINT_COLOR.g(), POINT_COLOR.b(), alpha));
+            for (const Vec3d &p : m_points) {
+                // World size of one pixel at the point: 2 w / (P11 h), w its clip w (its depth in perspective).
+                const Vec4d  pv     = proj * (view * Vec4d(p.x(), p.y(), p.z(), 1.));
+                const double px     = 2. * std::abs(pv.w()) / (std::abs(proj(1, 1)) * vp_h);
+                const double radius = std::min(max_r, 4. * px);
+                const Transform3d model = bias * Geometry::translation_transform(p) * Geometry::scale_transform(radius);
+                shader->set_uniform("view_model_matrix", view * model);
+                const Matrix3d view_normal = view.matrix().block(0, 0, 3, 3) * model.matrix().block(0, 0, 3, 3).inverse().transpose();
+                shader->set_uniform("view_normal_matrix", view_normal);
+                m_sphere.render();
+            }
             shader->stop_using();
         }
     }
-
-    if (GLShaderProgram *shader = wxGetApp().get_shader("gouraud_light")) {
-        shader->start_using();
-        shader->set_uniform("projection_matrix", camera.get_projection_matrix());
-        shader->set_uniform("emission_factor", 0.5f);
-        const BoundingBoxf3 bb     = m_parent.get_selection().get_bounding_box();
-        const double        radius = std::clamp(bb.size().norm() * 0.006, 0.25, 2.0);
-        const Transform3d  &view   = camera.get_view_matrix();
-        m_sphere.set_color(POINT_COLOR);
-        for (const Vec3d &p : m_points) {
-            const Transform3d model = Geometry::translation_transform(p) * Geometry::scale_transform(radius);
-            shader->set_uniform("view_model_matrix", view * model);
-            const Matrix3d view_normal = view.matrix().block(0, 0, 3, 3) * model.matrix().block(0, 0, 3, 3).inverse().transpose();
-            shader->set_uniform("view_normal_matrix", view_normal);
-            m_sphere.render();
-        }
-        shader->stop_using();
-    }
+    glsafe(::glDisable(GL_BLEND));
     glsafe(::glEnable(GL_DEPTH_TEST));
 }
 
@@ -540,6 +563,22 @@ void GLGizmoPathCut::on_render_input_window(float x, float y, float bottom_limit
     };
     const float scale = m_parent.get_scale();
     ImGuiWrapper::push_toolbar_style(scale);
+    // Drop-down lists: dark text on white, in either theme. (Under the toolbar style the open list was
+    // drawn black with dark green text, unreadable until hovered.)
+    auto push_list_style = []() {
+        ImGui::PushStyleColor(ImGuiCol_PopupBg, ImVec4(1.f, 1.f, 1.f, 1.f));
+        ImGui::PushStyleColor(ImGuiCol_FrameBg, ImVec4(1.f, 1.f, 1.f, 1.f));
+        ImGui::PushStyleColor(ImGuiCol_FrameBgHovered, ImVec4(0.92f, 0.92f, 0.92f, 1.f));
+        ImGui::PushStyleColor(ImGuiCol_FrameBgActive, ImVec4(0.88f, 0.88f, 0.88f, 1.f));
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.12f, 0.12f, 0.12f, 1.f));
+        ImGui::PushStyleColor(ImGuiCol_Header, ImVec4(0.f, 0.59f, 0.53f, 0.30f));
+        ImGui::PushStyleColor(ImGuiCol_HeaderHovered, ImVec4(0.f, 0.59f, 0.53f, 0.18f));
+        ImGui::PushStyleColor(ImGuiCol_HeaderActive, ImVec4(0.f, 0.59f, 0.53f, 0.45f));
+        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.92f, 0.92f, 0.92f, 1.f)); // the arrow box
+        ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(0.65f, 0.65f, 0.65f, 1.f));
+    };
+    auto pop_list_style = []() { ImGui::PopStyleColor(10); };
+
     // Keep the window inside the canvas: move it up when it gets taller, and scroll beyond that.
     y = std::max(0.f, std::min(y, bottom_limit - m_window_height));
     ImGui::SetNextWindowSizeConstraints(ImVec2(0.f, 0.f), ImVec2(FLT_MAX, std::max(100.f, bottom_limit - y)));
@@ -696,6 +735,7 @@ void GLGizmoPathCut::on_render_input_window(float x, float y, float bottom_limit
         const std::vector<std::string> sweeps{_u8L("From the view"), _u8L("Level with the bed"), _u8L("Vertical"), _u8L("Custom")};
         const int sweep = int(m_sweep);
         ImGui::PushItemWidth(input_w * 2.2f);
+        push_list_style();
         if (ImGui::BeginCombo("##pathcut_sweep", sweeps[size_t(sweep)].c_str())) {
             for (int i = 0; i < int(sweeps.size()); ++i)
                 if (ImGui::Selectable(sweeps[size_t(i)].c_str(), i == sweep) && i != sweep) {
@@ -709,6 +749,7 @@ void GLGizmoPathCut::on_render_input_window(float x, float y, float bottom_limit
                 }
             ImGui::EndCombo();
         }
+        pop_list_style();
         ImGui::PopItemWidth();
         if (m_sweep == Sweep::Custom) {
             ImGui::AlignTextToFramePadding();
@@ -741,7 +782,7 @@ void GLGizmoPathCut::on_render_input_window(float x, float y, float bottom_limit
         limit_row(_L("Limit past the last point (mm)"), m_lim_end, "##pathcut_end");
     }
 
-    // Connectors: straight, along the mean direction of the cut face, placed where they fit. Edited while
+    // Connectors: straight, along the direction the pieces come apart in, placed where they fit. Edited while
     // placing them by hand, the cut is kept and only the connectors are checked again.
     auto conn_changed = [&]() {
         if (m_placing)
@@ -757,6 +798,7 @@ void GLGizmoPathCut::on_render_input_window(float x, float y, float bottom_limit
         const std::vector<std::string> types{_u8L("None"), _u8L("Peg and hole"), _u8L("Separate pin")};
         const int                      type = std::clamp(int(m_conn.type), 0, int(types.size()) - 1);
         ImGui::PushItemWidth(input_w * 2.2f);
+        push_list_style();
         if (ImGui::BeginCombo("##pathcut_conn_type", types[size_t(type)].c_str())) {
             for (int i = 0; i < int(types.size()); ++i)
                 if (ImGui::Selectable(types[size_t(i)].c_str(), i == type) && i != type) {
@@ -765,6 +807,7 @@ void GLGizmoPathCut::on_render_input_window(float x, float y, float bottom_limit
                 }
             ImGui::EndCombo();
         }
+        pop_list_style();
         ImGui::PopItemWidth();
     }
     if (m_conn.type != PathCut::ConnectorType::None) {

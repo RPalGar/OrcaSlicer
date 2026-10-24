@@ -3,7 +3,8 @@
 // PathCutGeometry, so the printed parts register (no shift, no twist) when glued.
 //
 // The cut face of a path cut is curved, so a connector cannot simply stand on a plane as in the planar
-// cut. Every connector here is straight and shares one axis: the mean normal of the cut face. Where it
+// cut. Every connector here is straight and shares one axis: the direction the cut face comes apart in
+// (pull_direction), so all of them slide out of their holes together, even across a U-shaped face. Where it
 // may go is decided by casting lines parallel to that axis through each side (a grid of the triangles
 // projected along the axis keeps that linear in the triangle count): a connector is placed only where
 // both sides have material all around it, deep enough, with a wall left, and where the cut face is flat
@@ -192,6 +193,91 @@ inline double cut_face(const CutResult &cut, int level, std::vector<size_t> *fac
     return area;
 }
 
+// The direction the pieces come apart in, for straight connectors. Each triangle of the face pulls the
+// two sides apart along its normal; a connector only slides out of its hole along a direction no part of
+// the face turns away from. So the direction chosen leaves the least face turned against it (its area
+// times how far it turns), with a slight pull towards the mean normal to settle near ties and to cross
+// the face squarely. For a U-shaped face that is along its walls whatever their lengths, where the mean
+// normal leans towards the longer wall and the connectors jam; hand-drawn walls that are not quite
+// parallel barely move it. Directions far from the mean normal are not taken: a path cut swept along the
+// view direction also comes apart along it, but a connector there would lie in the face, not cross it.
+// `area_vectors`: one per triangle, its normal times its area. `worst` (optional) gets the cosine between
+// the direction and the normals most turned from it (2 % of the area left out): 1 for a flat face, 0 for
+// a U, negative when the pieces cannot come apart straight.
+inline V3 pull_direction(const std::vector<V3> &area_vectors, double *worst = nullptr)
+{
+    // Normals grouped by direction (about 3.5 degrees apart), each with its area: keeps the search cheap
+    // however fine the face is.
+    struct Bin { V3 n{V3::Zero()}; double area{0.}; };
+    std::unordered_map<int64_t, Bin> bins;
+    V3     mean  = V3::Zero();
+    double total = 0.;
+    for (const V3 &a : area_vectors) {
+        const double area = a.norm();
+        if (!(area > 0.)) continue;
+        const V3 u = a / area;
+        const int64_t key = (int64_t(std::lround(u.x() * 16.)) + 32) * 4096 + (int64_t(std::lround(u.y() * 16.)) + 32) * 64 +
+                            (int64_t(std::lround(u.z() * 16.)) + 32);
+        Bin &b = bins[key];
+        b.n += a;
+        b.area += area;
+        mean += a;
+        total += area;
+    }
+    if (bins.empty() || !(total > 0.)) {
+        if (worst) *worst = -1.;
+        return V3::UnitZ();
+    }
+    std::vector<Bin> bv;
+    bv.reserve(bins.size());
+    for (auto &kv : bins) {
+        kv.second.n.normalize();
+        bv.push_back(kv.second);
+    }
+    mean = mean.norm() > 0. ? V3(mean.normalized()) : bv.front().n;
+
+    // How far the face turns from d: the cosine below which only 2 % of the area lies.
+    std::vector<std::pair<double, double>> dots(bv.size());
+    auto score = [&](const V3 &d) {
+        for (size_t i = 0; i < bv.size(); ++i) dots[i] = {bv[i].n.dot(d), bv[i].area};
+        std::sort(dots.begin(), dots.end());
+        double acc = 0.;
+        for (const auto &[c, w] : dots)
+            if ((acc += w) > 0.02 * total) return c;
+        return dots.back().first;
+    };
+    // How much of the face turns against d: area fraction times how far (the sine past square), plus a
+    // hundredth of the turn from the mean normal.
+    auto cost = [&](const V3 &d) {
+        double against = 0.;
+        for (const Bin &b : bv) against += b.area * std::max(0., -b.n.dot(d));
+        return against / total + 0.01 * (1. - d.dot(mean));
+    };
+    V3     best      = mean;
+    double best_cost = cost(mean);
+    auto consider = [&](const V3 &d) {
+        if (d.dot(mean) < 0.25) return; // more than 75 degrees off: would run along the face
+        const double c = cost(d);
+        if (c < best_cost) { best_cost = c; best = d; }
+    };
+    // Candidates: the normals themselves, then directions spread over the cap around the mean normal,
+    // then finer and finer around the best so far.
+    auto sweep = [&](const V3 &centre, double max_angle, int count) {
+        const Frame g = frame_from_normal(centre, V3::Zero());
+        for (int i = 1; i <= count; ++i) {
+            const double t = std::acos(1. - (1. - std::cos(max_angle)) * (i - 0.5) / count); // even over the cap
+            const double a = i * 2.39996322972865332;                                          // golden angle
+            consider((g.n * std::cos(t) + (g.u * std::cos(a) + g.v * std::sin(a)) * std::sin(t)).normalized());
+        }
+    };
+    for (const Bin &b : bv) consider(b.n);
+    sweep(mean, 76. * PI_ / 180., 1500);
+    sweep(best, 4. * PI_ / 180., 300);
+    sweep(best, 0.6 * PI_ / 180., 200);
+    if (worst) *worst = score(best);
+    return best;
+}
+
 // Which side gets the pegs (Plug): the one whose cut face looks up, so the pegs point up (or level) as
 // the parts lie after the cut and never reach below the part they stick out of, which would lift it off
 // the bed; for a vertical cut face, the larger side. Returns the cut face level of that side (+1 = side_a).
@@ -259,14 +345,26 @@ public:
             return;
         }
         const indexed_triangle_set &m = cut.mesh;
-        // Cut face of `from`: its triangles and their mean outward normal (pointing into `to`).
+        // Cut face of `from`: its triangles, and the direction it comes apart from `to` in (pointing into
+        // `to`), which every connector follows so that all of them slide out together.
         V3           nsum;
         const double area = cut_face(cut, from_level, &m_face_idx, nsum);
-        if (m_face_idx.empty() || !(area > 1e-9) || nsum.norm() <= 0.2 * area) {
+        std::vector<V3> area_vectors;
+        area_vectors.reserve(m_face_idx.size());
+        for (size_t i : m_face_idx) {
+            const auto &t = m.indices[i];
+            const V3    a = m.vertices[size_t(t[0])].cast<double>(), b = m.vertices[size_t(t[1])].cast<double>(),
+                        c = m.vertices[size_t(t[2])].cast<double>();
+            area_vectors.push_back(0.5 * (b - a).cross(c - a));
+        }
+        double worst = -1.;
+        if (!m_face_idx.empty() && area > 1e-9) m_axis = pull_direction(area_vectors, &worst);
+        // Too curved: the face turns well against every straight direction (a U, whose walls are parallel
+        // to the direction, is fine), and its mean normal says the same.
+        if (m_face_idx.empty() || !(area > 1e-9) || (worst < -0.1 && nsum.norm() <= 0.2 * area)) {
             m_error = "No connectors fit: the cut face is too curved for a straight connector.";
             return;
         }
-        m_axis  = nsum.normalized();
         m_frame = frame_from_normal(m_axis, V3::Zero());
         // A copy of the face, for display and picking.
         std::unordered_map<int, int> vmap;

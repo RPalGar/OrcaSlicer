@@ -477,3 +477,29 @@ TEST_CASE("New connectors keep clear of holes already in the part", "[PathCut]")
     const double dx = std::max({0., 3. - p.x(), p.x() - 5.}), dy = std::max({0., 3. - p.y(), p.y() - 5.});
     CHECK(std::hypot(dx, dy) > 3.2);
 }
+
+TEST_CASE("Connectors follow the direction the pieces come apart in, not the mean normal", "[PathCut]")
+{
+    // A U-shaped cut face: bottom facing -y, walls facing -x and +x, the left wall three times as long.
+    // The mean normal leans towards it; the pieces only come apart straight along -y.
+    std::vector<PathCut::V3> faces;
+    for (int i = 0; i < 4; ++i) faces.emplace_back(0., -1., 0.);  // bottom, area 4
+    for (int i = 0; i < 12; ++i) faces.emplace_back(-1., 0., 0.); // left wall, area 12
+    for (int i = 0; i < 4; ++i) faces.emplace_back(1., 0., 0.);   // right wall, area 4
+    double worst = -2.;
+    const PathCut::V3 d = PathCut::pull_direction(faces, &worst);
+    CHECK(d.y() < -0.999); // within a couple of degrees of the walls
+    CHECK_THAT(worst, WithinAbs(0., 0.025));
+
+    // A flat face: its normal. A dome: about its axis, all of it facing that way.
+    CHECK_THAT(PathCut::pull_direction({PathCut::V3(0., 0., 2.), PathCut::V3(0., 0., 1.)}).z(), WithinAbs(1., 1e-9));
+    std::vector<PathCut::V3> dome;
+    for (int i = 0; i < 24; ++i)
+        for (int j = 1; j <= 4; ++j) {
+            const double a = 2. * PI * i / 24., t = 0.3 * j;
+            dome.emplace_back(std::sin(t) * std::cos(a), std::sin(t) * std::sin(a), std::cos(t));
+        }
+    const PathCut::V3 dd = PathCut::pull_direction(dome, &worst);
+    CHECK(dd.z() > 0.999);
+    CHECK(worst > 0.3);
+}
