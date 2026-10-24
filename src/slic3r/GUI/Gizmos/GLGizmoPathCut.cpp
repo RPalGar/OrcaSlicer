@@ -198,7 +198,10 @@ bool GLGizmoPathCut::on_mouse(const wxMouseEvent &mouse_event)
         const bool on_part = m_placing ? raycast_face(mouse_pos, hit) : raycast(mouse_pos, hit);
         // Empty space: the canvas orbits the view. On a modifier or negative volume (not cut, so no point)
         // the press is still kept from the canvas, which would otherwise start moving the object.
-        if (!on_part && m_parent.get_first_hover_volume_idx() < 0)
+        // While a computed cut is shown the object is hidden, so a click on the pieces drawn apart would
+        // reach the canvas as a click on empty space and deselect the object, leaving the tool unable to
+        // preview again: every press is kept then, and a drag orbits the view here.
+        if (!on_part && m_parent.get_first_hover_volume_idx() < 0 && !m_pending)
             return false;
         // On the object: a click adds a point (on release), a drag orbits the view.
         m_press_on_object  = true;
@@ -1217,18 +1220,22 @@ void GLGizmoPathCut::perform_cut()
     const int        obj_idx   = selection.get_object_idx();
     const int        inst_idx  = selection.get_instance_idx();
     Plater          *plater    = wxGetApp().plater();
-    if (obj_idx < 0 || inst_idx < 0 || obj_idx >= int(plater->model().objects.size()))
-        return;
-    ModelObject *mo = plater->model().objects[obj_idx];
-    if (mo != m_object) {
-        reset_path();
-        return;
-    }
     auto refuse = [this](const std::string &why) {
         m_message          = why;
         m_message_is_error = true;
         m_parent.set_as_dirty();
     };
+    // Never silently: a preview button that does nothing looks broken.
+    if (obj_idx < 0 || inst_idx < 0 || obj_idx >= int(plater->model().objects.size())) {
+        refuse(_u8L("No object is selected. Select the object to cut and make the preview again."));
+        return;
+    }
+    ModelObject *mo = plater->model().objects[obj_idx];
+    if (mo != m_object) {
+        reset_path();
+        refuse(_u8L("Another object is selected. Place the points again on the object to cut."));
+        return;
+    }
     // The cut replaces the object by its pieces. Its model parts are joined into one mesh and cut together
     // (their own settings are lost, the result takes those of the first part). The other volumes (negative
     // volumes such as the holes of an earlier cut, modifiers, support blockers/enforcers) are not cut: each

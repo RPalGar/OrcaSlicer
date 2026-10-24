@@ -36660,6 +36660,12 @@ msgstr "Editar"
 msgid "The object was changed during the preview. Make the preview again."
 msgstr "El objeto ha cambiado durante la vista previa. Vuelve a hacer la vista previa."
 
+msgid "No object is selected. Select the object to cut and make the preview again."
+msgstr "No hay ningún objeto seleccionado. Selecciona el objeto que quieres cortar y vuelve a hacer la vista previa."
+
+msgid "Another object is selected. Place the points again on the object to cut."
+msgstr "Hay otro objeto seleccionado. Vuelve a colocar los puntos en el objeto que quieres cortar."
+
 msgid "Preview: the pieces are shown apart. Perform the cut if it is right, or edit it."
 msgstr "Vista previa: las piezas se muestran separadas. Realiza el corte si está bien o edítalo."
 

@@ -168,13 +168,13 @@ TEST_CASE("The preview draws the detached piece apart from the rest", "[PathCut]
     indexed_triangle_set moved = its_make_cube(10., 10., 10.);
     for (Vec3f &v : moved.vertices) v += Vec3f(5.f, 5.f, 20.f);
     const PathCut::V3 shift = PathCut::preview_shift(moved, stay);
-    CHECK_THAT(shift.norm(), WithinAbs(3., 1e-9));
+    CHECK_THAT(shift.norm(), WithinAbs(6., 1e-9));
     CHECK(shift.z() > 0.);
     CHECK_THAT(shift.x(), WithinAbs(0., 1e-9));
-    // A large detached piece goes 5 % of its size, at most 15 mm; an empty piece is not moved.
+    // A large detached piece goes 10 % of its size, at most 30 mm; an empty piece is not moved.
     indexed_triangle_set big = its_make_cube(400., 400., 400.);
     for (Vec3f &v : big.vertices) v += Vec3f(0.f, 0.f, 20.f);
-    CHECK_THAT(PathCut::preview_shift(big, stay).norm(), WithinAbs(15., 1e-9));
+    CHECK_THAT(PathCut::preview_shift(big, stay).norm(), WithinAbs(30., 1e-9));
     CHECK(PathCut::preview_shift(indexed_triangle_set{}, stay).norm() == 0.);
 }
 
