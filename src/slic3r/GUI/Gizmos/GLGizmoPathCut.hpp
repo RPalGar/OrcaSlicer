@@ -63,6 +63,7 @@ private:
     void               rebuild_cutter_preview();
     // Manual connectors: after the cut, the cut face is shown and each click on it places a connector.
     void               start_placing(const std::shared_ptr<PathCutJob> &job);
+    void               rebuild_face();
     bool               raycast_face(const Vec2d &mouse_pos, Vec3d &hit_world) const;
     void               add_connector(const Vec3d &hit_world);
     void               connectors_changed(); // connector settings edited while placing

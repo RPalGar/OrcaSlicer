@@ -1144,6 +1144,25 @@ void GLGizmoPathCut::rebuild_pieces_preview()
     m_piece_shift = PathCut::preview_shift(moved, stay);
 }
 
+// The cut face shown and clicked while placing connectors. The picking tree refers to the face kept by
+// the placer, so it is rebuilt whenever the placer is (a new placer frees the face the old tree read).
+void GLGizmoPathCut::rebuild_face()
+{
+    m_face_model.reset();
+    m_face_aabb.reset();
+    if (!m_pending || !m_pending->placer || !m_pending->placer->error().empty())
+        return;
+    const indexed_triangle_set &face = m_pending->placer->face();
+    if (face.indices.empty())
+        return;
+    GLModel::Geometry g;
+    g.format = {GLModel::Geometry::EPrimitiveType::Triangles, GLModel::Geometry::EVertexLayout::P3};
+    for (const auto &v : face.vertices) g.add_vertex(Vec3f(v));
+    for (const auto &t : face.indices) g.add_triangle(unsigned(t[0]), unsigned(t[1]), unsigned(t[2]));
+    m_face_model.init_from(std::move(g));
+    m_face_aabb = std::make_shared<AABBMesh>(face);
+}
+
 // The cut separated the object and the connectors go where the user clicks: show the cut face.
 void GLGizmoPathCut::start_placing(const std::shared_ptr<PathCutJob> &st)
 {
@@ -1151,15 +1170,7 @@ void GLGizmoPathCut::start_placing(const std::shared_ptr<PathCutJob> &st)
     m_placing        = true;
     m_spots.clear();
     m_placing_offset = st->offset;
-    const indexed_triangle_set &face = st->placer->face();
-    GLModel::Geometry           g;
-    g.format = {GLModel::Geometry::EPrimitiveType::Triangles, GLModel::Geometry::EVertexLayout::P3};
-    for (const auto &v : face.vertices) g.add_vertex(Vec3f(v));
-    for (const auto &t : face.indices) g.add_triangle(unsigned(t[0]), unsigned(t[1]), unsigned(t[2]));
-    m_face_model.reset();
-    if (g.vertices_count() > 0)
-        m_face_model.init_from(std::move(g));
-    m_face_aabb = std::make_shared<AABBMesh>(face);
+    rebuild_face();
     rebuild_connector_preview();
     m_message          = _u8L("The cut is ready. Click on the cut face (orange) where each connector should go, then apply the cut.");
     m_message_is_error = false;
@@ -1186,7 +1197,7 @@ bool GLGizmoPathCut::raycast_face(const Vec2d &mouse_pos, Vec3d &hit_world) cons
 
 void GLGizmoPathCut::add_connector(const Vec3d &hit_world)
 {
-    if (!m_pending || !m_pending->placer)
+    if (!m_pending || !m_pending->placer || !m_pending->placer->error().empty())
         return;
     PathCut::ConnectorSpot   spot;
     const PathCut::ConnectorFit why = m_pending->placer->try_at(PathCut::V3(hit_world - m_placing_offset), spot, m_spots);
@@ -1214,8 +1225,10 @@ void GLGizmoPathCut::connectors_changed()
     st.conn        = m_conn;
     const indexed_triangle_set &from = st.connectors_from_a ? st.grouped.side_a : st.grouped.side_b;
     const indexed_triangle_set &to   = st.connectors_from_a ? st.grouped.side_b : st.grouped.side_a;
+    m_face_aabb.reset(); // it reads the face of the placer replaced here
     st.placer = std::make_unique<PathCut::ConnectorPlacer>(*st.cut, st.connectors_from_a ? 1 : -1, from, to, st.conn,
                                                            st.removed.indices.empty() ? nullptr : &st.removed);
+    rebuild_face();
     if (!st.placer->error().empty()) {
         m_spots.clear();
         m_message          = _u8L(st.placer->error().c_str());
@@ -1241,7 +1254,7 @@ void GLGizmoPathCut::connectors_changed()
 void GLGizmoPathCut::rebuild_connector_preview()
 {
     m_conn_model.reset();
-    if (!m_pending || !m_pending->placer || m_spots.empty())
+    if (!m_pending || !m_pending->placer || !m_pending->placer->error().empty() || m_spots.empty())
         return;
     const PathCut::ConnectorResult c = m_pending->placer->build(m_spots);
     // What sticks out of / goes into the parts: the pegs, or the holes of the pins.
