@@ -751,10 +751,64 @@ inline std::vector<char> foreign_bands(const indexed_triangle_set &its, const st
         if (comp[ti] >= 0 && dist[comp[ti]] > std::max(lc.reach, closest) + 1e-6) skip[ti] = 1;
     return skip;
 }
+// A limited view wall only cuts what it goes all the way through. Where the wall ends inside the model
+// (the leg next to a sword, reached by the limits), the band of triangles it crosses there touches the
+// wall's rim: that band is left uncut, and the wall cuts the parts it crosses completely. When every band
+// touches the rim nothing is skipped, so the cut reports that it ends inside the object.
+inline std::vector<char> foreign_bands(const indexed_triangle_set &its, const std::vector<double> &f, const std::vector<double> &out,
+                                       double hk, const ViewCutter &)
+{
+    const size_t      nt = its.indices.size();
+    std::vector<char> skip(nt, 0);
+    auto crosses = [&](const stl_triangle_vertex_indices &t) {
+        const double f0 = f[t[0]], f1 = f[t[1]], f2 = f[t[2]];
+        return !(std::min({f0, f1, f2}) >= hk || std::max({f0, f1, f2}) <= -hk);
+    };
+    auto inside = [&](const stl_triangle_vertex_indices &t) { return out[t[0]] < 0. && out[t[1]] < 0. && out[t[2]] < 0.; };
+    std::unordered_map<uint64_t, std::vector<uint32_t>> by_edge; // edges of the bands
+    std::unordered_set<uint64_t>                         rim;     // edges of triangles crossing the wall's rim
+    std::vector<int>                                     comp(nt, -1);
+    for (size_t ti = 0; ti < nt; ++ti) {
+        const auto &t = its.indices[ti];
+        if (!crosses(t)) continue;
+        const bool in = inside(t);
+        if (in) comp[ti] = -2;
+        for (int e = 0; e < 3; ++e) {
+            const uint64_t k = edge_key(t[e], t[(e + 1) % 3]);
+            if (in) by_edge[k].push_back(uint32_t(ti));
+            else rim.insert(k);
+        }
+    }
+    std::vector<char>   touches_rim; // per band
+    std::vector<size_t> stack;
+    for (size_t s = 0; s < nt; ++s) {
+        if (comp[s] != -2) continue;
+        const int c = int(touches_rim.size());
+        bool      r = false;
+        comp[s]     = c;
+        stack.assign(1, s);
+        while (!stack.empty()) {
+            const size_t ti = stack.back(); stack.pop_back();
+            const auto  &t  = its.indices[ti];
+            for (int e = 0; e < 3; ++e) {
+                const uint64_t k = edge_key(t[e], t[(e + 1) % 3]);
+                r = r || rim.count(k) > 0;
+                for (uint32_t n : by_edge[k])
+                    if (comp[n] == -2) { comp[n] = c; stack.push_back(n); }
+            }
+        }
+        touches_rim.push_back(r ? 1 : 0);
+    }
+    if (std::all_of(touches_rim.begin(), touches_rim.end(), [](char r) { return r != 0; }))
+        return skip;
+    for (size_t ti = 0; ti < nt; ++ti)
+        if (comp[ti] >= 0 && touches_rim[size_t(comp[ti])]) skip[ti] = 1;
+    return skip;
+}
 template<class Cutter>
 std::vector<char> foreign_bands(const indexed_triangle_set &, const std::vector<double> &, const std::vector<double> &, double, const Cutter &)
 {
-    return {}; // view cutters: the wall cuts everything it meets
+    return {};
 }
 
 // Picked loops are coarse, so the surface often bulges a few millimetres past the smoothed loop (ribs,

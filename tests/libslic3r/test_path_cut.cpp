@@ -93,10 +93,23 @@ TEST_CASE("A view path limited in depth cuts the front box and leaves the one be
         CHECK_FALSE(joined);
         CHECK(g.n_a + g.n_b == 3);
     }
-    SECTION("25 mm behind the points ends inside the back box and is reported")
+    SECTION("25 mm behind the points ends inside the back box: the front box is cut, the back box is left whole")
     {
         PathCut::ViewLimits lim;
         lim.back = 25.;
+        const PathCut::ViewCutter vc = PathCut::make_view_cutter(pts, PathCut::V3::UnitY(), PathCut::V3::Zero(), PathCut::V3(20., 30., 20.), 0.2, lim);
+        const PathCut::CutResult res = PathCut::cut_with_slab(boxes, vc, vc.limited());
+        REQUIRE(res.error.empty());
+        const auto parts = its_split(res.mesh);
+        CHECK(parts.size() == 3);
+        require_closed_parts(parts);
+        const bool back_whole = std::any_of(parts.begin(), parts.end(), [](const indexed_triangle_set &p) { return std::abs(its_volume(p) - 4000.) < 1.; });
+        CHECK(back_whole);
+    }
+    SECTION("5 mm behind the points ends inside the front box, the only one it reaches, and is reported")
+    {
+        PathCut::ViewLimits lim;
+        lim.back = 5.;
         const PathCut::ViewCutter vc = PathCut::make_view_cutter(pts, PathCut::V3::UnitY(), PathCut::V3::Zero(), PathCut::V3(20., 30., 20.), 0.2, lim);
         CHECK_FALSE(PathCut::cut_with_slab(boxes, vc, vc.limited()).error.empty());
     }
