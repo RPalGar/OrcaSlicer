@@ -166,7 +166,7 @@ TEST_CASE("A cut along a loop around a part still connected elsewhere is made an
     // A ring (torus, R = 15, r = 4): a loop around its tube cuts it, but the ring stays in one piece the
     // other way round, like an arm whose sword rests on a foot. The cut is made so the rest can be cut next.
     const double         R = 15., r = 4.;
-    const int            nu = 64, nv = 24;
+    constexpr int        nu = 64, nv = 24;
     indexed_triangle_set ring;
     for (int i = 0; i < nu; ++i)
         for (int j = 0; j < nv; ++j) {
@@ -174,7 +174,7 @@ TEST_CASE("A cut along a loop around a part still connected elsewhere is made an
             ring.vertices.emplace_back(float((R + r * std::cos(v)) * std::cos(u)), float((R + r * std::cos(v)) * std::sin(u)),
                                        float(r * std::sin(v)));
         }
-    auto at = [nu, nv](int i, int j) { return ((i + nu) % nu) * nv + (j + nv) % nv; };
+    auto at = [](int i, int j) { return ((i + nu) % nu) * nv + (j + nv) % nv; };
     for (int i = 0; i < nu; ++i)
         for (int j = 0; j < nv; ++j) {
             ring.indices.emplace_back(at(i, j), at(i + 1, j), at(i + 1, j + 1));
