@@ -1,0 +1,21 @@
+name: Build Windows (referencia sin Cortar por ruta)
+
+# Windows-only build of the upstream commit the path cut branch starts from (G-code comparison). Builds the dependencies on the first run
+# (cached afterwards) and uploads the installer and portable zip as workflow artifacts.
+on:
+  push:
+    branches:
+      - referencia-sin-herramienta
+  workflow_dispatch:
+
+jobs:
+  build_windows:
+    name: Build Windows x64
+    uses: ./.github/workflows/build_check_cache.yml
+    with:
+      os: windows-latest
+      arch: x64
+      compiler: clang
+      build-deps-only: false
+      force-build: false
+    secrets: inherit
