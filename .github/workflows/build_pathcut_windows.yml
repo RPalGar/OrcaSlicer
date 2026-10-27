@@ -19,3 +19,13 @@ jobs:
       build-deps-only: false
       force-build: false
     secrets: inherit
+
+  # Run the whole unit test suite (path cut tests included) on the tests this build packed.
+  unit_tests_windows_x64:
+    name: Unit tests Windows x64
+    needs: build_windows
+    if: ${{ !cancelled() && success() }}
+    uses: ./.github/workflows/unit_tests.yml
+    with:
+      os: windows-latest
+      artifact: ${{ github.sha }}-tests-windows-x64

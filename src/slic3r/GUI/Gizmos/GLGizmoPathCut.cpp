@@ -84,7 +84,6 @@ static void init_connector_model(GLModel &model, const PathCut::ConnectorResult 
     L("The cap spanning the loop runs into another part of the model. Place the loop where the part is free all around."),
     L("The object was changed while it was being cut. Cut it again."),
     L("The cut could not follow the loop along the surface. Place more points, closer together, along the line where you want to cut, or raise the margin."),
-    L("The loop does not detach anything: the part is still connected around it. Place the loop all the way around the part."),
     L("The cut failed. Try a simpler path or a lower resolution model."),
     L("The cut ends inside the object. Increase or remove the limits, or start and end the path beyond the part."),
     L("The path crosses itself seen from the view. Place the points in order along the cut line."),

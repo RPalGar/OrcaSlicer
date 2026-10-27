@@ -161,6 +161,49 @@ TEST_CASE("A cut exactly along a loop splits only the surface the loop runs on",
     CHECK_THAT(std::min(its_volume(g.side_a), its_volume(g.side_b)), WithinAbs(half, 0.1 * half));
 }
 
+TEST_CASE("A cut along a loop around a part still connected elsewhere is made and reported as joined", "[PathCut]")
+{
+    // A ring (torus, R = 15, r = 4): a loop around its tube cuts it, but the ring stays in one piece the
+    // other way round, like an arm whose sword rests on a foot. The cut is made so the rest can be cut next.
+    const double         R = 15., r = 4.;
+    const int            nu = 64, nv = 24;
+    indexed_triangle_set ring;
+    for (int i = 0; i < nu; ++i)
+        for (int j = 0; j < nv; ++j) {
+            const double u = 2. * PI * i / nu, v = 2. * PI * j / nv;
+            ring.vertices.emplace_back(float((R + r * std::cos(v)) * std::cos(u)), float((R + r * std::cos(v)) * std::sin(u)),
+                                       float(r * std::sin(v)));
+        }
+    auto at = [nu, nv](int i, int j) { return ((i + nu) % nu) * nv + (j + nv) % nv; };
+    for (int i = 0; i < nu; ++i)
+        for (int j = 0; j < nv; ++j) {
+            ring.indices.emplace_back(at(i, j), at(i + 1, j), at(i + 1, j + 1));
+            ring.indices.emplace_back(at(i, j), at(i + 1, j + 1), at(i, j + 1));
+        }
+    REQUIRE(its_volume(ring) > 0.);
+
+    std::vector<PathCut::V3> loop;
+    const double             u0 = 0.05; // between two rings of vertices
+    for (int k = 0; k < 12; ++k) {
+        const double v = 2. * PI * k / 12.;
+        loop.emplace_back((R + r * std::cos(v)) * std::cos(u0), (R + r * std::cos(v)) * std::sin(u0), r * std::sin(v));
+    }
+    const PathCut::LoopCutter lc = PathCut::make_loop_cutter(loop, 0.2, 1.5, [](const PathCut::V3 &p) { return p; }, false);
+    REQUIRE(lc.valid());
+
+    const PathCut::CutResult res = PathCut::cut_along_loop(ring, lc, 1.5);
+    REQUIRE(res.error.empty());
+    const auto parts = its_split(res.mesh);
+    CHECK(parts.size() == 1);
+    require_closed_parts(parts);
+    CHECK(its_volume(res.mesh) < its_volume(ring)); // the kerf is gone
+
+    bool joined = false;
+    PathCut::group_cut(res, [](const PathCut::V3 &) { return 0; }, true, &joined);
+    CHECK(joined);
+    CHECK_FALSE(PathCut::joined_routes(res).empty());
+}
+
 TEST_CASE("The preview draws the detached piece apart from the rest", "[PathCut]")
 {
     // A 10 mm cube resting on top of a 20 mm one: drawn 3 mm (the minimum) further up.

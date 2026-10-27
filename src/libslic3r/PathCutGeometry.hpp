@@ -1720,15 +1720,8 @@ inline CutResult cut_along_loop(indexed_triangle_set its, const LoopCutter &lc, 
     }
     for (const auto &t : split) its.indices.push_back(t);
 
-    // The two pieces of surface next to the chain must be apart, or the loop does not detach anything.
-    std::vector<int> dsu(its.vertices.size());
-    for (size_t i = 0; i < dsu.size(); ++i) dsu[i] = int(i);
-    auto find = [&dsu](int x) { while (dsu[x] != x) x = dsu[x] = dsu[dsu[x]]; return x; };
-    for (const auto &t : its.indices) { dsu[find(t[0])] = find(t[1]); dsu[find(t[1])] = find(t[2]); }
-    if (find(xv[chain_edges[0]][0]) == find(xv[chain_edges[0]][1])) {
-        res.error = "The loop does not detach anything: the part is still connected around it. Place the loop all the way around the part.";
-        return res;
-    }
+    // The surface on both sides of the chain may still be connected elsewhere (an arm whose hand rests on
+    // a leg): the cut is made anyway, group_cut reports it as joined, and the remaining connection is cut next.
 
     // Caps: rings shrinking from the chain to the loop's centre, on the cap surface, moved by half the kerf
     // towards their own piece away from the rim.
