@@ -72,6 +72,10 @@ private:
     // fits, red where it does not (a click there places nothing). Its tooltip says why.
     void               update_hover(const Vec2d &mouse_pos);
     void               clear_hover();
+    // Cuts already made on an object still in one piece (multi-cut): their faces and where it is still
+    // connected, world coordinates, shown while the next cut is marked.
+    void               rebuild_done();
+    void               render_done();
     // Preview: the cut is computed and shown with the pieces apart; the object is untouched until
     // "Perform cut" applies exactly what is shown. Editing (any change) drops it.
     void               enter_preview(const std::shared_ptr<PathCutJob> &job);
@@ -126,6 +130,9 @@ private:
     bool                                m_hover_on{false};
     PathCut::ConnectorFit               m_hover_fit{PathCut::ConnectorFit::Ok};
     Vec2d                               m_hover_pos{Vec2d::Zero()};
+    indexed_triangle_set                m_done_faces;
+    std::vector<std::vector<Vec3d>>     m_done_routes;
+    GLModel                             m_done_faces_model, m_done_routes_model;
 
     // A left press on the object adds a point on release, unless the mouse was dragged: then it orbits.
     bool  m_press_on_object{false};

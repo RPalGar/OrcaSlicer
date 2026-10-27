@@ -36422,6 +36422,10 @@ msgid "Click to add a point, right click removes the last one. Drag to rotate th
 msgstr "Haz clic para añadir un punto; el clic derecho elimina el último. Arrastra para girar la vista."
 
 # AI Translated
+msgid "The cut is made, shown in orange. The object is still connected along the red lines: mark the next cut there."
+msgstr "El corte está hecho (en naranja). El objeto sigue unido por las líneas rojas: marca ahí el siguiente corte."
+
+# AI Translated
 msgid "Cut along path: the cut is made, but the object is still in one piece. Cut the remaining connection to separate it."
 msgstr "Cortar por ruta: el corte está hecho, pero el objeto sigue siendo una sola pieza. Corta la unión que queda para separarlo."
 

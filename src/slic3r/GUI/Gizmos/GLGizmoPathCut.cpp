@@ -6,6 +6,7 @@
 #include "libslic3r/AppConfig.hpp"
 #include "slic3r/GUI/GLCanvas3D.hpp"
 #include "slic3r/GUI/GLShader.hpp"
+#include "slic3r/GUI/Gizmos/GLGizmosManager.hpp"
 #include "slic3r/GUI/GUI_App.hpp"
 #include "slic3r/GUI/I18N.hpp"
 #include "slic3r/GUI/ImGuiWrapper.hpp"
@@ -55,6 +56,7 @@ static const ColorRGBA PREVIEW_MOVED_COLOR = {0.95f, 0.62f, 0.25f, 1.f};
 static const ColorRGBA PREVIEW_PEG_COLOR   = {0.15f, 0.75f, 0.35f, 1.f};
 static const ColorRGBA HOVER_FITS_COLOR    = {0.2f, 1.f, 0.4f, 0.5f};  // connector under the mouse: it fits
 static const ColorRGBA HOVER_NO_FIT_COLOR  = {1.f, 0.15f, 0.15f, 0.6f}; // it does not fit there
+static const ColorRGBA DONE_CUT_COLOR      = {1.f, 0.55f, 0.f, 0.45f};  // faces of the cuts already made on the object
 
 // What of the connectors is shown on the cut face: the pegs, or the holes of the pins.
 static void init_connector_model(GLModel &model, const PathCut::ConnectorResult &c)
@@ -142,8 +144,12 @@ void GLGizmoPathCut::on_set_state()
         m_running.reset();
         m_busy = false;
     }
-    if (m_state == On || m_state == Off)
+    if (m_state == On || m_state == Off) {
         reset_path();
+        m_done_faces.clear();
+        m_done_routes.clear();
+        rebuild_done();
+    }
     m_message.clear();
 }
 
@@ -450,6 +456,8 @@ void GLGizmoPathCut::rebuild_cutter_preview()
 
 void GLGizmoPathCut::on_render()
 {
+    if (!previewing() && !m_placing)
+        render_done();
     if (m_points.empty())
         return;
     if (m_preview_dirty)
@@ -999,6 +1007,7 @@ struct PathCutJob
     PathCut::Grouped                          grouped;
     bool                                      joined{false}; // the sides still touch elsewhere
     std::vector<std::vector<PathCut::V3>>     routes;        // ... along these, object coordinates
+    indexed_triangle_set                      cut_faces;     // ... and the faces of this cut, object coordinates
     PathCut::ConnectorResult                  connectors;    // object coordinates
     // Manual connectors: the cut is kept to place them (and to check them again when their settings change).
     std::unique_ptr<PathCut::CutResult>       cut;
@@ -1327,6 +1336,60 @@ void GLGizmoPathCut::clear_hover()
     m_parent.set_as_dirty();
 }
 
+void GLGizmoPathCut::rebuild_done()
+{
+    m_done_faces_model.reset();
+    m_done_routes_model.reset();
+    if (!m_done_faces.indices.empty()) {
+        GLModel::Geometry g;
+        g.format = {GLModel::Geometry::EPrimitiveType::Triangles, GLModel::Geometry::EVertexLayout::P3};
+        for (const auto &v : m_done_faces.vertices) g.add_vertex(Vec3f(v));
+        for (const auto &f : m_done_faces.indices) g.add_triangle(unsigned(f[0]), unsigned(f[1]), unsigned(f[2]));
+        m_done_faces_model.init_from(std::move(g));
+    }
+    GLModel::Geometry g;
+    g.format = {GLModel::Geometry::EPrimitiveType::Lines, GLModel::Geometry::EVertexLayout::P3};
+    for (const auto &route : m_done_routes)
+        for (size_t i = 0; i + 1 < route.size(); ++i) {
+            const unsigned base = unsigned(g.vertices_count());
+            g.add_vertex(Vec3f(route[i].cast<float>()));
+            g.add_vertex(Vec3f(route[i + 1].cast<float>()));
+            g.add_line(base, base + 1);
+        }
+    if (g.vertices_count() > 0)
+        m_done_routes_model.init_from(std::move(g));
+}
+
+void GLGizmoPathCut::render_done()
+{
+    if (!m_done_faces_model.is_initialized() && !m_done_routes_model.is_initialized())
+        return;
+    GLShaderProgram *shader = wxGetApp().get_shader("flat");
+    if (shader == nullptr)
+        return;
+    const Camera &camera = wxGetApp().plater()->get_camera();
+    glsafe(::glDisable(GL_DEPTH_TEST));
+    glsafe(::glDisable(GL_CULL_FACE));
+    glsafe(::glEnable(GL_BLEND));
+    glsafe(::glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA));
+    shader->start_using();
+    shader->set_uniform("view_model_matrix", camera.get_view_matrix());
+    shader->set_uniform("projection_matrix", camera.get_projection_matrix());
+    if (m_done_faces_model.is_initialized()) {
+        m_done_faces_model.set_color(DONE_CUT_COLOR);
+        m_done_faces_model.render();
+    }
+    if (m_done_routes_model.is_initialized()) {
+        shader->set_uniform("width", 0.6f);
+        m_done_routes_model.set_color(ColorRGBA(1.f, 0.15f, 0.15f, 1.f));
+        m_done_routes_model.render();
+    }
+    shader->stop_using();
+    glsafe(::glDisable(GL_BLEND));
+    glsafe(::glEnable(GL_CULL_FACE));
+    glsafe(::glEnable(GL_DEPTH_TEST));
+}
+
 void GLGizmoPathCut::perform_cut()
 {
     if (m_busy)
@@ -1488,6 +1551,11 @@ void GLGizmoPathCut::perform_cut()
         }
         if (st->joined) {
             st->routes = PathCut::joined_routes(res, 3, -1., canceled);
+            for (size_t ti = res.first_cap; ti < res.mesh.indices.size(); ++ti) {
+                const int base = int(st->cut_faces.vertices.size());
+                for (int k = 0; k < 3; ++k) st->cut_faces.vertices.push_back(res.mesh.vertices[res.mesh.indices[ti][k]]);
+                st->cut_faces.indices.emplace_back(base, base + 1, base + 2);
+            }
             lap("connection routes");
         } else if (st->conn.type != PathCut::ConnectorType::None && !st->grouped.side_a.indices.empty() &&
                    !st->grouped.side_b.indices.empty()) {
@@ -1743,6 +1811,23 @@ void GLGizmoPathCut::do_apply_cut(const std::shared_ptr<PathCutJob> &st)
     if (grouped.n_small > 0)
         BOOST_LOG_TRIVIAL(info) << "PathCut: " << grouped.n_small << " tiny fragments kept with their side";
 
+    // Still in one piece: the tool opens again on it, showing the cuts made so far (their faces) and
+    // where it is still connected, so the next cut can be marked right away.
+    indexed_triangle_set            done_faces;
+    std::vector<std::vector<Vec3d>> done_routes;
+    if (st->joined && tmp.objects.size() == 1) {
+        const Vec3d shift = tmp.objects[0]->instances[0]->get_offset() - st->offset; // put on the bed
+        done_faces        = m_done_faces;
+        for (auto &v : done_faces.vertices) v += shift.cast<float>();
+        const int base = int(done_faces.vertices.size());
+        for (const auto &v : st->cut_faces.vertices) done_faces.vertices.push_back(v + (st->offset + shift).cast<float>());
+        for (const auto &f : st->cut_faces.indices) done_faces.indices.emplace_back(f[0] + base, f[1] + base, f[2] + base);
+        for (const auto &route : st->routes) {
+            done_routes.emplace_back();
+            for (const PathCut::V3 &p : route) done_routes.back().push_back(p + st->offset + shift);
+        }
+    }
+
     m_message.clear();
     m_parent.reset_all_gizmos();
     const auto t0 = std::chrono::steady_clock::now();
@@ -1757,6 +1842,17 @@ void GLGizmoPathCut::do_apply_cut(const std::shared_ptr<PathCutJob> &st)
         if (st->conn.type != PathCut::ConnectorType::None)
             text += " " + _u8L("Connectors are only added once the cut separates the object.");
         warn(text);
+        if (!done_faces.indices.empty())
+            wxGetApp().CallAfter([this, done_faces = std::move(done_faces), done_routes = std::move(done_routes)]() mutable {
+                if (!m_parent.get_gizmos_manager().open_gizmo(GLGizmosManager::PathCut))
+                    return;
+                m_done_faces  = std::move(done_faces);
+                m_done_routes = std::move(done_routes);
+                rebuild_done();
+                m_message          = _u8L("The cut is made, shown in orange. The object is still connected along the red lines: mark the next cut there.");
+                m_message_is_error = false;
+                m_parent.set_as_dirty();
+            });
     } else if (st->conn.type != PathCut::ConnectorType::None) {
         if (!st->connector_error.empty())
             warn(_u8L("Cut along path") + ": " + _u8L(st->connector_error.c_str()));
