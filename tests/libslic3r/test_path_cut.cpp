@@ -455,6 +455,28 @@ TEST_CASE("Connectors placed by hand are checked spot by spot", "[PathCut]")
     require_closed_parts({c.pegs, c.holes_to});
 }
 
+TEST_CASE("A connector that does not fit is still drawn where it was tried", "[PathCut]")
+{
+    // While placing by hand, the connector under the mouse is shown in red where it does not fit: the
+    // spot is only its position then, and it must still give a solid at that place.
+    const BarCut             b = cut_bar();
+    PathCut::ConnectorParams prm;
+    prm.type = PathCut::ConnectorType::Plug;
+    prm.size = 4.;
+    const PathCut::ConnectorPlacer pl(b.res, b.level, b.from(), b.to(), prm);
+    REQUIRE(pl.error().empty());
+
+    const PathCut::V3      edge = b.face_point(pl, 0.5, 6.);
+    PathCut::ConnectorSpot spot;
+    REQUIRE(pl.try_at(edge, spot) == PathCut::ConnectorFit::Edge);
+    PathCut::ConnectorSpot shown;
+    shown.p = edge;
+    const PathCut::ConnectorResult c = pl.build({shown});
+    REQUIRE(c.positions.size() == 1);
+    CHECK_FALSE(c.pegs.indices.empty());
+    CHECK_THAT(c.positions.front().x(), WithinAbs(edge.x(), 1e-9));
+}
+
 TEST_CASE("New connectors keep clear of holes already in the part", "[PathCut]")
 {
     // A 2 x 2 mm negative volume crossing the cut face near a corner.

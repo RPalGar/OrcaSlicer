@@ -53,6 +53,21 @@ static const ColorRGBA POINT_COLOR = {1.f, 0.55f, 0.f, 1.f};
 static const ColorRGBA PREVIEW_STAY_COLOR  = {0.55f, 0.72f, 0.70f, 1.f};
 static const ColorRGBA PREVIEW_MOVED_COLOR = {0.95f, 0.62f, 0.25f, 1.f};
 static const ColorRGBA PREVIEW_PEG_COLOR   = {0.15f, 0.75f, 0.35f, 1.f};
+static const ColorRGBA HOVER_FITS_COLOR    = {0.2f, 1.f, 0.4f, 0.5f};  // connector under the mouse: it fits
+static const ColorRGBA HOVER_NO_FIT_COLOR  = {1.f, 0.15f, 0.15f, 0.6f}; // it does not fit there
+
+// What of the connectors is shown on the cut face: the pegs, or the holes of the pins.
+static void init_connector_model(GLModel &model, const PathCut::ConnectorResult &c)
+{
+    model.reset();
+    const indexed_triangle_set &shown = c.pegs.indices.empty() ? c.holes_to : c.pegs;
+    GLModel::Geometry           g;
+    g.format = {GLModel::Geometry::EPrimitiveType::Triangles, GLModel::Geometry::EVertexLayout::P3};
+    for (const auto &v : shown.vertices) g.add_vertex(Vec3f(v));
+    for (const auto &t : shown.indices) g.add_triangle(unsigned(t[0]), unsigned(t[1]), unsigned(t[2]));
+    if (g.vertices_count() > 0)
+        model.init_from(std::move(g));
+}
 
 // Messages produced by libslic3r/PathCutGeometry.hpp, listed here so xgettext picks them up.
 [[maybe_unused]] static const char *const PATH_CUT_MESSAGES[] = {
@@ -91,7 +106,13 @@ bool GLGizmoPathCut::on_init() { return true; }
 
 std::string GLGizmoPathCut::on_get_name() const { return _u8L("Cut along path"); }
 
-std::string GLGizmoPathCut::get_tooltip() const { return ""; }
+// Placing connectors: where the one under the mouse does not fit, say why.
+std::string GLGizmoPathCut::get_tooltip() const
+{
+    if (m_placing && m_hover_on && m_hover_fit != PathCut::ConnectorFit::Ok)
+        return _u8L(PathCut::connector_fit_message(m_hover_fit));
+    return "";
+}
 
 bool GLGizmoPathCut::on_is_activable() const
 {
@@ -191,6 +212,12 @@ bool GLGizmoPathCut::on_mouse(const wxMouseEvent &mouse_event)
     if (m_busy) // the scene is frozen while a cut runs (zooming is fine)
         return mouse_event.GetWheelRotation() == 0;
     const Vec2d mouse_pos(mouse_event.GetX(), mouse_event.GetY());
+    if (m_placing && mouse_event.Moving()) {
+        update_hover(mouse_pos);
+        return false; // the canvas still tracks the mouse
+    }
+    if (mouse_event.Leaving())
+        clear_hover();
     if (mouse_event.LeftDown())
         m_press_on_object = m_orbiting = false; // a lost release must not leave a press behind
     if (mouse_event.LeftDown() && !mouse_event.CmdDown()) {
@@ -214,6 +241,7 @@ bool GLGizmoPathCut::on_mouse(const wxMouseEvent &mouse_event)
     if (m_press_on_object && mouse_event.Dragging() && mouse_event.LeftIsDown()) {
         if (!m_orbiting && (mouse_pos - m_press_pos).norm() > 4.) {
             m_orbiting = true;
+            clear_hover();
             if (!m_parent.has_mouse_capture())
                 m_parent.get_wxglcanvas()->CaptureMouse(); // released by the canvas on button up
         }
@@ -240,9 +268,10 @@ bool GLGizmoPathCut::on_mouse(const wxMouseEvent &mouse_event)
     if (m_press_on_object && mouse_event.LeftUp()) {
         m_press_on_object = false;
         if (!m_orbiting && m_press_adds_point) {
-            if (m_placing)
+            if (m_placing) {
                 add_connector(m_press_hit);
-            else
+                update_hover(mouse_pos); // the new connector is there now
+            } else
                 add_point(m_press_hit);
         }
         m_orbiting = false;
@@ -260,6 +289,7 @@ bool GLGizmoPathCut::on_mouse(const wxMouseEvent &mouse_event)
             if (!m_spots.empty()) {
                 m_spots.pop_back();
                 rebuild_connector_preview();
+                update_hover(mouse_pos);
                 m_message.clear();
                 m_parent.set_as_dirty();
             }
@@ -444,6 +474,10 @@ void GLGizmoPathCut::on_render()
             if (m_conn_model.is_initialized()) {
                 m_conn_model.set_color(ColorRGBA(0.1f, 0.85f, 0.3f, 0.85f));
                 m_conn_model.render();
+            }
+            if (m_hover_on && m_hover_model.is_initialized()) {
+                m_hover_model.set_color(m_hover_fit == PathCut::ConnectorFit::Ok ? HOVER_FITS_COLOR : HOVER_NO_FIT_COLOR);
+                m_hover_model.render();
             }
             shader->stop_using();
             glsafe(::glDisable(GL_BLEND));
@@ -1049,6 +1083,7 @@ void GLGizmoPathCut::clear_pending()
     m_spots.clear();
     m_face_model.reset();
     m_conn_model.reset();
+    clear_hover();
     m_face_aabb.reset();
     m_piece_stay.reset();
     m_piece_moved.reset();
@@ -1248,6 +1283,8 @@ void GLGizmoPathCut::connectors_changed()
         m_spots = std::move(kept);
     }
     rebuild_connector_preview();
+    if (m_hover_on)
+        update_hover(m_hover_pos); // shown again with the new settings
     m_parent.set_as_dirty();
 }
 
@@ -1256,15 +1293,39 @@ void GLGizmoPathCut::rebuild_connector_preview()
     m_conn_model.reset();
     if (!m_pending || !m_pending->placer || !m_pending->placer->error().empty() || m_spots.empty())
         return;
-    const PathCut::ConnectorResult c = m_pending->placer->build(m_spots);
-    // What sticks out of / goes into the parts: the pegs, or the holes of the pins.
-    const indexed_triangle_set &shown = c.pegs.indices.empty() ? c.holes_to : c.pegs;
-    GLModel::Geometry           g;
-    g.format = {GLModel::Geometry::EPrimitiveType::Triangles, GLModel::Geometry::EVertexLayout::P3};
-    for (const auto &v : shown.vertices) g.add_vertex(Vec3f(v));
-    for (const auto &t : shown.indices) g.add_triangle(unsigned(t[0]), unsigned(t[1]), unsigned(t[2]));
-    if (g.vertices_count() > 0)
-        m_conn_model.init_from(std::move(g));
+    init_connector_model(m_conn_model, m_pending->placer->build(m_spots));
+}
+
+void GLGizmoPathCut::update_hover(const Vec2d &mouse_pos)
+{
+    m_hover_pos = mouse_pos;
+    Vec3d hit;
+    if (!m_placing || m_busy || !m_pending || !m_pending->placer || !m_pending->placer->error().empty() ||
+        !raycast_face(mouse_pos, hit)) {
+        clear_hover();
+        return;
+    }
+    const PathCut::ConnectorPlacer &placer = *m_pending->placer;
+    const PathCut::V3               p      = PathCut::V3(hit - m_placing_offset);
+    PathCut::ConnectorSpot          spot;
+    m_hover_fit = placer.try_at(p, spot, m_spots);
+    if (m_hover_fit != PathCut::ConnectorFit::Ok) {
+        // It does not fit: show it at the mouse with its plain size (nothing measured there).
+        spot   = PathCut::ConnectorSpot();
+        spot.p = p;
+    }
+    init_connector_model(m_hover_model, placer.build({spot}));
+    m_hover_on = m_hover_model.is_initialized();
+    m_parent.set_as_dirty();
+}
+
+void GLGizmoPathCut::clear_hover()
+{
+    if (!m_hover_on && !m_hover_model.is_initialized())
+        return;
+    m_hover_on = false;
+    m_hover_model.reset();
+    m_parent.set_as_dirty();
 }
 
 void GLGizmoPathCut::perform_cut()

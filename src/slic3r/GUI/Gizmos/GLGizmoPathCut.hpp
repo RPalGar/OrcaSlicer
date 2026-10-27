@@ -68,6 +68,10 @@ private:
     void               add_connector(const Vec3d &hit_world);
     void               connectors_changed(); // connector settings edited while placing
     void               rebuild_connector_preview();
+    // While placing, the connector under the mouse is shown as it would be placed: green where it
+    // fits, red where it does not (a click there places nothing). Its tooltip says why.
+    void               update_hover(const Vec2d &mouse_pos);
+    void               clear_hover();
     // Preview: the cut is computed and shown with the pieces apart; the object is untouched until
     // "Perform cut" applies exactly what is shown. Editing (any change) drops it.
     void               enter_preview(const std::shared_ptr<PathCutJob> &job);
@@ -118,6 +122,10 @@ private:
     GLModel                             m_conn_model;     // the connectors placed so far
     std::shared_ptr<AABBMesh>           m_face_aabb;      // picks on the cut face (an open surface: first hit)
     Vec3d                               m_placing_offset{Vec3d::Zero()}; // object coordinates -> world
+    GLModel                             m_hover_model;    // the connector under the mouse, object coordinates
+    bool                                m_hover_on{false};
+    PathCut::ConnectorFit               m_hover_fit{PathCut::ConnectorFit::Ok};
+    Vec2d                               m_hover_pos{Vec2d::Zero()};
 
     // A left press on the object adds a point on release, unless the mouse was dragged: then it orbits.
     bool  m_press_on_object{false};
