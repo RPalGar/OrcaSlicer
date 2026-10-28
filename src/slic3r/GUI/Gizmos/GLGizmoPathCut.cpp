@@ -1604,33 +1604,51 @@ void GLGizmoPathCut::perform_cut()
             res  = PathCut::cut_with_slab(std::move(st->src), vc, vc.limited(), 0.5, canceled);
             side = [&vc](const PathCut::V3 &p) { return vc.side(p); };
         } else {
-            AABBMesh aabb(st->src);
-            auto     snap = [&aabb](const PathCut::V3 &p) -> PathCut::V3 {
-                int   idx;
-                Vec3d c;
-                aabb.squared_distance(Vec3d(p), idx, c);
-                return c;
-            };
-            lc = PathCut::make_loop_cutter(st->pts, st->kerf, st->margin, snap, st->flat_cap);
-            if (!lc.valid()) {
-                st->error = lc.error;
-                return;
+            bool cut_done = false;
+            if (st->follow_creases && !st->flat_cap) {
+                // Along the model's edges: cut exactly along them, nothing smoothed (the membrane cut face
+                // takes any outline). Where that cannot be done, the loop cut below follows them closely.
+                const PathCut::CreaseGraph graph(st->src);
+                const std::vector<int>     chain = graph.loop_vertices(st->pts);
+                lap("edges followed");
+                if (!chain.empty()) {
+                    res      = PathCut::cut_along_edge_loop(st->src, chain, st->kerf, canceled);
+                    cut_done = res.error.empty() || canceled();
+                    if (cut_done)
+                        side = [](const PathCut::V3 &) { return 0; };
+                    else
+                        BOOST_LOG_TRIVIAL(info) << "PathCut: cut along the edges failed (" << res.error << "), cutting along the loop";
+                }
             }
-            if (!st->flat_cap) {
-                // Exactly along the loop: only the surface the loop runs on is cut (folds, creases).
-                // Along a crease the surface folds sharply under the loop: let the cut line find it a little further.
-                res = PathCut::cut_along_loop(std::move(st->src), lc, st->follow_creases ? std::max<double>(st->margin, 3.) : st->margin,
-                                              canceled);
-            } else {
-                // Flat cut face: a slab through the mean plane of the loop, widened past bulges near it.
-                if (!PathCut::fit_loop_margin(st->src, lc)) {
-                    st->error = "The cap spanning the loop runs into another part of the model. Place the loop where the part is free all around.";
+            if (!cut_done) {
+                AABBMesh aabb(st->src);
+                auto     snap = [&aabb](const PathCut::V3 &p) -> PathCut::V3 {
+                    int   idx;
+                    Vec3d c;
+                    aabb.squared_distance(Vec3d(p), idx, c);
+                    return c;
+                };
+                lc = PathCut::make_loop_cutter(st->pts, st->kerf, st->margin, snap, st->flat_cap);
+                if (!lc.valid()) {
+                    st->error = lc.error;
                     return;
                 }
-                BOOST_LOG_TRIVIAL(info) << "PathCut: cap margin " << lc.margin << " mm";
-                res = PathCut::cut_with_slab(std::move(st->src), lc, true, 0.5, canceled);
+                if (!st->flat_cap) {
+                    // Exactly along the loop: only the surface the loop runs on is cut (folds, creases).
+                    // Along a crease the surface folds sharply under the loop: let the cut line find it a little further.
+                    res = PathCut::cut_along_loop(std::move(st->src), lc, st->follow_creases ? std::max<double>(st->margin, 3.) : st->margin,
+                                                  canceled);
+                } else {
+                    // Flat cut face: a slab through the mean plane of the loop, widened past bulges near it.
+                    if (!PathCut::fit_loop_margin(st->src, lc)) {
+                        st->error = "The cap spanning the loop runs into another part of the model. Place the loop where the part is free all around.";
+                        return;
+                    }
+                    BOOST_LOG_TRIVIAL(info) << "PathCut: cap margin " << lc.margin << " mm";
+                    res = PathCut::cut_with_slab(std::move(st->src), lc, true, 0.5, canceled);
+                }
+                side = [&lc](const PathCut::V3 &p) { return lc.side(p); };
             }
-            side = [&lc](const PathCut::V3 &p) { return lc.side(p); };
         }
         lap("cut");
         if (canceled())

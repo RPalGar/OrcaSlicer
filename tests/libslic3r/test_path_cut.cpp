@@ -299,6 +299,61 @@ TEST_CASE("A loop following the model's edges runs along a ridge between the pic
     CHECK(count_on_ridge(0., between) == 0);
 }
 
+TEST_CASE("A cut along a loop of the mesh's own edges splits exactly there, the bore open in both pieces", "[PathCut]")
+{
+    // A pipe (outer r = 8, bore r = 4, h = 30) meshed in 1 mm rings: the ring of the outside wall at
+    // z = 15 is cut exactly along its edges; the bore walls crossing the cut face are cut too.
+    const double  R = 8., r = 4., h = 30.;
+    constexpr int n = 48, rows = 31;
+    indexed_triangle_set pipe;
+    for (int wall = 0; wall < 2; ++wall) // outside, bore
+        for (int k = 0; k < rows; ++k)
+            for (int i = 0; i < n; ++i) {
+                const double a = 2. * PI * i / n, rr = wall == 0 ? R : r;
+                pipe.vertices.emplace_back(float(rr * std::cos(a)), float(rr * std::sin(a)), float(h * k / (rows - 1)));
+            }
+    auto v = [](int wall, int k, int i) { return (wall * rows + k) * n + (i + n) % n; };
+    for (int k = 0; k + 1 < rows; ++k)
+        for (int i = 0; i < n; ++i) {
+            pipe.indices.emplace_back(v(0, k, i), v(0, k, i + 1), v(0, k + 1, i + 1)); // outside, facing out
+            pipe.indices.emplace_back(v(0, k, i), v(0, k + 1, i + 1), v(0, k + 1, i));
+            pipe.indices.emplace_back(v(1, k, i), v(1, k + 1, i + 1), v(1, k, i + 1)); // bore, facing the axis
+            pipe.indices.emplace_back(v(1, k, i), v(1, k + 1, i), v(1, k + 1, i + 1));
+        }
+    for (int i = 0; i < n; ++i) {
+        pipe.indices.emplace_back(v(0, rows - 1, i), v(0, rows - 1, i + 1), v(1, rows - 1, i + 1)); // top ring
+        pipe.indices.emplace_back(v(0, rows - 1, i), v(1, rows - 1, i + 1), v(1, rows - 1, i));
+        pipe.indices.emplace_back(v(0, 0, i), v(1, 0, i + 1), v(0, 0, i + 1)); // bottom ring
+        pipe.indices.emplace_back(v(0, 0, i), v(1, 0, i), v(1, 0, i + 1));
+    }
+    const double full = its_volume(pipe);
+    REQUIRE(full > 0.);
+
+    std::vector<int> ring;
+    for (int i = 0; i < n; ++i) ring.push_back(v(0, 15, i));
+    const PathCut::CutResult res = PathCut::cut_along_edge_loop(pipe, ring, 0.2);
+    REQUIRE(res.error.empty());
+    const auto parts = its_split(res.mesh);
+    REQUIRE(parts.size() == 2);
+    require_closed_parts(parts);
+    for (const auto &p : parts) {
+        CHECK_THAT(its_volume(p), WithinAbs(0.5 * full, 0.03 * full));
+        // The cut runs exactly along the ring: the outside of each piece ends at z = 15.
+        bool on_ring = false;
+        for (const auto &q : p.vertices)
+            on_ring = on_ring || (std::abs(q.z() - 15.f) < 1e-4f && std::abs(std::hypot(q.x(), q.y()) - R) < 1e-3);
+        CHECK(on_ring);
+    }
+
+    // The same ring found from a few points picked on it, following the edges.
+    const PathCut::CreaseGraph     graph(pipe);
+    const std::vector<PathCut::V3> picked{{R, 0., 15.}, {-0.5 * R, 0.866 * R, 15.}, {-0.5 * R, -0.866 * R, 15.}};
+    const std::vector<int>         found = graph.loop_vertices(picked);
+    REQUIRE(found.size() >= 3);
+    for (int id : found)
+        CHECK_THAT(double(pipe.vertices[size_t(id)].z()), WithinAbs(15., 1e-4));
+}
+
 TEST_CASE("The preview draws the detached piece apart from the rest", "[PathCut]")
 {
     // A 10 mm cube resting on top of a 20 mm one: drawn 3 mm (the minimum) further up.

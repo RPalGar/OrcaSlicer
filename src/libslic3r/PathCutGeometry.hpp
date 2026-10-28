@@ -1712,50 +1712,19 @@ public:
         if (np < 3 || nv == 0) return picked;
         std::vector<int> pv(np);
         for (size_t i = 0; i < np; ++i) pv[i] = nearest(picked[i]);
+        if (!close_enough(picked, pv)) return picked; // too coarse a mesh to follow its edges
         std::vector<V3>     out;
         std::vector<double> dist(nv, std::numeric_limits<double>::max());
-        std::vector<int>    prev(nv, -1), seen;
+        std::vector<int>    prev(nv, -1), seen, seg;
         for (size_t i = 0; i < np; ++i) {
-            const V3    &A = picked[i], &B = picked[(i + 1) % np];
-            const int    s = pv[i], g = pv[(i + 1) % np];
-            const V3     ab = B - A;
-            const double len = ab.norm(), corridor = std::max(3., 0.3 * len);
-            auto in_corridor = [&](int v) {
-                const V3    &p = m_pos[size_t(v)];
-                const double t = len > 1e-9 ? std::clamp((p - A).dot(ab) / (len * len), 0., 1.) : 0.;
-                return (A + ab * t - p).norm() <= corridor;
-            };
-            for (int v : seen) { dist[size_t(v)] = std::numeric_limits<double>::max(); prev[size_t(v)] = -1; }
-            seen.clear();
-            using Item = std::pair<double, int>;
-            std::priority_queue<Item, std::vector<Item>, std::greater<Item>> heap;
-            dist[size_t(s)] = 0.;
-            seen.push_back(s);
-            heap.emplace(0., s);
-            while (!heap.empty()) {
-                const auto [d, v] = heap.top();
-                heap.pop();
-                if (d > dist[size_t(v)]) continue;
-                if (v == g) break;
-                for (const Link &l : m_adj[size_t(v)]) {
-                    if (!in_corridor(l.to)) continue;
-                    const double nd = d + (m_pos[size_t(v)] - m_pos[size_t(l.to)]).norm() * (1. - pull * l.bend);
-                    if (nd < dist[size_t(l.to)]) {
-                        if (dist[size_t(l.to)] == std::numeric_limits<double>::max()) seen.push_back(l.to);
-                        dist[size_t(l.to)] = nd;
-                        prev[size_t(l.to)] = v;
-                        heap.emplace(nd, l.to);
-                    }
-                }
+            if (!shortest(picked[i], picked[(i + 1) % np], pv[i], pv[(i + 1) % np], pull, dist, prev, seen, seg)) {
+                out.push_back(picked[i]);
+                continue;
             }
-            if (s == g || prev[size_t(g)] < 0) { out.push_back(A); continue; }
-            std::vector<int> path;
-            for (int v = g; v != s; v = prev[size_t(v)]) path.push_back(v);
-            path.push_back(s);
-            std::reverse(path.begin(), path.end());
-            path.pop_back(); // the next segment starts there
-            for (int v : path) out.push_back(m_pos[size_t(v)]);
+            seg.pop_back(); // the next segment starts there
+            for (int v : seg) out.push_back(m_pos[size_t(v)]);
         }
+        if (spacing <= 0.) return out;
         std::vector<V3> thin;
         for (const V3 &p : out)
             if (thin.empty() || (p - thin.back()).norm() >= spacing) thin.push_back(p);
@@ -1763,8 +1732,100 @@ public:
         return thin.size() >= 3 ? thin : picked;
     }
 
+    // The same loop as mesh vertices (consecutive ones share an edge), simple (a vertex the path comes
+    // back to closes off the detour), for a cut exactly along those edges. Empty when a segment has no path.
+    std::vector<int> loop_vertices(const std::vector<V3> &picked, double pull = 0.85) const
+    {
+        const size_t np = picked.size(), nv = m_pos.size();
+        if (np < 3 || nv == 0) return {};
+        std::vector<int> pv(np);
+        for (size_t i = 0; i < np; ++i) pv[i] = nearest(picked[i]);
+        if (!close_enough(picked, pv)) return {};
+        std::vector<int>    ids;
+        std::vector<double> dist(nv, std::numeric_limits<double>::max());
+        std::vector<int>    prev(nv, -1), seen;
+        for (size_t i = 0; i < np; ++i) {
+            std::vector<int> seg;
+            if (!shortest(picked[i], picked[(i + 1) % np], pv[i], pv[(i + 1) % np], pull, dist, prev, seen, seg)) return {};
+            seg.pop_back(); // the next segment starts there
+            ids.insert(ids.end(), seg.begin(), seg.end());
+        }
+        // Loop erasure: a vertex visited twice cuts out what lies between.
+        std::vector<int>                out;
+        std::unordered_map<int, size_t> at;
+        for (int v : ids) {
+            auto it = at.find(v);
+            if (it != at.end()) {
+                for (size_t k = it->second + 1; k < out.size(); ++k) at.erase(out[k]);
+                out.resize(it->second + 1);
+            } else {
+                at[v] = out.size();
+                out.push_back(v);
+            }
+        }
+        return out.size() >= 3 ? out : std::vector<int>{};
+    }
+    const V3 &position(int v) const { return m_pos[size_t(v)]; }
+
 private:
     struct Link { int to; double bend; };
+    // The mesh is fine enough to follow its edges: every picked point has a vertex within 2 mm.
+    bool close_enough(const std::vector<V3> &picked, const std::vector<int> &pv) const
+    {
+        for (size_t i = 0; i < picked.size(); ++i)
+            if ((m_pos[size_t(pv[i])] - picked[i]).norm() > 2.) return false;
+        return true;
+    }
+    // Least-cost path from s to g over the edges, in the corridor around the segment A-B.
+    bool shortest(const V3 &A, const V3 &B, int s, int g, double pull, std::vector<double> &dist, std::vector<int> &prev,
+                  std::vector<int> &seen, std::vector<int> &path) const
+    {
+        path.clear();
+        if (s == g) return false;
+        // The corridor widens when the surface between the points leaves it (round a fin, say).
+        for (double widen : {1., 2.5, 6.})
+            if (shortest_in(A, B, s, g, pull, widen, dist, prev, seen, path)) return true;
+        return false;
+    }
+    bool shortest_in(const V3 &A, const V3 &B, int s, int g, double pull, double widen, std::vector<double> &dist,
+                     std::vector<int> &prev, std::vector<int> &seen, std::vector<int> &path) const
+    {
+        const V3     ab = B - A;
+        const double len = ab.norm(), corridor = widen * std::max(3., 0.3 * len);
+        auto in_corridor = [&](int v) {
+            const V3    &p = m_pos[size_t(v)];
+            const double t = len > 1e-9 ? std::clamp((p - A).dot(ab) / (len * len), 0., 1.) : 0.;
+            return (A + ab * t - p).norm() <= corridor;
+        };
+        for (int v : seen) { dist[size_t(v)] = std::numeric_limits<double>::max(); prev[size_t(v)] = -1; }
+        seen.clear();
+        using Item = std::pair<double, int>;
+        std::priority_queue<Item, std::vector<Item>, std::greater<Item>> heap;
+        dist[size_t(s)] = 0.;
+        seen.push_back(s);
+        heap.emplace(0., s);
+        while (!heap.empty()) {
+            const auto [d, v] = heap.top();
+            heap.pop();
+            if (d > dist[size_t(v)]) continue;
+            if (v == g) break;
+            for (const Link &l : m_adj[size_t(v)]) {
+                if (!in_corridor(l.to)) continue;
+                const double nd = d + (m_pos[size_t(v)] - m_pos[size_t(l.to)]).norm() * (1. - pull * l.bend);
+                if (nd < dist[size_t(l.to)]) {
+                    if (dist[size_t(l.to)] == std::numeric_limits<double>::max()) seen.push_back(l.to);
+                    dist[size_t(l.to)] = nd;
+                    prev[size_t(l.to)] = v;
+                    heap.emplace(nd, l.to);
+                }
+            }
+        }
+        if (prev[size_t(g)] < 0) return false;
+        for (int v = g; v != s; v = prev[size_t(v)]) path.push_back(v);
+        path.push_back(s);
+        std::reverse(path.begin(), path.end());
+        return true;
+    }
     int nearest(const V3 &p) const
     {
         int best = 0; double bd = std::numeric_limits<double>::max();
@@ -2065,6 +2126,325 @@ inline CutResult cut_along_loop(indexed_triangle_set its, const LoopCutter &lc, 
         for (size_t i = 0; i < its.indices.size(); ++i) {
             const auto &t = its.indices[i];
             if (i < nt0 && t[0] == t[1] && t[1] == t[2]) { ++n_dropped; continue; }
+            kept.push_back(t);
+        }
+        its.indices = std::move(kept);
+    }
+    res.first_cap -= n_dropped;
+    res.mesh = std::move(its);
+    return res;
+}
+
+// The cut face of a cut exactly along a closed chain of mesh edges: a membrane spanning the chain, as a
+// height field over the chain's mean plane, the heights inside interpolated from the chain's with mean
+// value coordinates (smooth, exact on the chain, for any simple polygon: no star shape needed).
+struct MembraneCutter
+{
+    Frame               frame;
+    std::vector<V2>     poly; // the chain in the plane
+    std::vector<double> h;    // its heights
+    double              kerf{0.};
+
+    double height_at(const V2 &q) const
+    {
+        const size_t n = poly.size();
+        std::vector<V2>     d(n);
+        std::vector<double> r(n);
+        for (size_t i = 0; i < n; ++i) {
+            d[i] = poly[i] - q;
+            r[i] = d[i].norm();
+            if (r[i] < 1e-9) return h[i];
+        }
+        double ws = 0., hs = 0.;
+        std::vector<double> tn(n); // tan(alpha_i / 2), alpha_i the angle at q between i and i + 1
+        for (size_t i = 0; i < n; ++i) {
+            const size_t j = (i + 1) % n;
+            const double cr = d[i].x() * d[j].y() - d[i].y() * d[j].x(), dt = d[i].dot(d[j]);
+            if (std::abs(cr) < 1e-12 && dt < 0.) { // on the edge: linear along it
+                const double t = r[i] / (r[i] + r[j]);
+                return h[i] * (1. - t) + h[j] * t;
+            }
+            tn[i] = (r[i] * r[j] - dt) / cr; // tan(a/2) = (1 - cos a) / sin a, signed
+        }
+        for (size_t i = 0; i < n; ++i) {
+            const double w = (tn[(i + n - 1) % n] + tn[i]) / r[i];
+            ws += w;
+            hs += w * h[i];
+        }
+        return std::abs(ws) > 1e-12 ? hs / ws : h[0];
+    }
+    double field(const V3 &p) const { return frame.height(p) - height_at(frame.to2d(p)); }
+    V2     chart(const V3 &p, int) const { return frame.to2d(p); }
+    V3     lift(const V2 &q, int level) const { return frame.to3d(q, height_at(q) + 0.5 * kerf * level); }
+    std::vector<std::pair<V2, V2>> kinks(int, double) const { return {}; }
+};
+
+// Cuts a closed mesh exactly along a closed chain of its own edges (`chain`: vertex indices, consecutive
+// ones sharing an edge; e.g. a loop following a crease): the surface is split along those edges and
+// nowhere else, and both openings are closed with a membrane spanning the chain (see MembraneCutter),
+// moved by half the kerf towards its own piece away from the rim. Inner surfaces crossing the membrane
+// inside the chain (the walls of a hole) are cut by it, their openings holes in the cut faces.
+inline CutResult cut_along_edge_loop(indexed_triangle_set its, const std::vector<int> &chain_in, double kerf,
+                                     const std::function<bool()> &canceled = {})
+{
+    CutResult res;
+    auto stop = [&]() { return canceled && canceled(); };
+    auto pos  = [&](int v) -> V3 { return its.vertices[size_t(v)].template cast<double>(); };
+    const size_t nv0 = its.vertices.size(), nt0 = its.indices.size();
+    if (chain_in.size() < 3) {
+        res.error = "The loop needs at least three points.";
+        return res;
+    }
+    // Triangle holding each directed edge.
+    std::unordered_map<uint64_t, size_t> tri_of;
+    tri_of.reserve(nt0 * 3);
+    auto dkey = [](int a, int b) { return (uint64_t(uint32_t(a)) << 32) | uint32_t(b); };
+    for (size_t i = 0; i < nt0; ++i)
+        for (int e = 0; e < 3; ++e) tri_of[dkey(its.indices[i][e], its.indices[i][(e + 1) % 3])] = i;
+    // A chain running along two edges of one triangle goes along its third edge instead: otherwise the cut
+    // face would close over that triangle with a copy of it.
+    std::vector<int> chain = chain_in;
+    for (bool changed = true; changed && chain.size() > 3;) {
+        changed = false;
+        for (size_t i = 0; i < chain.size() && chain.size() > 3; ++i) {
+            const size_t m = chain.size();
+            const int    a = chain[i], b = chain[(i + 1) % m], c = chain[(i + 2) % m];
+            if (tri_of.count(dkey(a, c)) && tri_of.count(dkey(c, a))) {
+                const auto &t = its.indices[tri_of.at(dkey(a, b))];
+                const auto &u = its.indices[tri_of.at(dkey(b, a))];
+                const bool  abc = (t[0] == c || t[1] == c || t[2] == c) || (u[0] == c || u[1] == c || u[2] == c);
+                if (abc) {
+                    chain.erase(chain.begin() + std::ptrdiff_t((i + 1) % m));
+                    changed = true;
+                }
+            }
+        }
+    }
+    const size_t n = chain.size();
+    for (size_t i = 0; i < n; ++i)
+        if (!tri_of.count(dkey(chain[i], chain[(i + 1) % n])) || !tri_of.count(dkey(chain[(i + 1) % n], chain[i]))) {
+            res.error = "The cut could not follow the loop along the surface. Place more points, closer together, along the line "
+                        "where you want to cut, or raise the margin.";
+            return res;
+        }
+
+    // Mean plane (vector area) and the chain in it (ring), which must not cross itself.
+    MembraneCutter  mc;
+    std::vector<V2> ring;
+    mc.kerf = kerf;
+    {
+        V3 c = V3::Zero();
+        for (int v : chain) c += pos(v);
+        c /= double(n);
+        V3 varea = V3::Zero();
+        for (size_t i = 0; i < n; ++i) varea += (pos(chain[i]) - c).cross(pos(chain[(i + 1) % n]) - c);
+        if (varea.norm() < 1e-9) {
+            res.error = "The loop is degenerate (it encloses no area).";
+            return res;
+        }
+        mc.frame = frame_from_normal(varea, c);
+        for (int v : chain) { ring.push_back(mc.frame.to2d(pos(v))); }
+        // The membrane interpolates at most ~256 chain points (its cost grows with them); the chain
+        // itself stays exact, its vertices are not moved.
+        const size_t stride = std::max<size_t>(1, (n + 255) / 256);
+        for (size_t i = 0; i < n; i += stride) { mc.poly.push_back(ring[i]); mc.h.push_back(mc.frame.height(pos(chain[i]))); }
+        auto seg_cross = [](const V2 &a, const V2 &b, const V2 &c2, const V2 &d) {
+            auto orient = [](const V2 &p, const V2 &q, const V2 &r) { return (q - p).x() * (r - p).y() - (q - p).y() * (r - p).x(); };
+            const double o1 = orient(a, b, c2), o2 = orient(a, b, d), o3 = orient(c2, d, a), o4 = orient(c2, d, b);
+            return ((o1 > 0.) != (o2 > 0.)) && ((o3 > 0.) != (o4 > 0.)) && std::abs(o1) > 1e-12 && std::abs(o2) > 1e-12 &&
+                   std::abs(o3) > 1e-12 && std::abs(o4) > 1e-12;
+        };
+        for (size_t i = 0; i < n; ++i)
+            for (size_t j = i + 2; j < n; ++j) {
+                if (i == 0 && j == n - 1) continue;
+                if (seg_cross(ring[i], ring[(i + 1) % n], ring[j], ring[(j + 1) % n])) {
+                    res.error = "The loop folds back on itself seen from its mean plane. Place the points more evenly around the part.";
+                    return res;
+                }
+            }
+    }
+    if (stop()) return {};
+
+    // Field: height above the membrane, near the chain's box (elsewhere nothing is cut).
+    const double hk = 0.5 * kerf;
+    V2 bmin = ring.front(), bmax = ring.front();
+    for (const V2 &q : ring) { bmin = bmin.cwiseMin(q); bmax = bmax.cwiseMax(q); }
+    std::vector<double> g(nv0, std::numeric_limits<double>::max());
+    for (size_t v = 0; v < nv0; ++v) {
+        const V2 q = mc.frame.to2d(pos(int(v)));
+        if ((q.array() < bmin.array() - 1.).any() || (q.array() > bmax.array() + 1.).any()) continue;
+        g[v] = mc.field(pos(int(v)));
+        if (std::abs(g[v]) < 1e-7) g[v] = 1e-7;
+        if ((v & 0x3fff) == 0 && stop()) return {};
+    }
+    for (int v : chain) g[size_t(v)] = 0.; // on the membrane by construction
+
+    // Inner surfaces crossing the membrane inside the chain: bands of triangles crossing the slab, not
+    // touching the chain, inside its polygon; clipped against both faces of the slab below. Found before
+    // the chain is split, on the original triangles.
+    auto crosses_slab = [&](const stl_triangle_vertex_indices &t) {
+        const double g0 = g[t[0]], g1 = g[t[1]], g2 = g[t[2]];
+        if (g0 == std::numeric_limits<double>::max() || g1 == std::numeric_limits<double>::max() || g2 == std::numeric_limits<double>::max()) return false;
+        return !(std::min({g0, g1, g2}) >= hk || std::max({g0, g1, g2}) <= -hk);
+    };
+    std::vector<char> interior(nt0, 0);
+    {
+        std::unordered_set<int> on_chain(chain.begin(), chain.end());
+        std::vector<int>        comp(nt0, -1);
+        std::unordered_map<uint64_t, std::vector<uint32_t>> by_edge;
+        for (size_t ti = 0; ti < nt0; ++ti)
+            if (crosses_slab(its.indices[ti])) {
+                comp[ti] = -2;
+                const auto &t = its.indices[ti];
+                for (int e = 0; e < 3; ++e) by_edge[edge_key(t[e], t[(e + 1) % 3])].push_back(uint32_t(ti));
+            }
+        std::vector<size_t> stack, band;
+        for (size_t s = 0; s < nt0; ++s) {
+            if (comp[s] != -2) continue;
+            comp[s] = 0;
+            stack.assign(1, s);
+            band.clear();
+            bool rim = false;
+            while (!stack.empty()) {
+                const size_t ti = stack.back(); stack.pop_back();
+                band.push_back(ti);
+                const auto &t = its.indices[ti];
+                for (int e = 0; e < 3; ++e) {
+                    rim = rim || on_chain.count(t[e]) > 0;
+                    for (uint32_t nb : by_edge[edge_key(t[e], t[(e + 1) % 3])])
+                        if (comp[nb] == -2) { comp[nb] = 0; stack.push_back(nb); }
+                }
+            }
+            if (rim) continue;
+            const auto &t0 = its.indices[band.front()];
+            if (point_in_polygon(ring, mc.frame.to2d((pos(t0[0]) + pos(t0[1]) + pos(t0[2])) / 3.)))
+                for (size_t ti : band) interior[ti] = 1;
+        }
+    }
+    // Split the surface along the chain. L: the triangles holding the chain's edges in its direction, and
+    // the fan around each chain vertex from there to the previous chain edge; they get copies of the chain
+    // vertices.
+    std::unordered_set<uint64_t> chain_edges;
+    for (size_t i = 0; i < n; ++i) chain_edges.insert(edge_key(chain[i], chain[(i + 1) % n]));
+    std::vector<int> copy(n);
+    for (size_t i = 0; i < n; ++i) {
+        copy[i] = int(its.vertices.size());
+        its.vertices.push_back(its.vertices[size_t(chain[i])]);
+    }
+    std::unordered_set<size_t> left_tris; // around the chain, on its left
+    for (size_t i = 0; i < n; ++i) {
+        const int v = chain[i], nx = chain[(i + 1) % n], pv = chain[(i + n - 1) % n];
+        size_t    ti = tri_of.at(dkey(v, nx));
+        for (size_t guard = 0; guard < 256; ++guard) {
+            auto &t = its.indices[ti];
+            int   k = 0;
+            while (k < 3 && t[k] != v) ++k;
+            if (k == 3) { res.error = "The model has holes along the cut, so the cut faces cannot be closed. Repair the model first."; return res; }
+            left_tris.insert(ti);
+            int b = t[(k + 2) % 3]; // the edge b -> v closes the triangle at v
+            if (b >= int(nv0)) b = chain[size_t(b) - nv0]; // a chain vertex already given its copy here
+            t[k] = copy[i];
+            if (b == pv) break;
+            auto it = tri_of.find(dkey(v, b));
+            if (it == tri_of.end()) { res.error = "The model has holes along the cut, so the cut faces cannot be closed. Repair the model first."; return res; }
+            ti = it->second;
+            if (guard == 255) { res.error = "The cut could not follow the loop along the surface. Place more points, closer together, along the line where you want to cut, or raise the margin."; return res; }
+        }
+    }
+    // Which side the left triangles are on: above the membrane (level +1) or below.
+    double above = 0.;
+    for (size_t ti : left_tris) {
+        const auto &t = its.indices[ti];
+        const V3    c = (pos(t[0]) + pos(t[1]) + pos(t[2])) / 3.;
+        above += mc.field(c);
+    }
+    const int left_li = above >= 0. ? 0 : 1; // cap_edges index of the left side: 0 = level +1
+    std::vector<std::pair<int, int>>     cap_edges[2];
+    std::unordered_map<uint64_t, size_t> cut_owner;
+    for (size_t i = 0; i < n; ++i) {
+        const size_t j = (i + 1) % n;
+        // Left surface walks copy_i -> copy_j, its cap the other way; right surface walks chain_j -> chain_i.
+        cap_edges[left_li].emplace_back(copy[j], copy[i]);
+        cut_owner.emplace(edge_key(copy[i], copy[j]), tri_of.at(dkey(chain[i], chain[j])));
+        cap_edges[1 - left_li].emplace_back(chain[i], chain[j]);
+        cut_owner.emplace(edge_key(chain[i], chain[j]), tri_of.at(dkey(chain[j], chain[i])));
+    }
+    if (stop()) return {};
+
+    auto gl = [&](int v, int level) {
+        const double x = level > 0 ? g[v] - hk : -g[v] - hk;
+        return std::abs(x) < 1e-5 ? 1e-5 : x;
+    };
+    std::unordered_map<uint64_t, int> cross[2];
+    auto crossing = [&](int a, int b, int level) {
+        auto &m        = cross[level > 0 ? 0 : 1];
+        auto [it, ins] = m.emplace(edge_key(a, b), -1);
+        if (ins) {
+            const int lo = std::min(a, b), hi = std::max(a, b);
+            const V3  pa = pos(lo), pb = pos(hi);
+            auto      gx = [&](double t) { const double x = mc.field(pa + (pb - pa) * t); return level > 0 ? x - hk : -x - hk; };
+            double    t0 = 0., t1 = 1., g0 = gl(lo, level), g1 = gl(hi, level);
+            double    t  = g0 / (g0 - g1);
+            for (int iter = 0, side = 0; iter < 40; ++iter) {
+                t               = std::clamp((t0 * g1 - t1 * g0) / (g1 - g0), 0., 1.);
+                const double gt = gx(t);
+                if (std::abs(gt) < 1e-7 || (t1 - t0) < 1e-9) break;
+                if ((gt > 0.) == (g0 > 0.)) { t0 = t; g0 = gt; if (side == -1) g1 *= 0.5; side = -1; }
+                else                        { t1 = t; g1 = gt; if (side == 1) g0 *= 0.5; side = 1; }
+            }
+            it->second = int(its.vertices.size());
+            its.vertices.emplace_back((pa + (pb - pa) * t).template cast<float>());
+        }
+        return it->second;
+    };
+    const stl_triangle_vertex_indices dropped(0, 0, 0);
+    for (size_t ti = 0; ti < nt0; ++ti) {
+        if (!interior[ti]) continue;
+        const auto t    = its.indices[ti];
+        its.indices[ti] = dropped;
+        for (int level : {1, -1}) {
+            const bool k0 = gl(t[0], level) > 0., k1 = gl(t[1], level) > 0., k2 = gl(t[2], level) > 0.;
+            if (!k0 && !k1 && !k2) continue;
+            if (k0 && k1 && k2) { its.indices.push_back(t); continue; }
+            const bool keep[3] = {k0, k1, k2};
+            int        poly[4], np = 0, first_cross = -1;
+            for (int i = 0; i < 3; ++i) {
+                const int a = t[i], b = t[(i + 1) % 3];
+                if (keep[i]) poly[np++] = a;
+                if (keep[i] != keep[(i + 1) % 3]) {
+                    if (keep[i]) first_cross = np;
+                    poly[np++] = crossing(a, b, level);
+                }
+            }
+            const size_t base = its.indices.size();
+            for (int i = 1; i + 1 < np; ++i) its.indices.emplace_back(poly[0], poly[i], poly[i + 1]);
+            const int x0 = poly[first_cross], x1 = poly[(first_cross + 1) % np];
+            cap_edges[level > 0 ? 0 : 1].emplace_back(x1, x0);
+            const int fan = first_cross == 0 ? 1 : first_cross == np - 1 ? np - 2 : first_cross;
+            cut_owner.emplace(edge_key(x0, x1), base + size_t(fan - 1));
+        }
+    }
+    if (stop()) return {};
+
+    res.first_cap = its.indices.size();
+    res.level.assign(its.vertices.size(), 0);
+    switch (detail::close_cut_faces(its, cap_edges, mc, cut_owner, res, canceled)) {
+    case 1: return res;
+    case 2: return {};
+    default: break;
+    }
+    res.level.resize(its.vertices.size(), 0);
+    const signed char left_level = left_li == 0 ? 1 : -1;
+    for (size_t i = 0; i < n; ++i) { res.level[size_t(copy[i])] = left_level; res.level[size_t(chain[i])] = static_cast<signed char>(-left_level); }
+    for (int li = 0; li < 2; ++li)
+        for (const auto &kv : cross[li]) res.level[size_t(kv.second)] = static_cast<signed char>(li == 0 ? 1 : -1);
+    size_t n_dropped = 0;
+    {
+        std::vector<stl_triangle_vertex_indices> kept;
+        kept.reserve(its.indices.size());
+        for (size_t k = 0; k < its.indices.size(); ++k) {
+            const auto &t = its.indices[k];
+            if (k < nt0 && t[0] == t[1] && t[1] == t[2]) { ++n_dropped; continue; }
             kept.push_back(t);
         }
         its.indices = std::move(kept);
