@@ -261,6 +261,44 @@ TEST_CASE("A cut exactly along a loop around a pipe keeps its bore open in both 
         CHECK_THAT(its_volume(p), WithinAbs(0.5 * full, 0.05 * full));
 }
 
+TEST_CASE("A loop following the model's edges runs along a ridge between the picked points", "[PathCut]")
+{
+    // A roof (z = |x| / 2, a ridge along x = 0) meshed on a 0.5 mm grid; two points picked 1.5 mm off the
+    // ridge near its ends: between them the loop follows the ridge, not the straight line (which it does
+    // with no pull towards the edges).
+    constexpr int n = 41;
+    const double  step = 0.5;
+    indexed_triangle_set roof;
+    for (int j = 0; j < n; ++j)
+        for (int i = 0; i < n; ++i) {
+            const double x = -10. + step * i, y = step * j;
+            roof.vertices.emplace_back(float(x), float(y), float(0.5 * std::abs(x)));
+        }
+    auto at = [](int i, int j) { return j * n + i; };
+    for (int j = 0; j + 1 < n; ++j)
+        for (int i = 0; i + 1 < n; ++i) {
+            roof.indices.emplace_back(at(i, j), at(i + 1, j), at(i + 1, j + 1));
+            roof.indices.emplace_back(at(i, j), at(i + 1, j + 1), at(i, j + 1));
+        }
+    const PathCut::CreaseGraph     graph(roof);
+    const std::vector<PathCut::V3> picked{{1.5, 1., 0.75}, {1.5, 19., 0.75}, {-9., 10., 4.5}};
+    auto count_on_ridge = [&](double pull, size_t &between) {
+        size_t on_ridge = 0;
+        between         = 0;
+        for (const PathCut::V3 &p : graph.loop(picked, pull, 0.5))
+            if (p.y() > 4. && p.y() < 16. && p.x() > -1.) {
+                ++between;
+                if (std::abs(p.x()) < 0.6) ++on_ridge;
+            }
+        return on_ridge;
+    };
+    size_t between = 0;
+    const size_t on_ridge = count_on_ridge(0.85, between);
+    REQUIRE(between > 10);
+    CHECK(on_ridge == between);
+    CHECK(count_on_ridge(0., between) == 0);
+}
+
 TEST_CASE("The preview draws the detached piece apart from the rest", "[PathCut]")
 {
     // A 10 mm cube resting on top of a 20 mm one: drawn 3 mm (the minimum) further up.
