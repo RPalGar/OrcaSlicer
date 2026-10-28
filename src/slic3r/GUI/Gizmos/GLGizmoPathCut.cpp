@@ -131,6 +131,7 @@ CommonGizmosDataID GLGizmoPathCut::on_get_requirements() const
 
 static void abort_job(PathCutJob &job); // below, after PathCutJob
 static bool job_object_unchanged(const PathCutJob &job);
+static bool job_joined(const PathCutJob &job);
 
 void GLGizmoPathCut::on_set_state()
 {
@@ -643,15 +644,21 @@ void GLGizmoPathCut::on_render_input_window(float x, float y, float bottom_limit
     const float check_x = ImGui::GetStyle().WindowPadding.x + ImGui::GetFrameHeight() * 1.5f + check_w + gap;
 
     m_imgui->disabled_begin(m_busy);
-    if (m_imgui->bbl_radio_button(_u8L("Path from view").c_str(), m_mode == Mode::ViewPath) && m_mode != Mode::ViewPath) {
-        m_mode = Mode::ViewPath;
-        reset_path();
-    }
+    // Switching the mode starts a new path. A previewed cut that leaves the object in one piece is made
+    // first, so the next cut (in the other mode) goes on from it: the tool opens again on the object.
+    auto switch_mode = [this](Mode mode) {
+        m_mode = mode;
+        if (previewing() && job_joined(*m_pending)) {
+            std::shared_ptr<PathCutJob> job = m_pending;
+            wxGetApp().CallAfter([this, job]() { if (m_pending == job && previewing()) apply_cut(job); });
+        } else
+            reset_path();
+    };
+    if (m_imgui->bbl_radio_button(_u8L("Path from view").c_str(), m_mode == Mode::ViewPath) && m_mode != Mode::ViewPath)
+        switch_mode(Mode::ViewPath);
     ImGui::SameLine();
-    if (m_imgui->bbl_radio_button(_u8L("Closed loop on surface").c_str(), m_mode == Mode::Loop) && m_mode != Mode::Loop) {
-        m_mode = Mode::Loop;
-        reset_path();
-    }
+    if (m_imgui->bbl_radio_button(_u8L("Closed loop on surface").c_str(), m_mode == Mode::Loop) && m_mode != Mode::Loop)
+        switch_mode(Mode::Loop);
 
     ImGui::Separator();
     ImGui::PushTextWrapPos(ImGui::GetFontSize() * 26.f);
@@ -1032,6 +1039,7 @@ struct PathCutJob
 
 static void abort_job(PathCutJob &job) { job.abort = true; }
 static bool job_object_unchanged(const PathCutJob &job) { return job.object_unchanged(); }
+static bool job_joined(const PathCutJob &job) { return job.joined; }
 
 // Which pieces each volume that is not cut belongs to: those with material where it is. Its surface is
 // sampled (vertices, and a grid inside each triangle) and each sample tested inside each piece by
