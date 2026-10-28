@@ -1462,8 +1462,14 @@ CutResult cut_with_slab(indexed_triangle_set its, const Cutter &cutter, bool bou
     eval(0);
     if (stop()) return {};
 
-    // 1) Refine the triangles that may touch the slab. The fields grow at most ~1 mm per mm, so a
-    //    triangle whose closest vertex is more than ~2 edge lengths away from the slab cannot reach it.
+    // 1) Refine the triangles that may touch the slab where the cut would not follow the slab closely
+    //    enough: where the slab is curved across the triangle (the field is not linear along its edges,
+    //    so straight cut edges between the crossings would stray from it) and, for a bounded slab, where
+    //    the triangle runs across the rim of the footprint. Elsewhere the model's own triangles already
+    //    follow a planar slab exactly; refining them only multiplies the triangles of the result.
+    //    The fields grow at most ~1 mm per mm, so a triangle whose closest vertex is more than ~2 edge
+    //    lengths away from the slab cannot reach it.
+    constexpr double bend_tol = 0.05; // mm: straight cut edges stray at most about this far from the slab (a quarter layer)
     auto needs_split = [&](const stl_triangle_vertex_indices &t) { // longest edge to split, or -1
         double emax = 0.; int ei = 0;
         for (int e = 0; e < 3; ++e) {
@@ -1471,12 +1477,25 @@ CutResult cut_with_slab(indexed_triangle_set its, const Cutter &cutter, bool bou
             if (l > emax) { emax = l; ei = e; }
         }
         emax = std::sqrt(emax);
-        if (emax <= refine) return -1;
+        if (emax <= std::min(refine, 0.25)) return -1;
         // (not called `near`: windows.h defines that as a macro)
         double closest = std::numeric_limits<double>::max();
         for (int e = 0; e < 3; ++e)
             closest = std::min(closest, std::max(std::abs(f[t[e]]) - hk, out[t[e]]));
-        return closest < 2. * emax ? ei : -1;
+        if (closest >= 2. * emax) return -1;
+        if (bounded && emax > refine) {
+            const bool in0 = out[t[0]] < 0., in1 = out[t[1]] < 0., in2 = out[t[2]] < 0.;
+            if (in0 != in1 || in1 != in2) return ei; // across the rim
+        }
+        // Only edges a face of the slab crosses get a cut vertex: test those (the fields may also be
+        // clamped far from the slab, which is not a bend).
+        for (int e = 0; e < 3; ++e) {
+            const int    a = t[e], b = t[(e + 1) % 3];
+            const double fa = f[a], fb = f[b];
+            if (((fa - hk) * (fb - hk) >= 0.) && ((fa + hk) * (fb + hk) >= 0.)) continue;
+            if (std::abs(cutter.field((pos(a) + pos(b)) * 0.5) - 0.5 * (fa + fb)) > bend_tol) return ei;
+        }
+        return -1;
     };
     std::vector<size_t> cand;
     for (size_t i = 0; i < its.indices.size(); ++i)
