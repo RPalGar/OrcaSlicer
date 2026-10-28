@@ -217,6 +217,50 @@ TEST_CASE("A cut along a loop around a part still connected elsewhere is made an
     CHECK_FALSE(PathCut::joined_routes(res).empty());
 }
 
+TEST_CASE("A cut exactly along a loop around a pipe keeps its bore open in both pieces", "[PathCut]")
+{
+    // A pipe (outer r = 8, bore r = 4, h = 30) cut by a loop around its outside at mid height: the walls of
+    // the bore cross the cap and must be cut too, leaving the bore open, not closed over by the cap.
+    const double         R = 8., r = 4., h = 30.;
+    constexpr int        n = 48;
+    indexed_triangle_set pipe;
+    for (int ring = 0; ring < 4; ++ring) // outer bottom, outer top, inner bottom, inner top
+        for (int i = 0; i < n; ++i) {
+            const double a = 2. * PI * i / n, rr = ring < 2 ? R : r, z = ring % 2 ? h : 0.;
+            pipe.vertices.emplace_back(float(rr * std::cos(a)), float(rr * std::sin(a)), float(z));
+        }
+    auto v = [](int ring, int i) { return ring * n + (i + n) % n; };
+    for (int i = 0; i < n; ++i) {
+        pipe.indices.emplace_back(v(0, i), v(0, i + 1), v(1, i + 1)); // outside wall, facing out
+        pipe.indices.emplace_back(v(0, i), v(1, i + 1), v(1, i));
+        pipe.indices.emplace_back(v(2, i), v(3, i + 1), v(2, i + 1)); // bore wall, facing the axis
+        pipe.indices.emplace_back(v(2, i), v(3, i), v(3, i + 1));
+        pipe.indices.emplace_back(v(1, i), v(1, i + 1), v(3, i + 1)); // top ring, facing up
+        pipe.indices.emplace_back(v(1, i), v(3, i + 1), v(3, i));
+        pipe.indices.emplace_back(v(0, i), v(2, i + 1), v(0, i + 1)); // bottom ring, facing down
+        pipe.indices.emplace_back(v(0, i), v(2, i), v(2, i + 1));
+    }
+    const double full = PI * (R * R - r * r) * h;
+    REQUIRE_THAT(its_volume(pipe), WithinAbs(full, 0.02 * full));
+
+    std::vector<PathCut::V3> loop;
+    for (int k = 0; k < 12; ++k) {
+        const double a = 2. * PI * (k + 0.5) / 12.;
+        loop.emplace_back(R * std::cos(a), R * std::sin(a), 15. + 0.5 * std::sin(a));
+    }
+    const PathCut::LoopCutter lc = PathCut::make_loop_cutter(loop, 0.2, 1.5, [](const PathCut::V3 &p) { return p; }, false);
+    REQUIRE(lc.valid());
+    const PathCut::CutResult res = PathCut::cut_along_loop(pipe, lc, 1.5);
+    REQUIRE(res.error.empty());
+    const auto parts = its_split(res.mesh);
+    REQUIRE(parts.size() == 2);
+    require_closed_parts(parts);
+    // Each piece is half the pipe: with the bore closed over by the cap, the walls of the whole bore would
+    // stay with one piece and the volumes would be far apart.
+    for (const auto &p : parts)
+        CHECK_THAT(its_volume(p), WithinAbs(0.5 * full, 0.05 * full));
+}
+
 TEST_CASE("The preview draws the detached piece apart from the rest", "[PathCut]")
 {
     // A 10 mm cube resting on top of a 20 mm one: drawn 3 mm (the minimum) further up.

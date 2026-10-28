@@ -1128,206 +1128,18 @@ struct CutResult
     std::vector<signed char> level;     // per vertex: +1 / -1 on the cut face of that side, 0 elsewhere
 };
 
-// Removes the slab |field| < kerf / 2 from a closed mesh and closes the openings.
-//  cutter:  ViewCutter or LoopCutter (field, chart, lift).
-//  bounded: the slab only exists where cutter.outside(p) < 0 (loop cap).
-//  refine:  edges longer than this near the slab are split before clipping [mm].
-//  canceled: polled now and then; when it returns true the cut stops with an empty result.
+namespace detail {
+// Closes the openings left by a cut: chains the directed cut edges of each level (+1, -1) into loops,
+// triangulates them in the cutter's chart (outer loops with their holes), lifts the caps onto the level
+// set and refines them so they follow curved walls. Cut edges that receive cap vertices split the
+// triangle owning them (cut_owner: cut edge -> index in its.indices), keeping the mesh watertight.
+// Returns 0 when done, 1 on an error (in res.error), 2 when canceled.
 template<class Cutter>
-CutResult cut_with_slab(indexed_triangle_set its, const Cutter &cutter, bool bounded, double refine = 0.5,
-                        const std::function<bool()> &canceled = {})
+int close_cut_faces(indexed_triangle_set &its, std::vector<std::pair<int, int>> (&cap_edges)[2], const Cutter &cutter,
+                    const std::unordered_map<uint64_t, size_t> &cut_owner, CutResult &res, const std::function<bool()> &canceled)
 {
-    CutResult    res;
-    const double hk = 0.5 * cutter.kerf;
     auto stop = [&]() { return canceled && canceled(); };
-    auto pos  = [&](int v) -> V3 { return its.vertices[v].template cast<double>(); };
-
-    // Per-vertex field and distance outside the slab footprint.
-    std::vector<double> f, out;
-    auto eval = [&](size_t from) {
-        f.resize(its.vertices.size());
-        out.resize(its.vertices.size(), -1.);
-        for (size_t i = from; i < its.vertices.size(); ++i) {
-            const V3 p = pos(int(i));
-            f[i]       = cutter.field(p);
-            if (bounded) out[i] = cutter.outside(p);
-        }
-    };
-    eval(0);
-    if (stop()) return {};
-
-    // 1) Refine the triangles that may touch the slab. The fields grow at most ~1 mm per mm, so a
-    //    triangle whose closest vertex is more than ~2 edge lengths away from the slab cannot reach it.
-    auto needs_split = [&](const stl_triangle_vertex_indices &t) { // longest edge to split, or -1
-        double emax = 0.; int ei = 0;
-        for (int e = 0; e < 3; ++e) {
-            const double l = (pos(t[e]) - pos(t[(e + 1) % 3])).squaredNorm();
-            if (l > emax) { emax = l; ei = e; }
-        }
-        emax = std::sqrt(emax);
-        if (emax <= refine) return -1;
-        // (not called `near`: windows.h defines that as a macro)
-        double closest = std::numeric_limits<double>::max();
-        for (int e = 0; e < 3; ++e)
-            closest = std::min(closest, std::max(std::abs(f[t[e]]) - hk, out[t[e]]));
-        return closest < 2. * emax ? ei : -1;
-    };
-    std::vector<size_t> cand;
-    for (size_t i = 0; i < its.indices.size(); ++i)
-        if (needs_split(its.indices[i]) >= 0) cand.push_back(i);
-    for (int pass = 0; pass < 24 && !cand.empty(); ++pass) {
-        std::unordered_map<uint64_t, int> mid;
-        for (size_t i : cand) {
-            const auto &t  = its.indices[i];
-            const int   ei = needs_split(t);
-            if (ei >= 0) mid.emplace(edge_key(t[ei], t[(ei + 1) % 3]), -1);
-        }
-        if (mid.empty())
-            break;
-        const size_t nv0 = its.vertices.size();
-        std::vector<char> touched(nv0, 0);
-        for (auto &[k, idx] : mid) {
-            const int a = int(k >> 32), b = int(k & 0xffffffffu);
-            touched[a] = touched[b] = 1;
-            idx = int(its.vertices.size());
-            its.vertices.emplace_back(((pos(a) + pos(b)) * 0.5).template cast<float>());
-        }
-        eval(nv0);
-        // Only triangles with two touched vertices can hold a marked edge.
-        std::vector<size_t> hit;
-        for (size_t i = 0; i < its.indices.size(); ++i) {
-            const auto &t = its.indices[i];
-            if (int(touched[t[0]]) + int(touched[t[1]]) + int(touched[t[2]]) >= 2) hit.push_back(i);
-        }
-        const size_t n_before = its.indices.size();
-        detail::split_marked(its.indices, [&mid](int a, int b) { auto it = mid.find(edge_key(a, b)); return it == mid.end() ? -1 : it->second; }, &hit);
-        cand = std::move(hit);
-        for (size_t i = n_before; i < its.indices.size(); ++i) cand.push_back(i);
-        if (stop()) return {};
-    }
-
-    // Vertices lying (almost) on a level set would get crossings within float precision of them, i.e.
-    // coincident vertices and zero-area triangles. Nudge them off the level set, by a micrometre or so.
-    {
-        constexpr double snap = 2e-3, step = 1e-3;
-        for (size_t v = 0; v < its.vertices.size(); ++v) {
-            if (bounded && out[v] >= 0.) continue;
-            for (int level : {1, -1}) {
-                const double x = level > 0 ? f[v] - hk : -f[v] - hk;
-                if (std::abs(x) >= snap) continue;
-                const V3 p = pos(int(v));
-                V3       grad;
-                for (int k = 0; k < 3; ++k) {
-                    V3 d = V3::Zero();
-                    d[k] = step;
-                    grad[k] = (cutter.field(p + d) - cutter.field(p - d)) / (2. * step);
-                }
-                if (level < 0) grad = -grad;
-                const double gn = grad.norm();
-                if (gn < 1e-6) continue;
-                its.vertices[v] = (p + grad * ((snap - x) / (gn * gn))).template cast<float>();
-                f[v]            = cutter.field(pos(int(v)));
-                if (bounded) out[v] = cutter.outside(pos(int(v)));
-            }
-        }
-    }
-    // 2) Clip against f >= hk (level +1) and f <= -hk (level -1). Values exactly on a level are
-    //    nudged to the kept side so every crossing lies strictly inside its edge.
-    auto g = [&](int v, int level) {
-        const double x = level > 0 ? f[v] - hk : -f[v] - hk;
-        return std::abs(x) < 1e-5 ? 1e-5 : x;
-    };
-    // Parts of the model that cross a loop cap away from the loop are not cut (see foreign_bands).
-    std::vector<char> foreign;
-    if (bounded) foreign = foreign_bands(its, f, out, hk, cutter);
-    auto active_t = [&](size_t ti) {
-        const auto &t = its.indices[ti];
-        return !bounded || (out[t[0]] < 0. && out[t[1]] < 0. && out[t[2]] < 0. && (foreign.empty() || !foreign[ti]));
-    };
-    std::unordered_map<uint64_t, int> cross[2];
-    auto crossing = [&](int a, int b, int level) {
-        auto &m      = cross[level > 0 ? 0 : 1];
-        auto [it, ins] = m.emplace(edge_key(a, b), -1);
-        if (ins) {
-            // Put the crossing on the level set itself rather than where the linear interpolation of the
-            // field puts it, so the cut edges agree with the caps built on the exact level set
-            // (Illinois regula falsi, the field is cheap to evaluate).
-            const int    lo = std::min(a, b), hi = std::max(a, b);
-            const V3     pa = pos(lo), pb = pos(hi);
-            auto         gx = [&](double t) { const double x = cutter.field(pa + (pb - pa) * t); return level > 0 ? x - hk : -x - hk; };
-            double       t0 = 0., t1 = 1., g0 = g(lo, level), g1 = g(hi, level);
-            double       t  = g0 / (g0 - g1);
-            for (int iter = 0, side = 0; iter < 40; ++iter) {
-                t              = std::clamp((t0 * g1 - t1 * g0) / (g1 - g0), 0., 1.);
-                const double gt = gx(t);
-                if (std::abs(gt) < 1e-7 || (t1 - t0) < 1e-9) break;
-                if ((gt > 0.) == (g0 > 0.)) { t0 = t; g0 = gt; if (side == -1) g1 *= 0.5; side = -1; }
-                else                        { t1 = t; g1 = gt; if (side == 1) g0 *= 0.5; side = 1; }
-            }
-            it->second = int(its.vertices.size());
-            its.vertices.emplace_back((pa + (pb - pa) * t).template cast<float>());
-        }
-        return it->second;
-    };
-    std::vector<stl_triangle_vertex_indices> kept;
-    kept.reserve(its.indices.size() + its.indices.size() / 8);
-    std::vector<std::pair<int, int>> cap_edges[2]; // directed so the caps get the right winding
-    std::vector<size_t>              inactive_touching;
-    std::unordered_map<uint64_t, size_t> cut_owner;
-    std::unordered_map<uint64_t, int>    removed; // bounded cut only, values unused
-    for (size_t ti = 0; ti < its.indices.size(); ++ti) {
-        const auto &t = its.indices[ti];
-        if (!active_t(ti)) {
-            kept.push_back(t);
-            inactive_touching.push_back(ti);
-            continue;
-        }
-        if (bounded) // edges with both ends inside the slab disappear; an inactive neighbour must not use them
-            for (int e = 0; e < 3; ++e) {
-                const int a = t[e], b = t[(e + 1) % 3];
-                if (std::abs(f[a]) < hk && std::abs(f[b]) < hk) removed.emplace(edge_key(a, b), 0);
-            }
-        for (int level : {1, -1}) {
-            const bool k0 = g(t[0], level) > 0., k1 = g(t[1], level) > 0., k2 = g(t[2], level) > 0.;
-            if (!k0 && !k1 && !k2) continue;
-            if (k0 && k1 && k2) { kept.push_back(t); continue; }
-            const bool keep[3] = {k0, k1, k2};
-            int        poly[4], np = 0, first_cross = -1;
-            for (int i = 0; i < 3; ++i) {
-                const int a = t[i], b = t[(i + 1) % 3];
-                if (keep[i]) poly[np++] = a;
-                if (keep[i] != keep[(i + 1) % 3]) {
-                    if (keep[i]) first_cross = np; // the cut edge starts here
-                    poly[np++] = crossing(a, b, level);
-                }
-            }
-            const size_t base = kept.size();
-            for (int i = 1; i + 1 < np; ++i)
-                kept.emplace_back(poly[0], poly[i], poly[i + 1]);
-            // Kept polygon walks X_out -> X_in along the cut; the cap walks it backwards.
-            const int x0 = poly[first_cross], x1 = poly[(first_cross + 1) % np];
-            cap_edges[level > 0 ? 0 : 1].emplace_back(x1, x0);
-            // Fan triangle that holds the cut edge, in case a cap vertex gets inserted on it.
-            const int fan = first_cross == 0 ? 1 : first_cross == np - 1 ? np - 2 : first_cross;
-            cut_owner.emplace(edge_key(x0, x1), base + size_t(fan - 1));
-        }
-        if ((ti & 0xffff) == 0 && stop()) return {};
-    }
-    // A triangle outside the cap footprint must not border a clipped one: that means the surface
-    // runs through the rim of the cap, i.e. the loop does not go all the way around the part.
-    if (bounded)
-        for (size_t ti : inactive_touching) {
-            const auto &t = its.indices[ti];
-            for (int e = 0; e < 3; ++e)
-                for (auto *m : {&cross[0], &cross[1], &removed})
-                    if (m->count(edge_key(t[e], t[(e + 1) % 3]))) {
-                        res.error = cutter.rim_error();
-                        return res;
-                    }
-        }
-    its.indices   = std::move(kept);
-    res.first_cap = its.indices.size();
-
+    auto pos  = [&](int v) -> V3 { return its.vertices[size_t(v)].template cast<double>(); };
     // 3) Close the openings: chain the cut edges into loops, triangulate them in the chart of their
     //    level set and refine the caps so they follow curved walls.
     const double sag_tol = std::max(0.1, 0.25 * cutter.kerf); // 0.1 mm: half a layer; finer only multiplies the cap triangles
@@ -1355,7 +1167,7 @@ CutResult cut_with_slab(indexed_triangle_set its, const Cutter &cutter, bool bou
                 for (size_t c : outgoing[to]) if (!used[c]) { next = c; break; }
                 if (next == size_t(-1)) {
                     res.error = "The model has holes along the cut, so the cut faces cannot be closed. Repair the model first.";
-                    return res;
+                    return 1;
                 }
                 e = next;
             }
@@ -1601,7 +1413,7 @@ CutResult cut_with_slab(indexed_triangle_set its, const Cutter &cutter, bool bou
                 for (int k = 0; k < 3; ++k) res.level[size_t(t[k])] = static_cast<signed char>(level);
             its.indices.insert(its.indices.end(), cap.begin(), cap.end());
         }
-        if (stop()) return {};
+        if (stop()) return 2;
     }
     // Split the clipped triangles whose cut edge received cap vertices.
     for (auto &[k, xs] : inserts) {
@@ -1617,6 +1429,216 @@ CutResult cut_with_slab(indexed_triangle_set its, const Cutter &cutter, bool bou
         chain.push_back(b);
         its.indices[ti] = {chain[0], chain[1], o};
         for (size_t j = 1; j + 1 < chain.size(); ++j) its.indices.emplace_back(chain[j], chain[j + 1], o);
+    }
+    return 0;
+}
+} // namespace detail
+
+// Removes the slab |field| < kerf / 2 from a closed mesh and closes the openings.
+//  cutter:  ViewCutter or LoopCutter (field, chart, lift).
+//  bounded: the slab only exists where cutter.outside(p) < 0 (loop cap).
+//  refine:  edges longer than this near the slab are split before clipping [mm].
+//  canceled: polled now and then; when it returns true the cut stops with an empty result.
+template<class Cutter>
+CutResult cut_with_slab(indexed_triangle_set its, const Cutter &cutter, bool bounded, double refine = 0.5,
+                        const std::function<bool()> &canceled = {})
+{
+    CutResult    res;
+    const double hk = 0.5 * cutter.kerf;
+    auto stop = [&]() { return canceled && canceled(); };
+    auto pos  = [&](int v) -> V3 { return its.vertices[v].template cast<double>(); };
+
+    // Per-vertex field and distance outside the slab footprint.
+    std::vector<double> f, out;
+    auto eval = [&](size_t from) {
+        f.resize(its.vertices.size());
+        out.resize(its.vertices.size(), -1.);
+        for (size_t i = from; i < its.vertices.size(); ++i) {
+            const V3 p = pos(int(i));
+            f[i]       = cutter.field(p);
+            if (bounded) out[i] = cutter.outside(p);
+        }
+    };
+    eval(0);
+    if (stop()) return {};
+
+    // 1) Refine the triangles that may touch the slab. The fields grow at most ~1 mm per mm, so a
+    //    triangle whose closest vertex is more than ~2 edge lengths away from the slab cannot reach it.
+    auto needs_split = [&](const stl_triangle_vertex_indices &t) { // longest edge to split, or -1
+        double emax = 0.; int ei = 0;
+        for (int e = 0; e < 3; ++e) {
+            const double l = (pos(t[e]) - pos(t[(e + 1) % 3])).squaredNorm();
+            if (l > emax) { emax = l; ei = e; }
+        }
+        emax = std::sqrt(emax);
+        if (emax <= refine) return -1;
+        // (not called `near`: windows.h defines that as a macro)
+        double closest = std::numeric_limits<double>::max();
+        for (int e = 0; e < 3; ++e)
+            closest = std::min(closest, std::max(std::abs(f[t[e]]) - hk, out[t[e]]));
+        return closest < 2. * emax ? ei : -1;
+    };
+    std::vector<size_t> cand;
+    for (size_t i = 0; i < its.indices.size(); ++i)
+        if (needs_split(its.indices[i]) >= 0) cand.push_back(i);
+    for (int pass = 0; pass < 24 && !cand.empty(); ++pass) {
+        std::unordered_map<uint64_t, int> mid;
+        for (size_t i : cand) {
+            const auto &t  = its.indices[i];
+            const int   ei = needs_split(t);
+            if (ei >= 0) mid.emplace(edge_key(t[ei], t[(ei + 1) % 3]), -1);
+        }
+        if (mid.empty())
+            break;
+        const size_t nv0 = its.vertices.size();
+        std::vector<char> touched(nv0, 0);
+        for (auto &[k, idx] : mid) {
+            const int a = int(k >> 32), b = int(k & 0xffffffffu);
+            touched[a] = touched[b] = 1;
+            idx = int(its.vertices.size());
+            its.vertices.emplace_back(((pos(a) + pos(b)) * 0.5).template cast<float>());
+        }
+        eval(nv0);
+        // Only triangles with two touched vertices can hold a marked edge.
+        std::vector<size_t> hit;
+        for (size_t i = 0; i < its.indices.size(); ++i) {
+            const auto &t = its.indices[i];
+            if (int(touched[t[0]]) + int(touched[t[1]]) + int(touched[t[2]]) >= 2) hit.push_back(i);
+        }
+        const size_t n_before = its.indices.size();
+        detail::split_marked(its.indices, [&mid](int a, int b) { auto it = mid.find(edge_key(a, b)); return it == mid.end() ? -1 : it->second; }, &hit);
+        cand = std::move(hit);
+        for (size_t i = n_before; i < its.indices.size(); ++i) cand.push_back(i);
+        if (stop()) return {};
+    }
+
+    // Vertices lying (almost) on a level set would get crossings within float precision of them, i.e.
+    // coincident vertices and zero-area triangles. Nudge them off the level set, by a micrometre or so.
+    {
+        constexpr double snap = 2e-3, step = 1e-3;
+        for (size_t v = 0; v < its.vertices.size(); ++v) {
+            if (bounded && out[v] >= 0.) continue;
+            for (int level : {1, -1}) {
+                const double x = level > 0 ? f[v] - hk : -f[v] - hk;
+                if (std::abs(x) >= snap) continue;
+                const V3 p = pos(int(v));
+                V3       grad;
+                for (int k = 0; k < 3; ++k) {
+                    V3 d = V3::Zero();
+                    d[k] = step;
+                    grad[k] = (cutter.field(p + d) - cutter.field(p - d)) / (2. * step);
+                }
+                if (level < 0) grad = -grad;
+                const double gn = grad.norm();
+                if (gn < 1e-6) continue;
+                its.vertices[v] = (p + grad * ((snap - x) / (gn * gn))).template cast<float>();
+                f[v]            = cutter.field(pos(int(v)));
+                if (bounded) out[v] = cutter.outside(pos(int(v)));
+            }
+        }
+    }
+    // 2) Clip against f >= hk (level +1) and f <= -hk (level -1). Values exactly on a level are
+    //    nudged to the kept side so every crossing lies strictly inside its edge.
+    auto g = [&](int v, int level) {
+        const double x = level > 0 ? f[v] - hk : -f[v] - hk;
+        return std::abs(x) < 1e-5 ? 1e-5 : x;
+    };
+    // Parts of the model that cross a loop cap away from the loop are not cut (see foreign_bands).
+    std::vector<char> foreign;
+    if (bounded) foreign = foreign_bands(its, f, out, hk, cutter);
+    auto active_t = [&](size_t ti) {
+        const auto &t = its.indices[ti];
+        return !bounded || (out[t[0]] < 0. && out[t[1]] < 0. && out[t[2]] < 0. && (foreign.empty() || !foreign[ti]));
+    };
+    std::unordered_map<uint64_t, int> cross[2];
+    auto crossing = [&](int a, int b, int level) {
+        auto &m      = cross[level > 0 ? 0 : 1];
+        auto [it, ins] = m.emplace(edge_key(a, b), -1);
+        if (ins) {
+            // Put the crossing on the level set itself rather than where the linear interpolation of the
+            // field puts it, so the cut edges agree with the caps built on the exact level set
+            // (Illinois regula falsi, the field is cheap to evaluate).
+            const int    lo = std::min(a, b), hi = std::max(a, b);
+            const V3     pa = pos(lo), pb = pos(hi);
+            auto         gx = [&](double t) { const double x = cutter.field(pa + (pb - pa) * t); return level > 0 ? x - hk : -x - hk; };
+            double       t0 = 0., t1 = 1., g0 = g(lo, level), g1 = g(hi, level);
+            double       t  = g0 / (g0 - g1);
+            for (int iter = 0, side = 0; iter < 40; ++iter) {
+                t              = std::clamp((t0 * g1 - t1 * g0) / (g1 - g0), 0., 1.);
+                const double gt = gx(t);
+                if (std::abs(gt) < 1e-7 || (t1 - t0) < 1e-9) break;
+                if ((gt > 0.) == (g0 > 0.)) { t0 = t; g0 = gt; if (side == -1) g1 *= 0.5; side = -1; }
+                else                        { t1 = t; g1 = gt; if (side == 1) g0 *= 0.5; side = 1; }
+            }
+            it->second = int(its.vertices.size());
+            its.vertices.emplace_back((pa + (pb - pa) * t).template cast<float>());
+        }
+        return it->second;
+    };
+    std::vector<stl_triangle_vertex_indices> kept;
+    kept.reserve(its.indices.size() + its.indices.size() / 8);
+    std::vector<std::pair<int, int>> cap_edges[2]; // directed so the caps get the right winding
+    std::vector<size_t>              inactive_touching;
+    std::unordered_map<uint64_t, size_t> cut_owner;
+    std::unordered_map<uint64_t, int>    removed; // bounded cut only, values unused
+    for (size_t ti = 0; ti < its.indices.size(); ++ti) {
+        const auto &t = its.indices[ti];
+        if (!active_t(ti)) {
+            kept.push_back(t);
+            inactive_touching.push_back(ti);
+            continue;
+        }
+        if (bounded) // edges with both ends inside the slab disappear; an inactive neighbour must not use them
+            for (int e = 0; e < 3; ++e) {
+                const int a = t[e], b = t[(e + 1) % 3];
+                if (std::abs(f[a]) < hk && std::abs(f[b]) < hk) removed.emplace(edge_key(a, b), 0);
+            }
+        for (int level : {1, -1}) {
+            const bool k0 = g(t[0], level) > 0., k1 = g(t[1], level) > 0., k2 = g(t[2], level) > 0.;
+            if (!k0 && !k1 && !k2) continue;
+            if (k0 && k1 && k2) { kept.push_back(t); continue; }
+            const bool keep[3] = {k0, k1, k2};
+            int        poly[4], np = 0, first_cross = -1;
+            for (int i = 0; i < 3; ++i) {
+                const int a = t[i], b = t[(i + 1) % 3];
+                if (keep[i]) poly[np++] = a;
+                if (keep[i] != keep[(i + 1) % 3]) {
+                    if (keep[i]) first_cross = np; // the cut edge starts here
+                    poly[np++] = crossing(a, b, level);
+                }
+            }
+            const size_t base = kept.size();
+            for (int i = 1; i + 1 < np; ++i)
+                kept.emplace_back(poly[0], poly[i], poly[i + 1]);
+            // Kept polygon walks X_out -> X_in along the cut; the cap walks it backwards.
+            const int x0 = poly[first_cross], x1 = poly[(first_cross + 1) % np];
+            cap_edges[level > 0 ? 0 : 1].emplace_back(x1, x0);
+            // Fan triangle that holds the cut edge, in case a cap vertex gets inserted on it.
+            const int fan = first_cross == 0 ? 1 : first_cross == np - 1 ? np - 2 : first_cross;
+            cut_owner.emplace(edge_key(x0, x1), base + size_t(fan - 1));
+        }
+        if ((ti & 0xffff) == 0 && stop()) return {};
+    }
+    // A triangle outside the cap footprint must not border a clipped one: that means the surface
+    // runs through the rim of the cap, i.e. the loop does not go all the way around the part.
+    if (bounded)
+        for (size_t ti : inactive_touching) {
+            const auto &t = its.indices[ti];
+            for (int e = 0; e < 3; ++e)
+                for (auto *m : {&cross[0], &cross[1], &removed})
+                    if (m->count(edge_key(t[e], t[(e + 1) % 3]))) {
+                        res.error = cutter.rim_error();
+                        return res;
+                    }
+        }
+    its.indices   = std::move(kept);
+    res.first_cap = its.indices.size();
+
+    // 3) Close the openings.
+    switch (detail::close_cut_faces(its, cap_edges, cutter, cut_owner, res, canceled)) {
+    case 1: return res;
+    case 2: return {};
+    default: break;
     }
     res.level.resize(its.vertices.size(), 0);
     for (int li = 0; li < 2; ++li)
@@ -1751,7 +1773,59 @@ inline CutResult cut_along_loop(indexed_triangle_set its, const LoopCutter &lc, 
     }
     if (stop()) return {};
 
-    // Split the surface along the chain: every crossed edge gets one vertex per side.
+    // Other surfaces may cross the cap inside the loop: the walls of a hole or a hollow in the part. They
+    // are cut by the cap like a slab cut does, so their openings become holes in the cut faces (otherwise
+    // the cap would close over them and fill the hole). Found before the chain is split: bands of triangles
+    // crossing the slab |field| < kerf / 2, those inside the loop and not along the loop itself.
+    const double hk = 0.5 * lc.kerf;
+    const size_t nt0 = its.indices.size();
+    auto crosses_slab = [&](const stl_triangle_vertex_indices &t) {
+        const double g0 = g[t[0]], g1 = g[t[1]], g2 = g[t[2]];
+        return !(std::min({g0, g1, g2}) >= hk || std::max({g0, g1, g2}) <= -hk);
+    };
+    std::vector<char> interior(nt0, 0);
+    {
+        std::vector<V2> ring2d;
+        for (uint64_t k : chain_edges) ring2d.push_back(lc.frame.to2d(xpos[k]));
+        std::unordered_set<size_t> on_chain(chain_tris.begin(), chain_tris.end());
+        std::vector<int> comp(nt0, -1);
+        std::unordered_map<uint64_t, std::vector<uint32_t>> by_edge;
+        for (size_t ti = 0; ti < nt0; ++ti)
+            if (crosses_slab(its.indices[ti])) {
+                comp[ti] = -2;
+                const auto &t = its.indices[ti];
+                for (int e = 0; e < 3; ++e) by_edge[edge_key(t[e], t[(e + 1) % 3])].push_back(uint32_t(ti));
+            }
+        std::vector<size_t> stack, band;
+        for (size_t s = 0; s < nt0; ++s) {
+            if (comp[s] != -2) continue;
+            comp[s] = 0;
+            stack.assign(1, s);
+            band.clear();
+            bool rim = false;
+            while (!stack.empty()) {
+                const size_t ti = stack.back(); stack.pop_back();
+                band.push_back(ti);
+                rim = rim || on_chain.count(ti) > 0;
+                const auto &t = its.indices[ti];
+                for (int e = 0; e < 3; ++e)
+                    for (uint32_t nb : by_edge[edge_key(t[e], t[(e + 1) % 3])])
+                        if (comp[nb] == -2) { comp[nb] = 0; stack.push_back(nb); }
+            }
+            if (rim) continue;
+            const auto &t0 = its.indices[band.front()];
+            const V3    c  = (pos(t0[0]) + pos(t0[1]) + pos(t0[2])) / 3.;
+            if (point_in_polygon(ring2d, lc.frame.to2d(c)))
+                for (size_t ti : band) interior[ti] = 1;
+        }
+    }
+    if (stop()) return {};
+
+    // Split the surface along the chain: every crossed edge gets one vertex per side. The openings along
+    // the chain are closed below with the other cut faces: their edges, walked against the surface on
+    // each side, and the triangle holding each.
+    std::vector<std::pair<int, int>>     cap_edges[2]; // [0]: level +1 (positive side), [1]: level -1
+    std::unordered_map<uint64_t, size_t> cut_owner;
     std::unordered_map<uint64_t, std::array<int, 2>> xv; // [0]: positive side, [1]: negative side
     for (uint64_t k : chain_edges) {
         const int a = int(its.vertices.size());
@@ -1759,7 +1833,6 @@ inline CutResult cut_along_loop(indexed_triangle_set its, const LoopCutter &lc, 
         its.vertices.emplace_back(xpos[k].template cast<float>());
         xv[k] = {a, a + 1};
     }
-    std::vector<stl_triangle_vertex_indices> split;
     for (size_t ti : chain_tris) {
         const auto t = its.indices[ti];
         int lone = 0; // the vertex alone on its side
@@ -1767,66 +1840,106 @@ inline CutResult cut_along_loop(indexed_triangle_set its, const LoopCutter &lc, 
             if ((g[t[e]] > 0.) != (g[t[(e + 1) % 3]] > 0.) && (g[t[e]] > 0.) != (g[t[(e + 2) % 3]] > 0.)) lone = e;
         const int  v0 = t[lone], v1 = t[(lone + 1) % 3], v2 = t[(lone + 2) % 3];
         const int  s0 = g[v0] > 0. ? 0 : 1, s1 = 1 - s0;
-        const auto &x01 = xv[edge_key(v0, v1)], &x02 = xv[edge_key(v0, v2)];
+        const std::array<int, 2> x01 = xv[edge_key(v0, v1)], x02 = xv[edge_key(v0, v2)];
         its.indices[ti] = stl_triangle_vertex_indices(v0, x01[s0], x02[s0]);
-        split.emplace_back(x01[s1], v1, v2);
-        split.emplace_back(x01[s1], v2, x02[s1]);
+        cap_edges[s0].emplace_back(x02[s0], x01[s0]);
+        cut_owner.emplace(edge_key(x01[s0], x02[s0]), ti);
+        const size_t i1 = its.indices.size();
+        its.indices.emplace_back(x01[s1], v1, v2);
+        its.indices.emplace_back(x01[s1], v2, x02[s1]);
+        cap_edges[s1].emplace_back(x01[s1], x02[s1]);
+        cut_owner.emplace(edge_key(x01[s1], x02[s1]), i1 + 1);
     }
-    for (const auto &t : split) its.indices.push_back(t);
 
     // The surface on both sides of the chain may still be connected elsewhere (an arm whose hand rests on
     // a leg): the cut is made anyway, group_cut reports it as joined, and the remaining connection is cut next.
 
-    // Caps: rings shrinking from the chain to the loop's centre, on the cap surface, moved by half the kerf
-    // towards their own piece away from the rim.
-    const size_t n = chain_edges.size();
-    double       rmax = 0.;
-    for (uint64_t k : chain_edges) rmax = std::max(rmax, (lc.frame.to2d(xpos[k]) - lc.center2d).norm());
-    const int rings = std::clamp(int(rmax / 1.5), 2, 40);
-    res.first_cap   = its.indices.size();
-    res.level.assign(its.vertices.size(), 0);
-    for (uint64_t k : chain_edges) { res.level[size_t(xv[k][0])] = 1; res.level[size_t(xv[k][1])] = -1; }
-    for (int side = 0; side < 2; ++side) {
-        const int    level = side == 0 ? 1 : -1;
-        const size_t first = its.indices.size();
-        std::vector<int> prev(n);
-        for (size_t i = 0; i < n; ++i) prev[i] = xv[chain_edges[i]][side];
-        for (int r = rings - 1; r >= 0; --r) {
-            const double f = double(r) / double(rings);
-            std::vector<int> cur(n);
-            if (r == 0) {
-                const int c = int(its.vertices.size());
-                its.vertices.emplace_back(lc.lift(lc.center2d, level).template cast<float>());
-                std::fill(cur.begin(), cur.end(), c);
-            } else
-                for (size_t i = 0; i < n; ++i) {
-                    const V2 q = lc.center2d + (lc.frame.to2d(xpos[chain_edges[i]]) - lc.center2d) * f;
-                    cur[i]     = int(its.vertices.size());
-                    its.vertices.emplace_back(lc.lift(q, level).template cast<float>());
-                }
-            for (size_t i = 0; i < n; ++i) {
-                const size_t j = (i + 1) % n;
-                its.indices.emplace_back(prev[i], prev[j], cur[j]);
-                if (cur[i] != cur[j]) its.indices.emplace_back(prev[i], cur[j], cur[i]);
+    // Clip the inner surfaces against both faces of the slab (f >= kerf / 2: level +1, f <= -kerf / 2: level
+    // -1), as cut_with_slab does. A clipped triangle is replaced by its kept pieces, appended; its slot is
+    // left empty and dropped at the end.
+    auto gl = [&](int v, int level) {
+        const double x = level > 0 ? g[v] - hk : -g[v] - hk;
+        return std::abs(x) < 1e-5 ? 1e-5 : x;
+    };
+    std::unordered_map<uint64_t, int> cross[2];
+    auto crossing = [&](int a, int b, int level) {
+        auto &m        = cross[level > 0 ? 0 : 1];
+        auto [it, ins] = m.emplace(edge_key(a, b), -1);
+        if (ins) {
+            // On the level set itself (regula falsi on the field), so the cut edges agree with the caps.
+            const int lo = std::min(a, b), hi = std::max(a, b);
+            const V3  pa = pos(lo), pb = pos(hi);
+            auto      gx = [&](double t) { const double x = lc.field(pa + (pb - pa) * t); return level > 0 ? x - hk : -x - hk; };
+            double    t0 = 0., t1 = 1., g0 = gl(lo, level), g1 = gl(hi, level);
+            double    t  = g0 / (g0 - g1);
+            for (int iter = 0, side = 0; iter < 40; ++iter) {
+                t               = std::clamp((t0 * g1 - t1 * g0) / (g1 - g0), 0., 1.);
+                const double gt = gx(t);
+                if (std::abs(gt) < 1e-7 || (t1 - t0) < 1e-9) break;
+                if ((gt > 0.) == (g0 > 0.)) { t0 = t; g0 = gt; if (side == -1) g1 *= 0.5; side = -1; }
+                else                        { t1 = t; g1 = gt; if (side == 1) g0 *= 0.5; side = 1; }
             }
-            prev = std::move(cur);
+            it->second = int(its.vertices.size());
+            its.vertices.emplace_back((pa + (pb - pa) * t).template cast<float>());
         }
-        res.level.resize(its.vertices.size(), 0);
-        for (size_t v = res.level.size(); v-- > 0 && res.level[v] == 0 && v >= nv0 + 2 * n;) res.level[v] = static_cast<signed char>(level);
-        // Orient the cap with the surface it closes: each chain edge must be walked opposite to the surface.
-        std::unordered_set<uint64_t> surf_dir;
-        const int a0 = xv[chain_edges[0]][side], a1 = xv[chain_edges[1 % n]][side];
-        for (size_t ti = 0; ti < first; ++ti) {
-            const auto &t = its.indices[ti];
-            for (int e = 0; e < 3; ++e)
-                if (t[e] == a0 && t[(e + 1) % 3] == a1) {
-                    for (size_t c = first; c < its.indices.size(); ++c) std::swap(its.indices[c][1], its.indices[c][2]);
-                    break;
+        return it->second;
+    };
+    const stl_triangle_vertex_indices dropped(0, 0, 0);
+    for (size_t ti = 0; ti < nt0; ++ti) {
+        if (!interior[ti]) continue;
+        const auto t   = its.indices[ti];
+        its.indices[ti] = dropped;
+        for (int level : {1, -1}) {
+            const bool k0 = gl(t[0], level) > 0., k1 = gl(t[1], level) > 0., k2 = gl(t[2], level) > 0.;
+            if (!k0 && !k1 && !k2) continue;
+            if (k0 && k1 && k2) { its.indices.push_back(t); continue; }
+            const bool keep[3] = {k0, k1, k2};
+            int        poly[4], np = 0, first_cross = -1;
+            for (int i = 0; i < 3; ++i) {
+                const int a = t[i], b = t[(i + 1) % 3];
+                if (keep[i]) poly[np++] = a;
+                if (keep[i] != keep[(i + 1) % 3]) {
+                    if (keep[i]) first_cross = np;
+                    poly[np++] = crossing(a, b, level);
                 }
+            }
+            const size_t base = its.indices.size();
+            for (int i = 1; i + 1 < np; ++i) its.indices.emplace_back(poly[0], poly[i], poly[i + 1]);
+            const int x0 = poly[first_cross], x1 = poly[(first_cross + 1) % np];
+            cap_edges[level > 0 ? 0 : 1].emplace_back(x1, x0);
+            const int fan = first_cross == 0 ? 1 : first_cross == np - 1 ? np - 2 : first_cross;
+            cut_owner.emplace(edge_key(x0, x1), base + size_t(fan - 1));
         }
     }
-    res.cap_triangles = its.indices.size() - res.first_cap;
-    res.mesh          = std::move(its);
+    if (stop()) return {};
+
+    // Cut faces: the cap spanning the chain on each side, moved by half the kerf towards its own piece away
+    // from the rim, with the openings of the inner surfaces as holes.
+    res.first_cap = its.indices.size();
+    res.level.assign(its.vertices.size(), 0);
+    switch (detail::close_cut_faces(its, cap_edges, lc, cut_owner, res, canceled)) {
+    case 1: return res;
+    case 2: return {};
+    default: break;
+    }
+    res.level.resize(its.vertices.size(), 0);
+    for (uint64_t k : chain_edges) { res.level[size_t(xv[k][0])] = 1; res.level[size_t(xv[k][1])] = -1; }
+    for (int li = 0; li < 2; ++li)
+        for (const auto &kv : cross[li]) res.level[size_t(kv.second)] = static_cast<signed char>(li == 0 ? 1 : -1);
+    // Drop the emptied slots (all before the caps).
+    size_t n_dropped = 0;
+    {
+        std::vector<stl_triangle_vertex_indices> kept;
+        kept.reserve(its.indices.size());
+        for (size_t i = 0; i < its.indices.size(); ++i) {
+            const auto &t = its.indices[i];
+            if (i < nt0 && t[0] == t[1] && t[1] == t[2]) { ++n_dropped; continue; }
+            kept.push_back(t);
+        }
+        its.indices = std::move(kept);
+    }
+    res.first_cap -= n_dropped;
+    res.mesh = std::move(its);
     return res;
 }
 
