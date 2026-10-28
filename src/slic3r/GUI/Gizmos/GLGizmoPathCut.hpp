@@ -73,6 +73,7 @@ private:
     // While placing, the connector under the mouse is shown as it would be placed: green where it
     // fits, red where it does not (a click there places nothing). Its tooltip says why.
     void               update_hover(const Vec2d &mouse_pos);
+    bool               force_connector(PathCut::ConnectorFit why) const;
     void               clear_hover();
     // Cuts already made on an object still in one piece (multi-cut): their faces and where it is still
     // connected, world coordinates, shown while the next cut is marked.
@@ -108,6 +109,7 @@ private:
     // Straight connectors across the cut face (pegs into holes, or separate pins), placed automatically.
     PathCut::ConnectorParams m_conn;
     bool               m_conn_manual{false};     // the user clicks where each connector goes
+    bool               m_conn_force{false};      // ... and it goes there even where the checks say it does not fit
     std::string        m_message;
     bool               m_message_is_error{false};
     const ModelObject *m_object{nullptr};        // object the points were picked on

@@ -56,6 +56,7 @@ static const ColorRGBA PREVIEW_MOVED_COLOR = {0.95f, 0.62f, 0.25f, 1.f};
 static const ColorRGBA PREVIEW_PEG_COLOR   = {0.15f, 0.75f, 0.35f, 1.f};
 static const ColorRGBA HOVER_FITS_COLOR    = {0.2f, 1.f, 0.4f, 0.5f};  // connector under the mouse: it fits
 static const ColorRGBA HOVER_NO_FIT_COLOR  = {1.f, 0.15f, 0.15f, 0.6f}; // it does not fit there
+static const ColorRGBA HOVER_FORCED_COLOR  = {1.f, 0.6f, 0.05f, 0.6f};  // it does not fit there, but goes there anyway
 static const ColorRGBA DONE_CUT_COLOR      = {1.f, 0.55f, 0.f, 0.45f};  // faces of the cuts already made on the object
 
 // What of the connectors is shown on the cut face: the pegs, or the holes of the pins.
@@ -111,7 +112,8 @@ std::string GLGizmoPathCut::on_get_name() const { return _u8L("Cut along path");
 std::string GLGizmoPathCut::get_tooltip() const
 {
     if (m_placing && m_hover_on && m_hover_fit != PathCut::ConnectorFit::Ok)
-        return _u8L(PathCut::connector_fit_message(m_hover_fit));
+        return force_connector(m_hover_fit) ? _u8L("It does not fit there, but it will be placed anyway: check the pieces.") :
+                                              _u8L(PathCut::connector_fit_message(m_hover_fit));
     return "";
 }
 
@@ -531,7 +533,9 @@ void GLGizmoPathCut::on_render()
                 m_conn_model.render();
             }
             if (m_hover_on && m_hover_model.is_initialized()) {
-                m_hover_model.set_color(m_hover_fit == PathCut::ConnectorFit::Ok ? HOVER_FITS_COLOR : HOVER_NO_FIT_COLOR);
+                m_hover_model.set_color(m_hover_fit == PathCut::ConnectorFit::Ok ? HOVER_FITS_COLOR :
+                                        force_connector(m_hover_fit)    ? HOVER_FORCED_COLOR :
+                                                                          HOVER_NO_FIT_COLOR);
                 m_hover_model.render();
             }
             shader->stop_using();
@@ -960,6 +964,22 @@ void GLGizmoPathCut::on_render_input_window(float x, float y, float bottom_limit
         float_row(_u8L("Diameter / side (mm)"), "##pathcut_conn_size", m_conn.size, 0.5f, 1.f, 50.f, "%.1f");
         float_row(_u8L("Depth (mm)"), "##pathcut_conn_depth", m_conn.depth, 0.5f, 1.f, 50.f, "%.1f");
         float_row(_u8L("Hole clearance (mm)"), "##pathcut_conn_tol", m_conn.clearance, 0.05f, 0.f, 1.f, "%.2f");
+        // All connectors share one direction (or the pieces could not come apart): tilted by hand if wanted.
+        float_row(_u8L("Connector tilt (deg)"), "##pathcut_conn_tilt", m_conn.tilt, 1.f, 0.f, 60.f, "%.0f");
+        if (ImGui::IsItemHovered())
+            m_imgui->tooltip(_u8L("Tilts all the connectors away from the direction the pieces come apart in. They stay "
+                                  "parallel, so the pieces still come apart, along the new direction."),
+                             ImGui::GetFontSize() * 20.f);
+        if (m_conn.tilt > 0.)
+            float_row(_u8L("Tilt towards (deg)"), "##pathcut_conn_turn", m_conn.turn, 5.f, -180.f, 180.f, "%.0f");
+        if (m_conn_manual) {
+            if (m_imgui->bbl_checkbox(_L("Place even where it does not fit"), m_conn_force) && m_placing)
+                update_hover(m_hover_pos);
+            if (ImGui::IsItemHovered())
+                m_imgui->tooltip(_u8L("A click places the connector where the checks say it does not fit (shown in orange). "
+                                      "Its hole is still cut with the clearance set. Check the pieces before printing."),
+                                 ImGui::GetFontSize() * 20.f);
+        }
         ImGui::PushTextWrapPos(ImGui::GetFontSize() * 26.f);
         if (m_conn_manual)
             m_imgui->text(_u8L("Straight connectors along the mean direction of the cut face. After the cut is computed, click on "
@@ -1305,8 +1325,11 @@ void GLGizmoPathCut::add_connector(const Vec3d &hit_world)
     if (!m_pending || !m_pending->placer || !m_pending->placer->error().empty())
         return;
     PathCut::ConnectorSpot   spot;
-    const PathCut::ConnectorFit why = m_pending->placer->try_at(PathCut::V3(hit_world - m_placing_offset), spot, m_spots);
-    if (why == PathCut::ConnectorFit::Ok) {
+    const PathCut::V3        p   = PathCut::V3(hit_world - m_placing_offset);
+    const PathCut::ConnectorFit why = m_pending->placer->try_at(p, spot, m_spots);
+    if (force_connector(why))
+        spot = m_pending->placer->forced_at(p);
+    if (why == PathCut::ConnectorFit::Ok || force_connector(why)) {
         m_spots.push_back(spot);
         rebuild_connector_preview();
         m_message.clear();
@@ -1342,8 +1365,11 @@ void GLGizmoPathCut::connectors_changed()
         std::vector<PathCut::ConnectorSpot> kept;
         for (const PathCut::ConnectorSpot &old : m_spots) {
             PathCut::ConnectorSpot spot;
-            if (st.placer->try_at(old.p, spot, kept) == PathCut::ConnectorFit::Ok)
+            const PathCut::ConnectorFit why = st.placer->try_at(old.p, spot, kept);
+            if (why == PathCut::ConnectorFit::Ok)
                 kept.push_back(spot);
+            else if (old.forced && force_connector(why))
+                kept.push_back(st.placer->forced_at(old.p));
         }
         if (kept.size() < m_spots.size()) {
             m_message          = GUI::format(_u8L("%1% of the placed connectors no longer fit with these settings and were removed."),
@@ -1379,11 +1405,8 @@ void GLGizmoPathCut::update_hover(const Vec2d &mouse_pos)
     const PathCut::V3               p      = PathCut::V3(hit - m_placing_offset);
     PathCut::ConnectorSpot          spot;
     m_hover_fit = placer.try_at(p, spot, m_spots);
-    if (m_hover_fit != PathCut::ConnectorFit::Ok) {
-        // It does not fit: show it at the mouse with its plain size (nothing measured there).
-        spot   = PathCut::ConnectorSpot();
-        spot.p = p;
-    }
+    if (m_hover_fit != PathCut::ConnectorFit::Ok)
+        spot = placer.forced_at(p); // shown (and placed, if forced) as it would go there
     init_connector_model(m_hover_model, placer.build({spot}));
     m_hover_on = m_hover_model.is_initialized();
     m_parent.set_as_dirty();
@@ -1396,6 +1419,12 @@ void GLGizmoPathCut::clear_hover()
     m_hover_on = false;
     m_hover_model.reset();
     m_parent.set_as_dirty();
+}
+
+// Manual connectors placed even where they do not fit, when the user asks for it (not off the cut face).
+bool GLGizmoPathCut::force_connector(PathCut::ConnectorFit why) const
+{
+    return m_conn_force && why != PathCut::ConnectorFit::Ok && why != PathCut::ConnectorFit::OffFace;
 }
 
 void GLGizmoPathCut::rebuild_done()

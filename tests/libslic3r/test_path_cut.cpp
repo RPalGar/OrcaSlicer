@@ -577,6 +577,33 @@ TEST_CASE("A connector that does not fit is still drawn where it was tried", "[P
     CHECK_THAT(c.positions.front().x(), WithinAbs(edge.x(), 1e-9));
 }
 
+TEST_CASE("Connectors tilted by hand stay parallel at the tilt asked for, and can be placed anyway", "[PathCut]")
+{
+    const BarCut             b = cut_bar();
+    PathCut::ConnectorParams prm;
+    prm.type = PathCut::ConnectorType::Plug;
+    prm.size = 4.;
+    const PathCut::ConnectorPlacer straight(b.res, b.level, b.from(), b.to(), prm);
+    prm.tilt = 20.;
+    prm.turn = 90.;
+    const PathCut::ConnectorPlacer tilted(b.res, b.level, b.from(), b.to(), prm);
+    REQUIRE(straight.error().empty());
+    REQUIRE(tilted.error().empty());
+    const double angle = std::acos(std::clamp(straight.axis().dot(tilted.axis()), -1., 1.)) * 180. / PI;
+    CHECK_THAT(angle, WithinAbs(20., 1e-6));
+
+    // Near the edge it does not fit, but forced it is still built there.
+    const PathCut::V3      edge = b.face_point(tilted, 0.5, 6.);
+    PathCut::ConnectorSpot spot;
+    REQUIRE(tilted.try_at(edge, spot) != PathCut::ConnectorFit::Ok);
+    const PathCut::ConnectorSpot forced = tilted.forced_at(edge);
+    CHECK(forced.forced);
+    const PathCut::ConnectorResult c = tilted.build({forced});
+    REQUIRE(c.positions.size() == 1);
+    CHECK_FALSE(c.pegs.indices.empty());
+    CHECK_FALSE(c.holes_to.indices.empty());
+}
+
 TEST_CASE("New connectors keep clear of holes already in the part", "[PathCut]")
 {
     // A 2 x 2 mm negative volume crossing the cut face near a corner.

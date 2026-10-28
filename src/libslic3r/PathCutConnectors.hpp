@@ -44,6 +44,10 @@ struct ConnectorParams
     double         depth{5.};     // how far the peg (or each half of the pin) goes into a side [mm]
     double         clearance{0.2}; // added to the hole radius and depth [mm]
     double         wall{1.};      // material left around a hole [mm]
+    // All connectors are parallel (or the pieces could not come apart): by default along the direction the
+    // pieces come apart in; tilted away from it by `tilt`, towards `turn` (0 = up, around that direction) [deg].
+    double         tilt{0.};
+    double         turn{0.};
 };
 
 struct ConnectorResult
@@ -300,6 +304,7 @@ struct ConnectorSpot
     double from_face{0.}, to_face{0.}, from_top{0.};
     double angle{0.};
     double slack{0.};
+    bool   forced{false}; // placed where the checks said it does not fit (the user asked for it)
 };
 
 // Why a connector does not fit at a given place.
@@ -365,6 +370,15 @@ public:
             m_error = "No connectors fit: the cut face is too curved for a straight connector.";
             return;
         }
+        if (prm.tilt > 1e-6) {
+            // Tilted by hand: away from the direction they come apart in, towards `turn` measured from up.
+            V3 up = V3::UnitZ() - m_axis * m_axis.z();
+            if (up.norm() < 1e-6) up = V3::UnitX() - m_axis * m_axis.x();
+            up.normalize();
+            const V3     side = m_axis.cross(up);
+            const double t = std::min(prm.tilt, 80.) * PI_ / 180., r = prm.turn * PI_ / 180.;
+            m_axis = (m_axis * std::cos(t) + (up * std::cos(r) + side * std::sin(r)) * std::sin(t)).normalized();
+        }
         m_frame = frame_from_normal(m_axis, V3::Zero());
         // A copy of the face, for display and picking.
         std::unordered_map<int, int> vmap;
@@ -419,6 +433,22 @@ public:
                 first = why;
         }
         return found ? ConnectorFit::Ok : first;
+    }
+
+    // A connector at p placed whatever the checks say (the user asked for it): its faces measured on the
+    // axis where they are found, else at p.
+    ConnectorSpot forced_at(const V3 &p) const
+    {
+        ConnectorSpot s;
+        s.p = p;
+        s.forced = true;
+        if (!m_error.empty()) return s;
+        const V2     q = m_frame.to2d(p);
+        const double h = m_frame.height(p);
+        double       a0 = 0., a1 = 0., b0 = 0., b1 = 0.;
+        if (interval(*m_from, q, h, true, a0, a1)) s.from_face = s.from_top = a1;
+        if (interval(*m_to, q, h, false, b0, b1)) s.to_face = b0;
+        return s;
     }
 
     // Up to `count` connectors spread over the cut face: the roomiest spot first, then each next one as

@@ -36422,6 +36422,43 @@ msgid "Click to add a point, right click removes the last one. Drag to rotate th
 msgstr "Haz clic para añadir un punto; el clic derecho elimina el último. Arrastra para girar la vista."
 
 # AI Translated
+msgid "Connector tilt (deg)"
+msgstr "Inclinación de los conectores (°)"
+
+# AI Translated
+msgid ""
+"Tilts all the connectors away from the direction the pieces come apart "
+"in. They stay parallel, so the pieces still come apart, along the new "
+"direction."
+msgstr ""
+"Inclina todos los conectores respecto a la dirección en que se separan "
+"las piezas. Siguen paralelos, así que las piezas se siguen separando, "
+"en la nueva dirección."
+
+# AI Translated
+msgid "Tilt towards (deg)"
+msgstr "Inclinar hacia (°)"
+
+# AI Translated
+msgid "Place even where it does not fit"
+msgstr "Colocar aunque no quepa"
+
+# AI Translated
+msgid ""
+"A click places the connector where the checks say it does not fit "
+"(shown in orange). Its hole is still cut with the clearance set. Check "
+"the pieces before printing."
+msgstr ""
+"Un clic coloca el conector aunque las comprobaciones digan que no cabe "
+"(se ve en naranja). Su agujero se sigue haciendo con la holgura "
+"configurada. Revisa las piezas antes de imprimir."
+
+# AI Translated
+msgid ""
+"It does not fit there, but it will be placed anyway: check the pieces."
+msgstr "Ahí no cabe, pero se colocará igualmente: revisa las piezas."
+
+# AI Translated
 msgid "Follow the model's edges"
 msgstr "Seguir las aristas del modelo"
 
