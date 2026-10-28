@@ -53,6 +53,8 @@ private:
     void rebuild_preview();
     void perform_cut();
     std::vector<Vec3d> preview_curve() const;
+    void               update_loop_points();
+    std::vector<Vec3d> cut_points() const;
     Vec3d              sweep_dir() const;
     PathCut::ViewLimits view_limits() const;
     void               add_point(const Vec3d &hit);
@@ -90,6 +92,12 @@ private:
     float              m_kerf{0.2f};             // clearance between parts [mm]
     float              m_margin{1.5f};           // loop: how far the cut may run from the loop (exact) / min. cap reach past it (flat) [mm]
     bool               m_flat_cap{false};        // loop: flat cut face through the mean plane (a slab) instead of exactly along the loop
+    bool               m_follow_creases{true};   // loop: follow the model's creases between the picked points
+    std::vector<Vec3d> m_loop_pts;               // ... that loop, world coordinates (empty: use the picked points)
+    std::shared_ptr<PathCut::CreaseGraph> m_creases; // edges of the object and how sharply it bends across them
+    const ModelObject *m_creases_object{nullptr};
+    size_t             m_creases_tris{0};
+    Transform3d        m_creases_matrix{Transform3d::Identity()};
     enum class Sweep : int { View = 0, Level = 1, Vertical = 2, Custom = 3 };
     Sweep              m_sweep{Sweep::View};     // view path: direction the path is swept along
     float              m_turn{0.f}, m_tilt{0.f}; // custom sweep: around the vertical axis / below horizontal [deg]

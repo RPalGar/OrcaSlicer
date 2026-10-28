@@ -33,6 +33,7 @@
 #include <cstring>
 #include <functional>
 #include <limits>
+#include <queue>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -1665,6 +1666,117 @@ CutResult cut_with_slab(indexed_triangle_set its, const Cutter &cutter, bool bou
     res.mesh = std::move(its);
     return res;
 }
+
+// ------------------------------------------------------------------------------------------------ creases
+// Makes a loop follow the model's creases (the edge between a belly and a back, a seam, a groove): between
+// each two consecutive picked points, the path over the mesh edges that costs least, where an edge costs
+// its length, less the sharper the surface bends across it (up to `pull` off at 45 degrees or more). The
+// search stays in a corridor around the straight segment, so the path cannot wander off to another crease.
+// Built once per mesh (the edges and their bends); loop() is then quick.
+class CreaseGraph
+{
+public:
+    explicit CreaseGraph(const indexed_triangle_set &its) : m_pos(its.vertices.size())
+    {
+        const size_t nv = its.vertices.size();
+        for (size_t v = 0; v < nv; ++v) m_pos[v] = its.vertices[v].cast<double>();
+        std::vector<V3> fn(its.indices.size());
+        for (size_t i = 0; i < its.indices.size(); ++i) {
+            const auto &t = its.indices[i];
+            const V3    n = (m_pos[t[1]] - m_pos[t[0]]).cross(m_pos[t[2]] - m_pos[t[0]]);
+            fn[i]         = n.norm() > 1e-12 ? V3(n.normalized()) : V3::Zero();
+        }
+        std::unordered_map<uint64_t, size_t> face_of;
+        face_of.reserve(its.indices.size() * 2);
+        m_adj.resize(nv);
+        for (size_t i = 0; i < its.indices.size(); ++i) {
+            const auto &t = its.indices[i];
+            for (int e = 0; e < 3; ++e) {
+                const int      a = t[e], b = t[(e + 1) % 3];
+                const uint64_t k = edge_key(a, b);
+                auto [it, ins]   = face_of.emplace(k, i);
+                if (ins) continue;
+                const double bend = std::min(1., std::acos(std::clamp(fn[i].dot(fn[it->second]), -1., 1.)) / (0.25 * PI_));
+                m_adj[size_t(a)].push_back({b, bend});
+                m_adj[size_t(b)].push_back({a, bend});
+            }
+        }
+    }
+    bool empty() const { return m_pos.empty(); }
+
+    // The closed loop through the picked points along the creases, thinned to about `spacing` [mm]. Where
+    // no path is found the picked point is kept as it is.
+    std::vector<V3> loop(const std::vector<V3> &picked, double pull = 0.85, double spacing = 1.0) const
+    {
+        const size_t np = picked.size(), nv = m_pos.size();
+        if (np < 3 || nv == 0) return picked;
+        std::vector<int> pv(np);
+        for (size_t i = 0; i < np; ++i) pv[i] = nearest(picked[i]);
+        std::vector<V3>     out;
+        std::vector<double> dist(nv, std::numeric_limits<double>::max());
+        std::vector<int>    prev(nv, -1), seen;
+        for (size_t i = 0; i < np; ++i) {
+            const V3    &A = picked[i], &B = picked[(i + 1) % np];
+            const int    s = pv[i], g = pv[(i + 1) % np];
+            const V3     ab = B - A;
+            const double len = ab.norm(), corridor = std::max(3., 0.3 * len);
+            auto in_corridor = [&](int v) {
+                const V3    &p = m_pos[size_t(v)];
+                const double t = len > 1e-9 ? std::clamp((p - A).dot(ab) / (len * len), 0., 1.) : 0.;
+                return (A + ab * t - p).norm() <= corridor;
+            };
+            for (int v : seen) { dist[size_t(v)] = std::numeric_limits<double>::max(); prev[size_t(v)] = -1; }
+            seen.clear();
+            using Item = std::pair<double, int>;
+            std::priority_queue<Item, std::vector<Item>, std::greater<Item>> heap;
+            dist[size_t(s)] = 0.;
+            seen.push_back(s);
+            heap.emplace(0., s);
+            while (!heap.empty()) {
+                const auto [d, v] = heap.top();
+                heap.pop();
+                if (d > dist[size_t(v)]) continue;
+                if (v == g) break;
+                for (const Link &l : m_adj[size_t(v)]) {
+                    if (!in_corridor(l.to)) continue;
+                    const double nd = d + (m_pos[size_t(v)] - m_pos[size_t(l.to)]).norm() * (1. - pull * l.bend);
+                    if (nd < dist[size_t(l.to)]) {
+                        if (dist[size_t(l.to)] == std::numeric_limits<double>::max()) seen.push_back(l.to);
+                        dist[size_t(l.to)] = nd;
+                        prev[size_t(l.to)] = v;
+                        heap.emplace(nd, l.to);
+                    }
+                }
+            }
+            if (s == g || prev[size_t(g)] < 0) { out.push_back(A); continue; }
+            std::vector<int> path;
+            for (int v = g; v != s; v = prev[size_t(v)]) path.push_back(v);
+            path.push_back(s);
+            std::reverse(path.begin(), path.end());
+            path.pop_back(); // the next segment starts there
+            for (int v : path) out.push_back(m_pos[size_t(v)]);
+        }
+        std::vector<V3> thin;
+        for (const V3 &p : out)
+            if (thin.empty() || (p - thin.back()).norm() >= spacing) thin.push_back(p);
+        if (thin.size() > 3 && (thin.front() - thin.back()).norm() < 0.5 * spacing) thin.pop_back();
+        return thin.size() >= 3 ? thin : picked;
+    }
+
+private:
+    struct Link { int to; double bend; };
+    int nearest(const V3 &p) const
+    {
+        int best = 0; double bd = std::numeric_limits<double>::max();
+        for (size_t v = 0; v < m_pos.size(); ++v) {
+            const double d = (m_pos[v] - p).squaredNorm();
+            if (d < bd) { bd = d; best = int(v); }
+        }
+        return best;
+    }
+    std::vector<V3>                m_pos;
+    std::vector<std::vector<Link>> m_adj;
+};
 
 // ------------------------------------------------------------------------------------------------ grouping
 struct Grouped

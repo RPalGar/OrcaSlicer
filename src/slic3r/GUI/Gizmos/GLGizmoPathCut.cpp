@@ -144,6 +144,8 @@ void GLGizmoPathCut::on_set_state()
             abort_job(*m_running);
         m_running.reset();
         m_busy = false;
+        m_creases.reset(); // rebuilt for the object the tool opens on next
+        m_creases_object = nullptr;
     }
     if (m_state == On || m_state == Off) {
         reset_path();
@@ -158,6 +160,7 @@ void GLGizmoPathCut::reset_path()
 {
     clear_pending();
     m_points.clear();
+    m_loop_pts.clear();
     m_object        = nullptr;
     m_preview_dirty = true;
 }
@@ -314,6 +317,11 @@ bool GLGizmoPathCut::on_mouse(const wxMouseEvent &mouse_event)
 
 std::vector<Vec3d> GLGizmoPathCut::preview_curve() const
 {
+    if (m_mode == Mode::Loop && !m_loop_pts.empty()) { // along the creases: the path itself
+        std::vector<Vec3d> out(m_loop_pts);
+        out.push_back(out.front());
+        return out;
+    }
     std::vector<PathCut::V3> pts(m_points.begin(), m_points.end());
     const bool closed = m_mode == Mode::Loop && pts.size() >= 3;
     std::vector<PathCut::V3> c = PathCut::catmull_rom(pts, closed, 12);
@@ -340,8 +348,46 @@ Vec3d GLGizmoPathCut::sweep_dir() const
     }
 }
 
+// Loop mode, following the creases: the loop through the picked points along the model's creases.
+void GLGizmoPathCut::update_loop_points()
+{
+    m_loop_pts.clear();
+    if (m_mode != Mode::Loop || !m_follow_creases || m_points.size() < 3)
+        return;
+    const ModelObject *mo   = m_c->selection_info() ? m_c->selection_info()->model_object() : nullptr;
+    const int          inst = m_parent.get_selection().get_instance_idx();
+    if (mo == nullptr || inst < 0 || inst >= int(mo->instances.size()))
+        return;
+    const Transform3d &matrix = mo->instances[inst]->get_matrix();
+    size_t             tris   = 0;
+    for (const ModelVolume *v : mo->volumes)
+        if (v->is_model_part()) tris += v->mesh().its.indices.size();
+    if (!m_creases || mo != m_creases_object || tris != m_creases_tris || !matrix.isApprox(m_creases_matrix)) {
+        indexed_triangle_set world;
+        for (const ModelVolume *v : mo->volumes)
+            if (v->is_model_part()) {
+                indexed_triangle_set its = v->mesh().its;
+                its_transform(its, matrix * v->get_matrix(), true);
+                its_merge(world, its);
+            }
+        m_creases        = std::make_shared<PathCut::CreaseGraph>(world);
+        m_creases_object = mo;
+        m_creases_tris   = tris;
+        m_creases_matrix = matrix;
+    }
+    const std::vector<PathCut::V3> picked(m_points.begin(), m_points.end());
+    for (const PathCut::V3 &p : m_creases->loop(picked)) m_loop_pts.push_back(p);
+}
+
+// The points the cut is built from: the loop along the creases, or the picked points.
+std::vector<Vec3d> GLGizmoPathCut::cut_points() const
+{
+    return m_mode == Mode::Loop && !m_loop_pts.empty() ? m_loop_pts : m_points;
+}
+
 void GLGizmoPathCut::rebuild_preview()
 {
+    update_loop_points();
     m_curve.reset();
     const std::vector<Vec3d> curve = preview_curve();
     if (curve.size() >= 2) {
@@ -388,7 +434,8 @@ PathCut::ViewLimits GLGizmoPathCut::view_limits() const
 void GLGizmoPathCut::rebuild_cutter_preview()
 {
     m_cutter.reset();
-    const std::vector<PathCut::V3> pts(m_points.begin(), m_points.end());
+    const std::vector<Vec3d>       cut = cut_points();
+    const std::vector<PathCut::V3> pts(cut.begin(), cut.end());
     const BoundingBoxf3            bb = m_parent.get_selection().get_bounding_box();
     if (!bb.defined)
         return;
@@ -774,6 +821,12 @@ void GLGizmoPathCut::on_render_input_window(float x, float y, float bottom_limit
         m_margin = std::clamp(m_margin, 0.2f, 10.f);
         if (m_imgui->bbl_checkbox(_L("Flat cut face"), m_flat_cap))
             settings_changed();
+        if (m_imgui->bbl_checkbox(_L("Follow the model's edges"), m_follow_creases))
+            settings_changed();
+        if (ImGui::IsItemHovered())
+            m_imgui->tooltip(_u8L("Between the points you place, the loop follows the sharpest edges of the model nearby "
+                                  "(a seam, the line between belly and back), so a few points are enough."),
+                             ImGui::GetFontSize() * 20.f);
     } else {
         // Direction the path is swept along: as seen when placing the first point, forced level with the
         // bed (a cut parallel to the bed for a path drawn from the front), vertical, or set by hand.
@@ -1011,6 +1064,7 @@ struct PathCutJob
     struct VolumeState { size_t id; Transform3d matrix; std::shared_ptr<const TriangleMesh> mesh; };
     std::vector<VolumeState> volumes_before; // meshes held so their addresses cannot be reused
     // output
+    bool                                      follow_creases{false}; // the loop runs along creases: wider tolerance
     PathCut::Grouped                          grouped;
     bool                                      joined{false}; // the sides still touch elsewhere
     std::vector<std::vector<PathCut::V3>>     routes;        // ... along these, object coordinates
@@ -1469,8 +1523,11 @@ void GLGizmoPathCut::perform_cut()
     }
     if (st->src.indices.empty())
         return;
-    for (const Vec3d &p : m_points)
+    if (m_preview_dirty)
+        rebuild_preview(); // the loop along the creases for the current points
+    for (const Vec3d &p : cut_points())
         st->pts.emplace_back(p - st->offset);
+    st->follow_creases = m_mode == Mode::Loop && !m_loop_pts.empty();
     st->view_dir = sweep_dir();
     st->mode     = m_mode;
     st->kerf     = m_kerf;
@@ -1532,7 +1589,9 @@ void GLGizmoPathCut::perform_cut()
             }
             if (!st->flat_cap) {
                 // Exactly along the loop: only the surface the loop runs on is cut (folds, creases).
-                res = PathCut::cut_along_loop(std::move(st->src), lc, st->margin, canceled);
+                // Along a crease the surface folds sharply under the loop: let the cut line find it a little further.
+                res = PathCut::cut_along_loop(std::move(st->src), lc, st->follow_creases ? std::max<double>(st->margin, 3.) : st->margin,
+                                              canceled);
             } else {
                 // Flat cut face: a slab through the mean plane of the loop, widened past bulges near it.
                 if (!PathCut::fit_loop_margin(st->src, lc)) {

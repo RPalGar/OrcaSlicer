@@ -36422,6 +36422,19 @@ msgid "Click to add a point, right click removes the last one. Drag to rotate th
 msgstr "Haz clic para añadir un punto; el clic derecho elimina el último. Arrastra para girar la vista."
 
 # AI Translated
+msgid "Follow the model's edges"
+msgstr "Seguir las aristas del modelo"
+
+# AI Translated
+msgid ""
+"Between the points you place, the loop follows the sharpest edges of the model "
+"nearby (a seam, the line between belly and back), so a few points are enough."
+msgstr ""
+"Entre los puntos que colocas, el lazo sigue las aristas más marcadas del modelo "
+"cercanas (una costura, la línea entre la panza y el lomo), así que bastan unos "
+"pocos puntos."
+
+# AI Translated
 msgid "The cut is made, shown in orange. The object is still connected along the red lines: mark the next cut there."
 msgstr "El corte está hecho (en naranja). El objeto sigue unido por las líneas rojas: marca ahí el siguiente corte."
 
