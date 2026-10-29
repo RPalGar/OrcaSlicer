@@ -4,6 +4,7 @@ on:
   push:
     branches:
      - main
+     - ci/path-cut
      - release/*
     paths:
      - 'deps/**'
