@@ -3,6 +3,7 @@
 #include "GLGizmoBase.hpp"
 #include "GLGizmosCommon.hpp"
 #include "slic3r/GUI/GLModel.hpp"
+#include "libslic3r/ObjectID.hpp"
 #include "libslic3r/PathCutConnectors.hpp"
 #include "libslic3r/PathCutGeometry.hpp"
 #include "libslic3r/Point.hpp"
@@ -86,6 +87,7 @@ private:
     // Cuts already made on an object still in one piece (multi-cut): their faces and where it is still
     // connected, world coordinates, shown while the next cut is marked.
     void               rebuild_done();
+    void               sync_done();
     void               render_done();
     // Preview: the cut is computed and shown with the pieces apart; the object is untouched until
     // "Perform cut" applies exactly what is shown. Editing (any change) drops it.
@@ -148,8 +150,12 @@ private:
     bool                                m_hover_on{false};
     PathCut::ConnectorFit               m_hover_fit{PathCut::ConnectorFit::Ok};
     Vec2d                               m_hover_pos{Vec2d::Zero()};
+    // Faces of the cuts that left the object in one piece, and where it is still connected (world). Kept
+    // while the tool is closed, for that object as it was placed then (offset, rotation and scale).
     indexed_triangle_set                m_done_faces;
     std::vector<std::vector<Vec3d>>     m_done_routes;
+    ObjectID                            m_done_object;
+    Transform3d                         m_done_matrix{Transform3d::Identity()};
     GLModel                             m_done_faces_model, m_done_routes_model;
     Vec3d                               m_orb_center{Vec3d::Zero()}; // object coordinates (of m_pending)
     double                              m_orb_radius{10.};

@@ -154,12 +154,10 @@ void GLGizmoPathCut::on_set_state()
         m_creases.reset(); // rebuilt for the object the tool opens on next
         m_creases_object = nullptr;
     }
-    if (m_state == On || m_state == Off) {
+    if (m_state == On || m_state == Off)
         reset_path();
-        m_done_faces.clear();
-        m_done_routes.clear();
-        rebuild_done();
-    }
+    if (m_state == On)
+        sync_done();
     m_message.clear();
 }
 
@@ -1646,6 +1644,33 @@ std::string GLGizmoPathCut::orb_tooltip() const
     return m_orb_hover >= 0 ? _u8L("Drag to turn the direction of the connectors") : "";
 }
 
+// The faces of earlier cuts belong to one instance: shown again when the tool opens on it, moved along
+// with it; dropped for any other instance, or when it was rotated or scaled meanwhile.
+void GLGizmoPathCut::sync_done()
+{
+    if (!m_done_faces.indices.empty() || !m_done_routes.empty()) {
+        const Selection     &selection = m_parent.get_selection();
+        const int            obj_idx   = selection.get_object_idx();
+        const int            inst_idx  = selection.get_instance_idx();
+        const Model         &model     = wxGetApp().plater()->model();
+        const ModelObject   *mo = obj_idx >= 0 && obj_idx < int(model.objects.size()) ? model.objects[obj_idx] : nullptr;
+        const ModelInstance *mi = mo != nullptr && inst_idx >= 0 && inst_idx < int(mo->instances.size()) ? mo->instances[inst_idx] : nullptr;
+        const Transform3d    now  = mi != nullptr ? mi->get_matrix() : Transform3d::Identity();
+        if (mi != nullptr && mi->id() == m_done_object && now.linear().isApprox(m_done_matrix.linear(), 1e-9)) {
+            const Vec3d delta = now.translation() - m_done_matrix.translation();
+            for (auto &v : m_done_faces.vertices) v += delta.cast<float>();
+            for (auto &route : m_done_routes)
+                for (Vec3d &p : route) p += delta;
+            m_done_matrix = now;
+        } else {
+            m_done_faces.clear();
+            m_done_routes.clear();
+            m_done_object = ObjectID();
+        }
+    }
+    rebuild_done();
+}
+
 void GLGizmoPathCut::rebuild_done()
 {
     m_done_faces_model.reset();
@@ -2170,6 +2195,10 @@ void GLGizmoPathCut::do_apply_cut(const std::shared_ptr<PathCutJob> &st)
         }
     }
 
+    // The object is replaced: the faces of its earlier cuts are carried over above only if it stays in one piece.
+    m_done_faces.clear();
+    m_done_routes.clear();
+    m_done_object = ObjectID();
     m_message.clear();
     m_parent.reset_all_gizmos();
     const auto t0 = std::chrono::steady_clock::now();
@@ -2190,6 +2219,17 @@ void GLGizmoPathCut::do_apply_cut(const std::shared_ptr<PathCutJob> &st)
                     return;
                 m_done_faces  = std::move(done_faces);
                 m_done_routes = std::move(done_routes);
+                // The instance the tool opened on: the one left in one piece.
+                const Selection &selection = m_parent.get_selection();
+                const Model     &model     = wxGetApp().plater()->model();
+                const int        obj_idx   = selection.get_object_idx();
+                const int        inst_idx  = selection.get_instance_idx();
+                if (obj_idx >= 0 && obj_idx < int(model.objects.size()) && inst_idx >= 0 &&
+                    inst_idx < int(model.objects[obj_idx]->instances.size())) {
+                    const ModelInstance *mi = model.objects[obj_idx]->instances[inst_idx];
+                    m_done_object = mi->id();
+                    m_done_matrix = mi->get_matrix();
+                }
                 rebuild_done();
                 m_message          = _u8L("The cut is made, shown in orange. The object is still connected along the red lines: mark the next cut there.");
                 m_message_is_error = false;
