@@ -684,6 +684,10 @@ TEST_CASE("Connectors tilted by hand stay parallel at the tilt asked for, and ca
     REQUIRE(tilted.error().empty());
     const double angle = std::acos(std::clamp(straight.axis().dot(tilted.axis()), -1., 1.)) * 180. / PI;
     CHECK_THAT(angle, WithinAbs(20., 1e-6));
+    double tilt = 0., turn = 0.; // and back, as the direction orb reads it
+    PathCut::tilt_of(tilted.pull_axis(), tilted.axis(), tilt, turn);
+    CHECK_THAT(tilt, WithinAbs(20., 1e-6));
+    CHECK_THAT(turn, WithinAbs(90., 1e-6));
 
     // Near the edge it does not fit, but forced it is still built there.
     const PathCut::V3      edge = b.face_point(tilted, 0.5, 6.);

@@ -74,6 +74,14 @@ private:
     // fits, red where it does not (a click there places nothing). Its tooltip says why.
     void               update_hover(const Vec2d &mouse_pos);
     bool               force_connector(PathCut::ConnectorFit why) const;
+    // The direction orb while placing connectors (see the .cpp).
+    std::vector<Vec3d> orb_ring(int ring) const;
+    int                orb_pick(const Vec2d &mouse_pos) const;
+    bool               orb_plane_dir(const Vec2d &mouse_pos, int ring, Vec3d &dir) const;
+    bool               on_orb_mouse(const wxMouseEvent &mouse_event, const Vec2d &mouse_pos);
+    void               rebuild_orb();
+    void               render_orb();
+    std::string        orb_tooltip() const;
     void               clear_hover();
     // Cuts already made on an object still in one piece (multi-cut): their faces and where it is still
     // connected, world coordinates, shown while the next cut is marked.
@@ -143,6 +151,12 @@ private:
     indexed_triangle_set                m_done_faces;
     std::vector<std::vector<Vec3d>>     m_done_routes;
     GLModel                             m_done_faces_model, m_done_routes_model;
+    Vec3d                               m_orb_center{Vec3d::Zero()}; // object coordinates (of m_pending)
+    double                              m_orb_radius{10.};
+    Vec3d                               m_orb_axis{Vec3d::UnitZ()};  // the connectors' direction shown
+    Vec3d                               m_orb_start_axis{Vec3d::UnitZ()}, m_orb_start_dir{Vec3d::UnitX()};
+    int                                 m_orb_ring{-1}, m_orb_hover{-1}; // ring dragged / under the mouse
+    GLModel                             m_orb_models[3];                 // two rings, the arrow
 
     // A left press on the object adds a point on release, unless the mouse was dragged: then it orbits.
     bool  m_press_on_object{false};

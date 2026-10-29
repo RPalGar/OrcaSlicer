@@ -36459,6 +36459,14 @@ msgid ""
 msgstr "Ahí no cabe, pero se colocará igualmente: revisa las piezas."
 
 # AI Translated
+msgid "Connector tilt %1% deg, towards %2% deg"
+msgstr "Inclinación de los conectores %1%°, hacia %2%°"
+
+# AI Translated
+msgid "Drag to turn the direction of the connectors"
+msgstr "Arrastra para girar la dirección de los conectores"
+
+# AI Translated
 msgid "Follow the model's edges"
 msgstr "Seguir las aristas del modelo"
 

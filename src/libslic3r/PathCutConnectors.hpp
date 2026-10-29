@@ -333,6 +333,32 @@ inline const char *connector_fit_message(ConnectorFit why)
     }
 }
 
+// Connectors tilted by hand: `pull` (the direction the pieces come apart in) tilted away from itself by
+// `tilt` degrees (at most 80), towards `turn` degrees around it, measured from up (from +X when `pull` is
+// vertical). tilt_of() gives the tilt and turn of an axis.
+inline void tilt_frame(const V3 &pull, V3 &up, V3 &side)
+{
+    up = V3::UnitZ() - pull * pull.z();
+    if (up.norm() < 1e-6) up = V3::UnitX() - pull * pull.x();
+    up.normalize();
+    side = pull.cross(up);
+}
+inline V3 tilted_axis(const V3 &pull, double tilt, double turn)
+{
+    V3 up, side;
+    tilt_frame(pull, up, side);
+    const double t = std::clamp(tilt, 0., 80.) * PI_ / 180., r = turn * PI_ / 180.;
+    return (pull * std::cos(t) + (up * std::cos(r) + side * std::sin(r)) * std::sin(t)).normalized();
+}
+inline void tilt_of(const V3 &pull, const V3 &axis, double &tilt, double &turn)
+{
+    V3 up, side;
+    tilt_frame(pull, up, side);
+    const V3 a = axis.normalized();
+    tilt = std::acos(std::clamp(a.dot(pull), -1., 1.)) * 180. / PI_;
+    turn = tilt > 1e-6 ? std::atan2(a.dot(side), a.dot(up)) * 180. / PI_ : 0.;
+}
+
 // Places straight connectors across the cut face between `from` and `to`, the two sides of `cut` (cut
 // faces with level `from_level` belong to `from`): automatically, or one by one where the user asks.
 // Pegs (Plug) stick out of `from` into holes of `to`. `avoid` (optional, closed) is material that is
@@ -370,15 +396,8 @@ public:
             m_error = "No connectors fit: the cut face is too curved for a straight connector.";
             return;
         }
-        if (prm.tilt > 1e-6) {
-            // Tilted by hand: away from the direction they come apart in, towards `turn` measured from up.
-            V3 up = V3::UnitZ() - m_axis * m_axis.z();
-            if (up.norm() < 1e-6) up = V3::UnitX() - m_axis * m_axis.x();
-            up.normalize();
-            const V3     side = m_axis.cross(up);
-            const double t = std::min(prm.tilt, 80.) * PI_ / 180., r = prm.turn * PI_ / 180.;
-            m_axis = (m_axis * std::cos(t) + (up * std::cos(r) + side * std::sin(r)) * std::sin(t)).normalized();
-        }
+        m_pull = m_axis;
+        if (prm.tilt > 1e-6) m_axis = tilted_axis(m_pull, prm.tilt, prm.turn);
         m_frame = frame_from_normal(m_axis, V3::Zero());
         // A copy of the face, for display and picking.
         std::unordered_map<int, int> vmap;
@@ -409,6 +428,8 @@ public:
     // Non-empty when no connector can go anywhere (cut face too curved, bad sizes).
     const std::string          &error() const { return m_error; }
     const V3                   &axis() const { return m_axis; }
+    // The direction the pieces come apart in: the axis before any tilt asked for.
+    const V3                   &pull_axis() const { return m_pull; }
     const indexed_triangle_set &face() const { return m_face; }
     double                      min_gap() const { return m_min_gap; }
 
@@ -647,6 +668,7 @@ private:
     ConnectorParams                     m_prm;
     std::string                         m_error;
     V3                                  m_axis{V3::Zero()};
+    V3                                  m_pull{V3::Zero()};
     Frame                               m_frame;
     std::vector<size_t>                 m_face_idx;
     indexed_triangle_set                m_face;

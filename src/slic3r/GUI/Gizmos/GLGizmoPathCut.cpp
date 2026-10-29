@@ -57,6 +57,9 @@ static const ColorRGBA PREVIEW_PEG_COLOR   = {0.15f, 0.75f, 0.35f, 1.f};
 static const ColorRGBA HOVER_FITS_COLOR    = {0.2f, 1.f, 0.4f, 0.5f};  // connector under the mouse: it fits
 static const ColorRGBA HOVER_NO_FIT_COLOR  = {1.f, 0.15f, 0.15f, 0.6f}; // it does not fit there
 static const ColorRGBA HOVER_FORCED_COLOR  = {1.f, 0.6f, 0.05f, 0.6f};  // it does not fit there, but goes there anyway
+static const ColorRGBA ORB_RING_COLOR[2] = {{0.9f, 0.2f, 0.2f, 1.f}, {0.2f, 0.8f, 0.2f, 1.f}}; // like Orca's X / Y rings
+static const ColorRGBA ORB_HOVER_COLOR     = {1.f, 0.9f, 0.2f, 1.f};
+static const ColorRGBA ORB_AXIS_COLOR      = {0.f, 0.588f, 0.533f, 1.f};
 static const ColorRGBA DONE_CUT_COLOR      = {1.f, 0.55f, 0.f, 0.45f};  // faces of the cuts already made on the object
 
 // What of the connectors is shown on the cut face: the pegs, or the holes of the pins.
@@ -111,6 +114,8 @@ std::string GLGizmoPathCut::on_get_name() const { return _u8L("Cut along path");
 // Placing connectors: where the one under the mouse does not fit, say why.
 std::string GLGizmoPathCut::get_tooltip() const
 {
+    if (m_placing && (m_orb_ring >= 0 || m_orb_hover >= 0))
+        return orb_tooltip();
     if (m_placing && m_hover_on && m_hover_fit != PathCut::ConnectorFit::Ok)
         return force_connector(m_hover_fit) ? _u8L("It does not fit there, but it will be placed anyway: check the pieces.") :
                                               _u8L(PathCut::connector_fit_message(m_hover_fit));
@@ -223,8 +228,13 @@ bool GLGizmoPathCut::on_mouse(const wxMouseEvent &mouse_event)
     if (m_busy) // the scene is frozen while a cut runs (zooming is fine)
         return mouse_event.GetWheelRotation() == 0;
     const Vec2d mouse_pos(mouse_event.GetX(), mouse_event.GetY());
+    if (m_placing && on_orb_mouse(mouse_event, mouse_pos))
+        return true;
     if (m_placing && mouse_event.Moving()) {
-        update_hover(mouse_pos);
+        if (m_orb_hover >= 0)
+            clear_hover(); // on a ring of the orb: no connector shown under the mouse
+        else
+            update_hover(mouse_pos);
         return false; // the canvas still tracks the mouse
     }
     if (mouse_event.Leaving())
@@ -532,7 +542,7 @@ void GLGizmoPathCut::on_render()
                 m_conn_model.set_color(ColorRGBA(0.1f, 0.85f, 0.3f, 0.85f));
                 m_conn_model.render();
             }
-            if (m_hover_on && m_hover_model.is_initialized()) {
+            if (m_hover_on && m_hover_model.is_initialized() && m_orb_hover < 0 && m_orb_ring < 0) {
                 m_hover_model.set_color(m_hover_fit == PathCut::ConnectorFit::Ok ? HOVER_FITS_COLOR :
                                         force_connector(m_hover_fit)    ? HOVER_FORCED_COLOR :
                                                                           HOVER_NO_FIT_COLOR);
@@ -542,6 +552,7 @@ void GLGizmoPathCut::on_render()
             glsafe(::glDisable(GL_BLEND));
             glsafe(::glEnable(GL_CULL_FACE));
         }
+        render_orb();
     } else if (previewing()) {
         if (GLShaderProgram *shader = wxGetApp().get_shader("gouraud_light")) {
             shader->start_using();
@@ -1174,6 +1185,7 @@ void GLGizmoPathCut::clear_pending()
     m_face_model.reset();
     m_conn_model.reset();
     clear_hover();
+    m_orb_ring = m_orb_hover = -1;
     m_face_aabb.reset();
     m_piece_stay.reset();
     m_piece_moved.reset();
@@ -1286,6 +1298,14 @@ void GLGizmoPathCut::rebuild_face()
     for (const auto &t : face.indices) g.add_triangle(unsigned(t[0]), unsigned(t[1]), unsigned(t[2]));
     m_face_model.init_from(std::move(g));
     m_face_aabb = std::make_shared<AABBMesh>(face);
+    // The direction orb: at the middle of the cut face, sized to it.
+    BoundingBoxf3 bb;
+    for (const auto &v : face.vertices) bb.merge(Vec3d(v.cast<double>()));
+    m_orb_center = bb.center();
+    m_orb_radius = std::clamp(0.3 * bb.size().norm(), 6., 30.);
+    m_orb_axis   = Vec3d(m_pending->placer->axis());
+    m_orb_ring   = m_orb_hover = -1;
+    rebuild_orb();
 }
 
 // The cut separated the object and the connectors go where the user clicks: show the cut face.
@@ -1425,6 +1445,203 @@ void GLGizmoPathCut::clear_hover()
 bool GLGizmoPathCut::force_connector(PathCut::ConnectorFit why) const
 {
     return m_conn_force && why != PathCut::ConnectorFit::Ok && why != PathCut::ConnectorFit::OffFace;
+}
+
+// ---------------------------------------------------------------------------------------------------------
+// Direction orb, while placing connectors: an arrow along the direction all the connectors share, and two
+// rings around it to turn it, as the rotation rings of the plane cut tool. Dragging a ring turns the arrow
+// about the ring's axis (1 degree steps); on release the connectors take the new direction (as a tilt and
+// a turn, the same settings as in the panel).
+
+// The rings' axes for an arrow along `axis`: perpendicular to it, the first one level with the bed if it can.
+static void orb_frame(const Vec3d &axis, Vec3d &e1, Vec3d &e2)
+{
+    e1 = Vec3d::UnitZ().cross(axis);
+    if (e1.norm() < 1e-6) e1 = Vec3d::UnitX().cross(axis);
+    e1.normalize();
+    e2 = axis.cross(e1).normalized();
+}
+
+std::vector<Vec3d> GLGizmoPathCut::orb_ring(int ring) const
+{
+    const Vec3d axis = m_orb_ring >= 0 ? m_orb_start_axis : m_orb_axis; // the rings stay put while dragging
+    Vec3d       e1, e2;
+    orb_frame(axis, e1, e2);
+    const Vec3d n = ring == 0 ? e1 : e2, a = axis, b = n.cross(a);
+    const Vec3d c = m_orb_center + m_placing_offset;
+    std::vector<Vec3d> pts;
+    for (int k = 0; k <= 64; ++k) {
+        const double t = 2. * PI * k / 64.;
+        pts.push_back(c + (a * std::cos(t) + b * std::sin(t)) * m_orb_radius);
+    }
+    return pts;
+}
+
+// The ring under the mouse (within 7 px of it on screen), or -1.
+int GLGizmoPathCut::orb_pick(const Vec2d &mouse_pos) const
+{
+    const Camera &camera = wxGetApp().plater()->get_camera();
+    int           best   = -1;
+    double        bd     = 7. * m_parent.get_scale();
+    for (int ring = 0; ring < 2; ++ring) {
+        const Points pts = CameraUtils::project(camera, orb_ring(ring));
+        for (size_t k = 0; k + 1 < pts.size(); ++k) {
+            const Vec2d  a = pts[k].cast<double>(), b = pts[k + 1].cast<double>(), ab = b - a;
+            const double t = ab.squaredNorm() > 0. ? std::clamp((mouse_pos - a).dot(ab) / ab.squaredNorm(), 0., 1.) : 0.;
+            const double d = (a + ab * t - mouse_pos).norm();
+            if (d < bd) { bd = d; best = ring; }
+        }
+    }
+    return best;
+}
+
+// Where the mouse ray meets the plane of a ring, as a direction from its centre; false when it misses.
+bool GLGizmoPathCut::orb_plane_dir(const Vec2d &mouse_pos, int ring, Vec3d &dir) const
+{
+    Vec3d e1, e2;
+    orb_frame(m_orb_start_axis, e1, e2);
+    const Vec3d n = ring == 0 ? e1 : e2, c = m_orb_center + m_placing_offset;
+    Vec3d       point, ray;
+    CameraUtils::ray_from_screen_pos(wxGetApp().plater()->get_camera(), mouse_pos, point, ray);
+    const double den = n.dot(ray);
+    if (std::abs(den) < 1e-9)
+        return false;
+    const Vec3d p = point + ray * (n.dot(c - point) / den);
+    dir           = p - c - n * n.dot(p - c);
+    if (dir.norm() < 1e-9)
+        return false;
+    dir.normalize();
+    return true;
+}
+
+bool GLGizmoPathCut::on_orb_mouse(const wxMouseEvent &mouse_event, const Vec2d &mouse_pos)
+{
+    if (!m_pending || !m_pending->placer || !m_pending->placer->error().empty() || m_conn.type == PathCut::ConnectorType::None)
+        return false;
+    if (m_orb_ring >= 0) {
+        if (mouse_event.Dragging() && mouse_event.LeftIsDown()) {
+            Vec3d d;
+            if (orb_plane_dir(mouse_pos, m_orb_ring, d)) {
+                Vec3d e1, e2;
+                orb_frame(m_orb_start_axis, e1, e2);
+                const Vec3d  n     = m_orb_ring == 0 ? e1 : e2;
+                double       angle = std::atan2(n.dot(m_orb_start_dir.cross(d)), m_orb_start_dir.dot(d));
+                const double step  = PI / 180.;
+                angle              = step * std::round(angle / step);
+                m_orb_axis         = (Eigen::AngleAxisd(angle, n) * m_orb_start_axis).normalized();
+                // Not past 80 degrees from the direction the pieces come apart in (they would not come apart).
+                const Vec3d pull = Vec3d(m_pending->placer->pull_axis());
+                double      tilt = 0., turn = 0.;
+                PathCut::tilt_of(pull, m_orb_axis, tilt, turn);
+                if (tilt > 80.)
+                    m_orb_axis = Vec3d(PathCut::tilted_axis(pull, 80., turn));
+                rebuild_orb();
+                m_parent.set_as_dirty();
+            }
+            return true;
+        }
+        if (mouse_event.LeftUp()) {
+            m_orb_ring = -1;
+            double tilt = 0., turn = 0.;
+            PathCut::tilt_of(m_pending->placer->pull_axis(), m_orb_axis, tilt, turn);
+            m_conn.tilt = std::round(tilt);
+            m_conn.turn = std::round(turn);
+            connectors_changed(); // the connectors take the new direction (and the orb follows the placer)
+            m_parent.set_as_dirty();
+            return true;
+        }
+        return true;
+    }
+    if (mouse_event.Moving()) {
+        const int hover = orb_pick(mouse_pos);
+        if (hover != m_orb_hover) {
+            m_orb_hover = hover;
+            m_parent.set_as_dirty();
+        }
+        return false;
+    }
+    if (mouse_event.LeftDown() && !mouse_event.CmdDown() && m_orb_hover >= 0 && orb_pick(mouse_pos) == m_orb_hover) {
+        m_orb_start_axis = m_orb_axis;
+        if (!orb_plane_dir(mouse_pos, m_orb_hover, m_orb_start_dir))
+            return false;
+        m_orb_ring = m_orb_hover;
+        clear_hover();
+        if (!m_parent.has_mouse_capture())
+            m_parent.get_wxglcanvas()->CaptureMouse(); // released by the canvas on button up
+        return true;
+    }
+    return false;
+}
+
+void GLGizmoPathCut::rebuild_orb()
+{
+    for (GLModel &m : m_orb_models) m.reset();
+    for (int ring = 0; ring < 2; ++ring) {
+        const std::vector<Vec3d> pts = orb_ring(ring);
+        GLModel::Geometry        g;
+        g.format = {GLModel::Geometry::EPrimitiveType::LineStrip, GLModel::Geometry::EVertexLayout::P3};
+        for (size_t k = 0; k < pts.size(); ++k) {
+            g.add_vertex(Vec3f(pts[k].cast<float>()));
+            g.add_index(unsigned(k));
+        }
+        m_orb_models[ring].init_from(std::move(g));
+    }
+    // The arrow: a line from the centre along the direction, through the cut face both ways.
+    const Vec3d       c = m_orb_center + m_placing_offset;
+    GLModel::Geometry g;
+    g.format = {GLModel::Geometry::EPrimitiveType::Lines, GLModel::Geometry::EVertexLayout::P3};
+    g.add_vertex(Vec3f((c - m_orb_axis * (0.5 * m_orb_radius)).cast<float>()));
+    g.add_vertex(Vec3f((c + m_orb_axis * (1.3 * m_orb_radius)).cast<float>()));
+    g.add_line(0, 1);
+    // arrow head
+    Vec3d e1, e2;
+    orb_frame(m_orb_axis, e1, e2);
+    const Vec3d tip = c + m_orb_axis * (1.3 * m_orb_radius), back = tip - m_orb_axis * (0.15 * m_orb_radius);
+    for (const Vec3d &s : {e1, -e1, e2, -e2}) {
+        const unsigned base = unsigned(g.vertices_count());
+        g.add_vertex(Vec3f(tip.cast<float>()));
+        g.add_vertex(Vec3f((back + s * (0.08 * m_orb_radius)).cast<float>()));
+        g.add_line(base, base + 1);
+    }
+    m_orb_models[2].init_from(std::move(g));
+}
+
+void GLGizmoPathCut::render_orb()
+{
+    if (!m_pending || !m_pending->placer || !m_pending->placer->error().empty() || m_conn.type == PathCut::ConnectorType::None)
+        return;
+    GLShaderProgram *shader = wxGetApp().get_shader("flat");
+    if (shader == nullptr)
+        return;
+    const Camera &camera = wxGetApp().plater()->get_camera();
+    shader->start_using();
+    shader->set_uniform("view_model_matrix", camera.get_view_matrix());
+    shader->set_uniform("projection_matrix", camera.get_projection_matrix());
+    for (int ring = 0; ring < 2; ++ring)
+        if (m_orb_models[ring].is_initialized()) {
+            const bool active = m_orb_ring == ring || (m_orb_ring < 0 && m_orb_hover == ring);
+            shader->set_uniform("width", active ? 3.f : 1.5f);
+            m_orb_models[ring].set_color(active ? ORB_HOVER_COLOR : ORB_RING_COLOR[ring]);
+            m_orb_models[ring].render();
+        }
+    if (m_orb_models[2].is_initialized()) {
+        shader->set_uniform("width", 2.f);
+        m_orb_models[2].set_color(ORB_AXIS_COLOR);
+        m_orb_models[2].render();
+    }
+    shader->stop_using();
+}
+
+std::string GLGizmoPathCut::orb_tooltip() const
+{
+    if (!m_pending || !m_pending->placer)
+        return "";
+    if (m_orb_ring >= 0) {
+        double tilt = 0., turn = 0.;
+        PathCut::tilt_of(m_pending->placer->pull_axis(), m_orb_axis, tilt, turn);
+        return GUI::format(_u8L("Connector tilt %1% deg, towards %2% deg"), int(std::round(tilt)), int(std::round(turn)));
+    }
+    return m_orb_hover >= 0 ? _u8L("Drag to turn the direction of the connectors") : "";
 }
 
 void GLGizmoPathCut::rebuild_done()
