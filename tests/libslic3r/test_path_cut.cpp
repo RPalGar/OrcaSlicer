@@ -217,6 +217,79 @@ TEST_CASE("A cut along a loop around a part still connected elsewhere is made an
     CHECK_FALSE(PathCut::joined_routes(res).empty());
 }
 
+TEST_CASE("Connectors go on the faces of every cut it took to separate the pieces", "[PathCut]")
+{
+    // A ring (torus, R = 15, r = 4) cut around its tube on one side stays in one piece; a second loop on
+    // the other side separates it. The pieces come apart along both faces, so connectors go on both.
+    const double         R = 15., r = 4.;
+    constexpr int        nu = 64, nv = 24;
+    indexed_triangle_set ring;
+    for (int i = 0; i < nu; ++i)
+        for (int j = 0; j < nv; ++j) {
+            const double u = 2. * PI * i / nu, v = 2. * PI * j / nv;
+            ring.vertices.emplace_back(float((R + r * std::cos(v)) * std::cos(u)), float((R + r * std::cos(v)) * std::sin(u)),
+                                       float(r * std::sin(v)));
+        }
+    auto at = [](int i, int j) { return ((i + nu) % nu) * nv + (j + nv) % nv; };
+    for (int i = 0; i < nu; ++i)
+        for (int j = 0; j < nv; ++j) {
+            ring.indices.emplace_back(at(i, j), at(i + 1, j), at(i + 1, j + 1));
+            ring.indices.emplace_back(at(i, j), at(i + 1, j + 1), at(i, j + 1));
+        }
+    auto cut_around = [R, r](const indexed_triangle_set &its, double u0) {
+        std::vector<PathCut::V3> loop;
+        for (int k = 0; k < 12; ++k) {
+            const double v = 2. * PI * k / 12.;
+            loop.emplace_back((R + r * std::cos(v)) * std::cos(u0), (R + r * std::cos(v)) * std::sin(u0), r * std::sin(v));
+        }
+        const PathCut::LoopCutter lc = PathCut::make_loop_cutter(loop, 0.2, 1.5, [](const PathCut::V3 &p) { return p; }, false);
+        REQUIRE(lc.valid());
+        return PathCut::cut_along_loop(its, lc, 1.5);
+    };
+    auto no_side = [](const PathCut::V3 &) { return 0; };
+
+    const PathCut::CutResult first = cut_around(ring, 0.05);
+    REQUIRE(first.error.empty());
+    bool joined = false;
+    PathCut::group_cut(first, no_side, true, &joined);
+    REQUIRE(joined);
+    indexed_triangle_set first_faces; // as the tool keeps them: a copy of the cap triangles
+    for (size_t i = first.first_cap; i < first.mesh.indices.size(); ++i) {
+        const int base = int(first_faces.vertices.size());
+        for (int k = 0; k < 3; ++k) first_faces.vertices.push_back(first.mesh.vertices[size_t(first.mesh.indices[i][k])]);
+        first_faces.indices.emplace_back(base, base + 1, base + 2);
+    }
+
+    PathCut::CutResult second = cut_around(first.mesh, PI + 0.05);
+    REQUIRE(second.error.empty());
+    std::vector<signed char> vertex_side;
+    const PathCut::Grouped   g = PathCut::group_cut(second, no_side, true, &joined, &vertex_side);
+    REQUIRE_FALSE(joined);
+    PathCut::add_earlier_faces(second, first_faces, vertex_side);
+    CHECK(second.earlier_faces.size() == first_faces.indices.size());
+
+    const int                   level = PathCut::peg_side(second, g.side_a, g.side_b);
+    const indexed_triangle_set &from  = level == 1 ? g.side_a : g.side_b;
+    const indexed_triangle_set &to    = level == 1 ? g.side_b : g.side_a;
+    PathCut::ConnectorParams    prm;
+    prm.type  = PathCut::ConnectorType::Plug;
+    prm.count = 2;
+    prm.size  = 2.;
+    prm.depth = 3.;
+    prm.wall  = 0.5;
+    std::string                    error;
+    const PathCut::ConnectorResult c = PathCut::place_connectors(second, level, from, to, prm, error);
+    REQUIRE(error.empty());
+    REQUIRE(c.positions.size() == 2);
+    // One on each face: the first cut's at x = +R, the second's at x = -R.
+    CHECK(std::max(c.positions[0].x(), c.positions[1].x()) > 10.);
+    CHECK(std::min(c.positions[0].x(), c.positions[1].x()) < -10.);
+    for (const PathCut::V3 &p : c.positions) {
+        CHECK(PathCut::point_inside(from, p - 1. * c.axis));
+        CHECK(PathCut::point_inside(to, p + prm.depth * c.axis));
+    }
+}
+
 TEST_CASE("A cut exactly along a loop around a pipe keeps its bore open in both pieces", "[PathCut]")
 {
     // A pipe (outer r = 8, bore r = 4, h = 30) cut by a loop around its outside at mid height: the walls of

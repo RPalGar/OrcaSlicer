@@ -1087,6 +1087,7 @@ struct PathCutJob
     std::vector<Extra>       extras;           // object coordinates
     std::vector<unsigned char> extra_sides;    // per extra: 1 = in side_a, 2 = in side_b (bits), from the cut
     indexed_triangle_set     removed;          // the negative volumes joined: no new connector runs into them
+    indexed_triangle_set     earlier_faces;    // faces of the earlier cuts that left the object in one piece
     // the object
     int          obj_idx{-1}, inst_idx{-1};
     ModelObject *mo{nullptr};
@@ -1784,6 +1785,8 @@ void GLGizmoPathCut::perform_cut()
     st->conn     = m_conn;
     st->merged_parts   = parts;
     st->conn_manual    = m_conn_manual;
+    st->earlier_faces  = m_done_faces; // shown in world coordinates, the job works relative to the offset
+    for (auto &v : st->earlier_faces.vertices) v -= st->offset.cast<float>();
 
     m_busy             = true;
     m_message          = _u8L("Cutting, please wait...");
@@ -1875,8 +1878,15 @@ void GLGizmoPathCut::perform_cut()
             st->error = res.error;
             return;
         }
-        st->grouped = PathCut::group_cut(res, side, st->mode == GLGizmoPathCut::Mode::Loop, &st->joined);
+        std::vector<signed char> vertex_side;
+        st->grouped = PathCut::group_cut(res, side, st->mode == GLGizmoPathCut::Mode::Loop, &st->joined,
+                                         st->earlier_faces.indices.empty() ? nullptr : &vertex_side);
         lap("grouping");
+        if (!st->joined && !st->earlier_faces.indices.empty()) {
+            // The pieces come apart along the faces of all the cuts: connectors can go on any of them.
+            PathCut::add_earlier_faces(res, st->earlier_faces, vertex_side);
+            BOOST_LOG_TRIVIAL(info) << "PathCut: " << res.earlier_faces.size() << " triangles of earlier cut faces";
+        }
         if (!st->extras.empty()) {
             st->extra_sides = extras_in_sides(st->extras, st->grouped.side_a, st->grouped.side_b);
             lap("volumes kept");

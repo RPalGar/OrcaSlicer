@@ -34,6 +34,7 @@
 #include <functional>
 #include <limits>
 #include <queue>
+#include <set>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -1127,6 +1128,9 @@ struct CutResult
     size_t               cap_triangles{0};
     size_t               first_cap{0};  // index of the first cap triangle in mesh.indices
     std::vector<signed char> level;     // per vertex: +1 / -1 on the cut face of that side, 0 elsewhere
+    // Faces of earlier cuts that left the object in one piece (see add_earlier_faces): indices in
+    // mesh.indices, their vertices leveled by the side they end up in. Part of the cut face for connectors.
+    std::vector<size_t>      earlier_faces;
 };
 
 namespace detail {
@@ -2486,8 +2490,10 @@ inline void its_append(indexed_triangle_set &dst, const indexed_triangle_set &sr
 // vote) or, with `untouched_follow_inside`, follow a side-a part they lie inside. A part carrying both
 // cut faces is still connected around the cut (an arm resting on a leg, say): it goes to side b and
 // `joined` is set.
+// `vertex_side` (optional) gets, per vertex of cut.mesh, the side it ends up in: +1 side_a, -1 side_b.
 template<class SideOf>
-Grouped group_cut(const CutResult &cut, SideOf side_of, bool untouched_follow_inside, bool *joined = nullptr)
+Grouped group_cut(const CutResult &cut, SideOf side_of, bool untouched_follow_inside, bool *joined = nullptr,
+                  std::vector<signed char> *vertex_side = nullptr)
 {
     const indexed_triangle_set &its = cut.mesh;
     std::vector<int>            dsu(its.vertices.size());
@@ -2536,6 +2542,13 @@ Grouped group_cut(const CutResult &cut, SideOf side_of, bool untouched_follow_in
             label[i] = vote > 0 ? 1 : -1;
         }
     }
+    if (vertex_side) {
+        vertex_side->assign(its.vertices.size(), 0);
+        for (size_t v = 0; v < its.vertices.size(); ++v) {
+            const auto it = comp_of_root.find(find(int(v)));
+            if (it != comp_of_root.end()) (*vertex_side)[v] = label[it->second] == 1 ? 1 : -1;
+        }
+    }
     Grouped g;
     for (size_t i = 0; i < parts.size(); ++i) {
         if (std::abs(signed_volume(parts[i])) < 1.) ++g.n_small;
@@ -2543,6 +2556,74 @@ Grouped group_cut(const CutResult &cut, SideOf side_of, bool untouched_follow_in
         else               { its_append(g.side_b, parts[i]); ++g.n_b; }
     }
     return g;
+}
+
+// A cut that leaves the object in one piece is followed by others until the pieces come apart; the cut
+// face between the pieces is then made of the faces of all of them. Finds the triangles of `faces` (the
+// cut faces of the earlier cuts, in the coordinates of cut.mesh, from a copy of the mesh: positions match
+// within `tol`) in cut.mesh and adds them to the cut face of the side they end up in (`vertex_side` from
+// group_cut), so connectors can go on them too. Triangles the new cut split are left out.
+inline void add_earlier_faces(CutResult &cut, const indexed_triangle_set &faces, const std::vector<signed char> &vertex_side,
+                              double tol = 1e-3)
+{
+    cut.earlier_faces.clear();
+    if (faces.indices.empty() || vertex_side.size() != cut.mesh.vertices.size()) return;
+    // Vertices of `faces`, merged within tol, on a grid of cells of 4 tol.
+    const double cell = 4. * tol;
+    auto key_of = [cell](const V3 &p, int dx, int dy, int dz) {
+        const int64_t x = int64_t(std::floor(p.x() / cell)) + dx, y = int64_t(std::floor(p.y() / cell)) + dy,
+                      z = int64_t(std::floor(p.z() / cell)) + dz;
+        return uint64_t(x & 0x1fffff) | (uint64_t(y & 0x1fffff) << 21) | (uint64_t(z & 0x1fffff) << 42);
+    };
+    std::unordered_map<uint64_t, std::vector<int>> grid;
+    std::vector<V3>                                 pos;
+    auto find_id = [&](const V3 &p) {
+        for (int dx = -1; dx <= 1; ++dx)
+            for (int dy = -1; dy <= 1; ++dy)
+                for (int dz = -1; dz <= 1; ++dz) {
+                    const auto it = grid.find(key_of(p, dx, dy, dz));
+                    if (it != grid.end())
+                        for (int id : it->second)
+                            if ((pos[size_t(id)] - p).squaredNorm() <= tol * tol) return id;
+                }
+        return -1;
+    };
+    auto tri_key = [](int a, int b, int c) {
+        if (a > b) std::swap(a, b);
+        if (b > c) std::swap(b, c);
+        if (a > b) std::swap(a, b);
+        return std::array<int, 3>{a, b, c};
+    };
+    std::set<std::array<int, 3>> tris;
+    for (const auto &t : faces.indices) {
+        int ids[3];
+        for (int k = 0; k < 3; ++k) {
+            const V3 p = faces.vertices[size_t(t[k])].cast<double>();
+            ids[k]     = find_id(p);
+            if (ids[k] < 0) {
+                ids[k] = int(pos.size());
+                pos.push_back(p);
+                grid[key_of(p, 0, 0, 0)].push_back(ids[k]);
+            }
+        }
+        tris.insert(tri_key(ids[0], ids[1], ids[2]));
+    }
+    const indexed_triangle_set &m = cut.mesh;
+    std::vector<int>            id_of(m.vertices.size(), -2); // -2: not looked up yet
+    auto mesh_id = [&](int v) {
+        int &id = id_of[size_t(v)];
+        if (id == -2) id = find_id(m.vertices[size_t(v)].cast<double>());
+        return id;
+    };
+    if (cut.level.size() < m.vertices.size()) cut.level.resize(m.vertices.size(), 0);
+    for (size_t i = 0; i < m.indices.size(); ++i) {
+        if (i >= cut.first_cap && i < cut.first_cap + cut.cap_triangles) continue;
+        const auto &t = m.indices[i];
+        const int   a = mesh_id(t[0]), b = mesh_id(t[1]), c = mesh_id(t[2]);
+        if (a < 0 || b < 0 || c < 0 || !tris.count(tri_key(a, b, c))) continue;
+        cut.earlier_faces.push_back(i);
+        for (int k = 0; k < 3; ++k) cut.level[size_t(t[k])] = vertex_side[size_t(t[k])];
+    }
 }
 
 // Where a cut that did not separate the object is still connected: shortest routes over the surface

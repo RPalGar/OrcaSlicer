@@ -175,14 +175,19 @@ inline void append_prism(indexed_triangle_set &its, const Frame &f, const V2 &q,
 
 } // namespace detail
 
-// Triangles of the cut face of one side (cut faces with `level`), and the sum of their area vectors
-// (outward of that side). Returns the total area.
+// Triangles of the cut face of one side (cut faces with `level`, also those of earlier cuts), and the
+// sum of their area vectors (outward of that side). Returns the total area.
 inline double cut_face(const CutResult &cut, int level, std::vector<size_t> *face, V3 &nsum)
 {
     const indexed_triangle_set &m = cut.mesh;
     double                      area = 0.;
     nsum                             = V3::Zero();
-    for (size_t i = cut.first_cap; i < cut.first_cap + cut.cap_triangles && i < m.indices.size(); ++i) {
+    std::vector<size_t> tris;
+    tris.reserve(cut.cap_triangles + cut.earlier_faces.size());
+    for (size_t i = cut.first_cap; i < cut.first_cap + cut.cap_triangles && i < m.indices.size(); ++i) tris.push_back(i);
+    for (size_t i : cut.earlier_faces)
+        if (i < m.indices.size()) tris.push_back(i);
+    for (size_t i : tris) {
         const auto &t     = m.indices[i];
         int         votes = 0;
         for (int k = 0; k < 3; ++k)
