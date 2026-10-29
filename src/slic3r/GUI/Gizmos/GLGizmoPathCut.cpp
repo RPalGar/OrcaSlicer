@@ -1597,7 +1597,8 @@ void GLGizmoPathCut::rebuild_orb()
     Vec3d e1, e2;
     orb_frame(m_orb_axis, e1, e2);
     const Vec3d tip = c + m_orb_axis * (1.3 * m_orb_radius), back = tip - m_orb_axis * (0.15 * m_orb_radius);
-    for (const Vec3d &s : {e1, -e1, e2, -e2}) {
+    const Vec3d sides[4] = {e1, -e1, e2, -e2};
+    for (const Vec3d &s : sides) {
         const unsigned base = unsigned(g.vertices_count());
         g.add_vertex(Vec3f(tip.cast<float>()));
         g.add_vertex(Vec3f((back + s * (0.08 * m_orb_radius)).cast<float>()));
