@@ -36984,8 +36984,7 @@ msgstr ""
 "Divide tus impresiones en camas\n"
 "¿Sabías que puedes dividir un modelo con muchas piezas en camas individuales listas para imprimir? Esto simplificará el proceso de seguimiento de todas las piezas."
 
-#: resources/data/hints.ini: [hint:Speed up your print with Adaptive Layer
-#: Height]
+#: resources/data/hints.ini: [hint:Speed up your print with Adaptive Layer Height]
 msgid ""
 "Speed up your print with Adaptive Layer Height\n"
 "Did you know that you can print a model even faster by using the Adaptive Layer Height option? Check it out!"
@@ -37057,8 +37056,7 @@ msgstr ""
 "Mejorar la resistencia\n"
 "¿Sabías que puedes utilizar más bucles de perímetro y mayor densidad de relleno de baja densidad para mejorar la resistencia del modelo?"
 
-#: resources/data/hints.ini: [hint:When do you need to print with the printer
-#: door opened]
+#: resources/data/hints.ini: [hint:When do you need to print with the printer door opened]
 msgid ""
 "When do you need to print with the printer door opened?\n"
 "Did you know that opening the printer door can reduce the probability of extruder/hotend clogging when printing lower temperature filament with a higher enclosure temperature? There is more info about this in the Wiki."
@@ -37073,3 +37071,364 @@ msgid ""
 msgstr ""
 "Evita la deformación\n"
 "¿Sabías que al imprimir materiales propensos a la deformación como el ABS, aumentar adecuadamente la temperatura de la cama térmica puede reducir la probabilidad de deformaciones?"
+
+# AI Translated
+msgid "The cut ends inside the object. Increase or remove the limits, or start and end the path beyond the part."
+msgstr "El corte termina dentro del objeto. Aumenta o quita los límites, o empieza y acaba la ruta fuera de la pieza."
+
+# AI Translated
+msgid "The path needs at least two points."
+msgstr "La ruta necesita al menos dos puntos."
+
+# AI Translated
+msgid "The path crosses itself seen from the view. Place the points in order along the cut line."
+msgstr "La ruta se cruza consigo misma vista desde la cámara. Coloca los puntos en orden a lo largo de la línea de corte."
+
+# AI Translated
+msgid "The path must not end where it starts. Use the loop mode for closed paths."
+msgstr "La ruta no debe terminar donde empieza. Usa el modo de lazo para rutas cerradas."
+
+# AI Translated
+msgid "The loop does not go all the way around the part. Place the points around it, or lower the cap margin."
+msgstr "El lazo no rodea la pieza por completo. Coloca los puntos alrededor de ella o reduce el margen de la tapa."
+
+# AI Translated
+msgid "The loop needs at least three points."
+msgstr "El lazo necesita al menos tres puntos."
+
+# AI Translated
+msgid "The loop is degenerate (it encloses no area)."
+msgstr "El lazo es degenerado (no encierra ninguna superficie)."
+
+# AI Translated
+msgid "The loop folds back on itself seen from its mean plane. Place the points more evenly around the part."
+msgstr "El lazo se dobla sobre sí mismo visto desde su plano medio. Reparte los puntos de forma más uniforme alrededor de la pieza."
+
+# AI Translated
+msgid "The loop is too irregular. Place the points more evenly around the part."
+msgstr "El lazo es demasiado irregular. Reparte los puntos de forma más uniforme alrededor de la pieza."
+
+# AI Translated
+msgid "The model has holes along the cut, so the cut faces cannot be closed. Repair the model first."
+msgstr "El modelo tiene agujeros a lo largo del corte y no se pueden cerrar las caras del corte. Repara antes el modelo."
+
+msgid "The cut could not follow the loop along the surface. Place more points, closer together, along the line where you want to cut, or raise the margin."
+msgstr "El corte no ha podido seguir el lazo por la superficie. Pon más puntos, más juntos, a lo largo de la línea por donde quieres cortar, o aumenta la desviación máxima."
+
+# AI Translated
+msgid "The connector does not fit there: too close to the edge of the cut face."
+msgstr "El conector no cabe ahí: está demasiado cerca del borde de la cara de corte."
+
+# AI Translated
+msgid "The connector does not fit there: the cut face is too steep or uneven under it."
+msgstr "El conector no cabe ahí: la cara de corte es demasiado inclinada o irregular en ese punto."
+
+# AI Translated
+msgid "The connector does not fit there: the part is too thin for its depth. Make it shorter or try another spot."
+msgstr "El conector no cabe ahí: la pieza es demasiado fina para su profundidad. Hazlo más corto o prueba en otro punto."
+
+# AI Translated
+msgid "The connector does not fit there: it would run into a hole that is already there."
+msgstr "El conector no cabe ahí: chocaría con un agujero que ya existe."
+
+# AI Translated
+msgid "The connector does not fit there: too close to another connector."
+msgstr "El conector no cabe ahí: está demasiado cerca de otro conector."
+
+# AI Translated
+msgid "Click on the cut face to place a connector."
+msgstr "Haz clic en la cara de corte para colocar un conector."
+
+# AI Translated
+msgid "No connectors fit: the cut face is too small or too thin for them. Make them smaller or shorter."
+msgstr "No caben conectores: la cara de corte es demasiado pequeña o estrecha para ellos. Hazlos más pequeños o más cortos."
+
+# AI Translated
+msgid "No connectors fit: the cut face is too curved for a straight connector."
+msgstr "No caben conectores: la cara de corte es demasiado curva para un conector recto."
+
+# AI Translated
+msgid "The path did not split the object. Make sure it crosses the object completely."
+msgstr "La ruta no ha dividido el objeto. Asegúrate de que lo atraviesa por completo."
+
+# AI Translated
+msgid "The loop did not detach anything. Make sure it goes all the way around the part."
+msgstr "El lazo no ha separado nada. Asegúrate de que rodea la pieza por completo."
+
+# AI Translated
+msgid "The cap spanning the loop runs into another part of the model. Place the loop where the part is free all around."
+msgstr "La tapa que rellena el lazo choca con otra parte del modelo. Coloca el lazo donde la pieza esté libre alrededor."
+
+# AI Translated
+msgid "The object was changed while it was being cut. Cut it again."
+msgstr "El objeto se ha modificado mientras se cortaba. Vuelve a cortarlo."
+
+# AI Translated
+msgid "The cut failed. Try a simpler path or a lower resolution model."
+msgstr "El corte ha fallado. Prueba con una ruta más sencilla o un modelo de menor resolución."
+
+# AI Translated
+msgid "Cut along path"
+msgstr "Cortar por ruta"
+
+# AI Translated
+msgid "It does not fit there, but it will be placed anyway: check the pieces."
+msgstr "Ahí no cabe, pero se colocará igualmente: revisa las piezas."
+
+# AI Translated
+msgid "Clearance (mm)"
+msgstr "Holgura (mm)"
+
+# AI Translated
+msgid "Min. cap margin (mm)"
+msgstr "Margen mín. de la tapa (mm)"
+
+msgid "Max. deviation (mm)"
+msgstr "Desviación máx. (mm)"
+
+# AI Translated
+msgid "Cut direction"
+msgstr "Dirección del corte"
+
+# AI Translated
+msgid "Turn (deg)"
+msgstr "Giro (°)"
+
+# AI Translated
+msgid "Tilt (deg)"
+msgstr "Inclinación (°)"
+
+# AI Translated
+msgid "Number of connectors"
+msgstr "Número de conectores"
+
+# AI Translated
+msgid "Diameter / side (mm)"
+msgstr "Diámetro / lado (mm)"
+
+# AI Translated
+msgid "Depth (mm)"
+msgstr "Profundidad (mm)"
+
+# AI Translated
+msgid "Hole clearance (mm)"
+msgstr "Holgura del agujero (mm)"
+
+# AI Translated
+msgid "Limit in front (mm)"
+msgstr "Limitar por delante (mm)"
+
+# AI Translated
+msgid "Limit behind (mm)"
+msgstr "Limitar por detrás (mm)"
+
+# AI Translated
+msgid "Limit past the first point (mm)"
+msgstr "Limitar tras el primer punto (mm)"
+
+# AI Translated
+msgid "Limit past the last point (mm)"
+msgstr "Limitar tras el último punto (mm)"
+
+# AI Translated
+msgid "Path from view"
+msgstr "Ruta desde la vista"
+
+# AI Translated
+msgid "Closed loop on surface"
+msgstr "Lazo cerrado sobre la superficie"
+
+# AI Translated
+msgid "Click points on the object along the line where it should be split. The path is extended past the object and cut straight through it in the direction you were looking when you placed the first point."
+msgstr "Haz clic en puntos del objeto a lo largo de la línea por donde quieres dividirlo. La ruta se prolonga más allá del objeto y lo atraviesa en línea recta en la dirección en la que mirabas al colocar el primer punto."
+
+# AI Translated
+msgid "Click points on the surface all the way around the part to detach (e.g. an arm). The loop closes itself; a curved cap spanning it separates only that part."
+msgstr "Haz clic en puntos de la superficie alrededor de toda la parte que quieres separar (por ejemplo, un brazo). El lazo se cierra solo; una tapa curva que lo rellena separa únicamente esa parte."
+
+# AI Translated
+msgid "Click to add a point, right click removes the last one. Drag to rotate the view."
+msgstr "Haz clic para añadir un punto; el clic derecho elimina el último. Arrastra para girar la vista."
+
+# AI Translated
+msgid "Points: %1%"
+msgstr "Puntos: %1%"
+
+msgid "The object was changed during the preview. Make the preview again."
+msgstr "El objeto ha cambiado durante la vista previa. Vuelve a hacer la vista previa."
+
+# AI Translated
+msgid "Undo point"
+msgstr "Deshacer punto"
+
+msgid "Preview cut"
+msgstr "Vista previa"
+
+msgid "Edit cut"
+msgstr "Editar"
+
+# AI Translated
+msgid "Cut cancelled."
+msgstr "Corte cancelado."
+
+# AI Translated
+msgid "Click on the cut face (orange) where each connector should go. Right click removes the last one. Then apply the cut."
+msgstr "Haz clic en la cara de corte (naranja) donde quieras cada conector. El clic derecho quita el último. Después aplica el corte."
+
+# AI Translated
+msgid "%1% connector placed"
+msgid_plural "%1% connectors placed"
+msgstr[0] "%1% conector colocado"
+msgstr[1] "%1% conectores colocados"
+
+# AI Translated
+msgid "Undo connector"
+msgstr "Deshacer conector"
+
+# AI Translated
+msgid "Apply cut"
+msgstr "Aplicar corte"
+
+# AI Translated
+msgid "Flat cut face"
+msgstr "Cara de corte plana"
+
+# AI Translated
+msgid "Follow the model's edges"
+msgstr "Seguir las aristas del modelo"
+
+# AI Translated
+msgid "Between the points you place, the loop follows the sharpest edges of the model nearby (a seam, the line between belly and back), so a few points are enough."
+msgstr "Entre los puntos que colocas, el lazo sigue las aristas más marcadas del modelo cercanas (una costura, la línea entre la panza y el lomo), así que bastan unos pocos puntos."
+
+# AI Translated
+msgid "From the view"
+msgstr "Desde la vista"
+
+# AI Translated
+msgid "Level with the bed"
+msgstr "Nivelada con la cama"
+
+# AI Translated
+msgid "Peg and hole"
+msgstr "Espiga y agujero"
+
+# AI Translated
+msgid "Separate pin"
+msgstr "Pasador suelto"
+
+# AI Translated
+msgid "Connector tilt (deg)"
+msgstr "Inclinación de los conectores (°)"
+
+# AI Translated
+msgid "Tilts all the connectors away from the direction the pieces come apart in. They stay parallel, so the pieces still come apart, along the new direction."
+msgstr "Inclina todos los conectores respecto a la dirección en que se separan las piezas. Siguen paralelos, así que las piezas se siguen separando, en la nueva dirección."
+
+# AI Translated
+msgid "Tilt towards (deg)"
+msgstr "Inclinar hacia (°)"
+
+# AI Translated
+msgid "Place even where it does not fit"
+msgstr "Colocar aunque no quepa"
+
+# AI Translated
+msgid "A click places the connector where the checks say it does not fit (shown in orange). Its hole is still cut with the clearance set. Check the pieces before printing."
+msgstr "Un clic coloca el conector aunque las comprobaciones digan que no cabe (se ve en naranja). Su agujero se sigue haciendo con la holgura configurada. Revisa las piezas antes de imprimir."
+
+# AI Translated
+msgid "Straight connectors along the mean direction of the cut face. After the cut is computed, click on the cut face where each one should go: each spot is checked for room in both parts. Two or more also keep the parts from turning."
+msgstr "Conectores rectos en la dirección media de la cara de corte. Cuando el corte esté calculado, haz clic en la cara de corte donde quieras cada uno: se comprueba que haya sitio en las dos piezas. Con dos o más, además, las piezas no pueden girar."
+
+# AI Translated
+msgid "Straight connectors along the mean direction of the cut face, placed automatically where both parts have room for them. Two or more also keep the parts from turning."
+msgstr "Conectores rectos en la dirección media de la cara de corte, colocados automáticamente donde las dos partes tienen sitio. Con dos o más, además, las piezas no pueden girar."
+
+# AI Translated
+msgid "The cut is ready. Click on the cut face (orange) where each connector should go, then apply the cut."
+msgstr "El corte está listo. Haz clic en la cara de corte (naranja) donde quieras cada conector y después aplica el corte."
+
+# AI Translated
+msgid "%1% placed connector no longer fits with these settings and was removed."
+msgid_plural "%1% placed connectors no longer fit with these settings and were removed."
+msgstr[0] "%1% conector colocado ya no cabe con estos ajustes y se ha quitado."
+msgstr[1] "%1% conectores colocados ya no caben con estos ajustes y se han quitado."
+
+# AI Translated
+msgid "Connector tilt %1% deg, towards %2% deg"
+msgstr "Inclinación de los conectores %1%°, hacia %2%°"
+
+# AI Translated
+msgid "Drag to turn the direction of the connectors"
+msgstr "Arrastra para girar la dirección de los conectores"
+
+msgid "No object is selected. Select the object to cut and make the preview again."
+msgstr "No hay ningún objeto seleccionado. Selecciona el objeto que quieres cortar y vuelve a hacer la vista previa."
+
+msgid "Another object is selected. Place the points again on the object to cut."
+msgstr "Hay otro objeto seleccionado. Vuelve a colocar los puntos en el objeto que quieres cortar."
+
+# AI Translated
+msgid "This object has several copies. Cutting it would remove the other copies: make them separate objects first, then cut one of them."
+msgstr "Este objeto tiene varias copias. Al cortarlo se eliminarían las demás: conviértelas primero en objetos independientes y corta uno de ellos."
+
+# AI Translated
+msgid "The object was moved since the points were placed. Place them again."
+msgstr "El objeto se ha movido desde que se colocaron los puntos. Vuelve a colocarlos."
+
+# AI Translated
+msgid "Cutting, please wait..."
+msgstr "Cortando, espera..."
+
+msgid "The cut does not separate the object: it is still connected along the red lines. Edit the cut, or perform it now and cut the connection next."
+msgstr "El corte no separa el objeto: sigue unido por las líneas rojas. Edita el corte, o realízalo ahora y corta después esa unión."
+
+msgid "Preview: the pieces are shown apart. Perform the cut if it is right, or edit it."
+msgstr "Vista previa: las piezas se muestran separadas. Realiza el corte si está bien o edítalo."
+
+# AI Translated
+msgid "The cut could not be applied."
+msgstr "No se ha podido aplicar el corte."
+
+# AI Translated
+msgid "%1% - piece"
+msgstr "%1% - pieza"
+
+# AI Translated
+msgid "%1% - rest"
+msgstr "%1% - resto"
+
+# AI Translated
+msgid "%1% - cut"
+msgstr "%1% - corte"
+
+# AI Translated
+msgid "%1% - pin %2%"
+msgstr "%1% - pasador %2%"
+
+# AI Translated
+msgid "Cut along path: the cut is made, but the object is still in one piece. Cut the remaining connection to separate it."
+msgstr "Cortar por ruta: el corte está hecho, pero el objeto sigue siendo una sola pieza. Corta la unión que queda para separarlo."
+
+# AI Translated
+msgid "Cut along path: the cut is made, but the object is still in one piece. Cut the remaining connection to separate it. Connectors are only added once the cut separates the object."
+msgstr "Cortar por ruta: el corte está hecho, pero el objeto sigue siendo una sola pieza. Corta la unión que queda para separarlo. Los conectores solo se añaden cuando el corte separa el objeto."
+
+# AI Translated
+msgid "The cut is made, shown in orange. The object is still connected along the red lines: mark the next cut there."
+msgstr "El corte está hecho (en naranja). El objeto sigue unido por las líneas rojas: marca ahí el siguiente corte."
+
+# AI Translated
+msgid "Cut along path: %1%"
+msgstr "Cortar por ruta: %1%"
+
+# AI Translated
+msgid "Cut along path: only %1% of %2% connectors fits on the cut face."
+msgid_plural "Cut along path: only %1% of %2% connectors fit on the cut face."
+msgstr[0] "Cortar por ruta: solo cabe %1% de %2% conectores en la cara de corte."
+msgstr[1] "Cortar por ruta: solo caben %1% de %2% conectores en la cara de corte."
+
+# AI Translated
+msgid "Cut along path: the parts of the object were joined into one before cutting."
+msgstr "Cortar por ruta: las partes del objeto se han unido en una sola antes de cortar."
