@@ -5,6 +5,7 @@ on:
     branches:
      - main
      - release/*
+     - ci/beta4
     paths:
      - 'deps/**'
      - 'deps_src/**'
