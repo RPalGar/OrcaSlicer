@@ -5,7 +5,7 @@ on:
     branches:
      - main
      - release/*
-     - ci/beta4
+     - ci/lab-cut-modes
     paths:
      - 'deps/**'
      - 'deps_src/**'

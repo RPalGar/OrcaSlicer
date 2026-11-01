@@ -819,6 +819,11 @@ msgstr "Plano"
 msgid "Dovetail"
 msgstr "Cola de milano o pato"
 
+# AI Translated
+msgctxt "Cut mode"
+msgid "Curve"
+msgstr "Curva"
+
 msgid "Auto"
 msgstr "Automático"
 
