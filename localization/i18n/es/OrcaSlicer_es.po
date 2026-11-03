@@ -824,6 +824,34 @@ msgctxt "Cut mode"
 msgid "Curve"
 msgstr "Curva"
 
+# AI Translated
+msgid "Limits"
+msgstr "Límites"
+
+# AI Translated
+msgid "Place a connector on the cut face"
+msgstr "Colocar un conector en la cara de corte"
+
+# AI Translated
+msgid "Remove the last connector"
+msgstr "Quitar el último conector"
+
+# AI Translated
+msgid "Add a point around the part to detach"
+msgstr "Añadir un punto alrededor de la parte a separar"
+
+# AI Translated
+msgid "Add a point along the line to cut"
+msgstr "Añadir un punto en la línea de corte"
+
+# AI Translated
+msgid "Remove the last point"
+msgstr "Quitar el último punto"
+
+# AI Translated
+msgid "Rotate the view"
+msgstr "Girar la vista"
+
 msgid "Auto"
 msgstr "Automático"
 
