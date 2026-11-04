@@ -825,6 +825,14 @@ msgid "Curve"
 msgstr "Curva"
 
 # AI Translated
+msgid "The model has too few faces near the points to follow its edges: the cut goes through the points as placed."
+msgstr "El modelo tiene muy pocas caras cerca de los puntos para seguir sus aristas: el corte pasa por los puntos tal como se colocaron."
+
+# AI Translated
+msgid "On a model with so few faces a curved cut face can come out uneven. A flat cut face gives a clean cut."
+msgstr "En un modelo con tan pocas caras, una cara de corte curva puede salir irregular. Una cara de corte plana da un corte limpio."
+
+# AI Translated
 msgid "Limits"
 msgstr "Límites"
 
