@@ -37477,3 +37477,31 @@ msgstr[1] "Cortar por ruta: solo caben %1% de %2% conectores en la cara de corte
 # AI Translated
 msgid "Cut along path: the parts of the object were joined into one before cutting."
 msgstr "Cortar por ruta: las partes del objeto se han unido en una sola antes de cortar."
+
+# AI Translated
+msgid "Limits (enabled)"
+msgstr "Límites (activados)"
+
+# AI Translated
+msgid "In front (mm)"
+msgstr "Por delante (mm)"
+
+# AI Translated
+msgid "Behind (mm)"
+msgstr "Por detrás (mm)"
+
+# AI Translated
+msgid "Past the first point (mm)"
+msgstr "Tras el primer punto (mm)"
+
+# AI Translated
+msgid "Past the last point (mm)"
+msgstr "Tras el último punto (mm)"
+
+# AI Translated
+msgid "Connectors: %1%"
+msgstr "Conectores: %1%"
+
+# AI Translated
+msgid "Remove all the points"
+msgstr "Quitar todos los puntos"
