@@ -26,6 +26,7 @@
 #include "libslic3r/AABBMesh.hpp"
 #include "libslic3r/BoundingBox.hpp"
 #include "libslic3r/Geometry.hpp"
+#include "libslic3r/MeshBoolean.hpp"
 #include "libslic3r/Model.hpp"
 #include "libslic3r/PathCutConnectors.hpp"
 #include "libslic3r/PathCutGeometry.hpp"
@@ -34,6 +35,7 @@
 #include "libslic3r/libslic3r.h"
 
 #include <boost/log/trivial.hpp>
+#include <wx/utils.h>
 #include <glad/gl.h>
 #include <imgui/imgui.h>
 #include <wx/app.h>
@@ -957,6 +959,12 @@ void GLGizmoPathCut::on_render_input_window(float x, float y, float bottom_limit
                                           "Its hole is still cut with the clearance set. Check the pieces before printing."),
                                      ImGui::GetFontSize() * 20.f);
             }
+            // Only how the cut is applied: the preview stays.
+            m_imgui->bbl_checkbox(_L("Cut the holes into the pieces"), m_holes_in_mesh);
+            if (ImGui::IsItemHovered())
+                m_imgui->tooltip(_u8L("The holes are cut into the meshes of the pieces when the cut is made, so they show and are "
+                                      "exported with them. Otherwise they are negative volumes, subtracted when slicing."),
+                                 ImGui::GetFontSize() * 20.f);
         }
         end_section();
     }
@@ -2183,7 +2191,31 @@ void GLGizmoPathCut::do_apply_cut(const std::shared_ptr<PathCutJob> &st)
     }
     const PathCut::ConnectorResult &conn       = st->connectors;
     const bool                      connectors = sides.size() == 2 && !conn.positions.empty();
-    const indexed_triangle_set     *from_side  = st->connectors_from_a ? &grouped.side_a : &grouped.side_b;
+    indexed_triangle_set           *from_side  = st->connectors_from_a ? &grouped.side_a : &grouped.side_b;
+    indexed_triangle_set           *to_side    = st->connectors_from_a ? &grouped.side_b : &grouped.side_a;
+
+    // Holes cut into the meshes when asked; a hole set the boolean fails on stays a negative volume.
+    auto cut_holes = [](indexed_triangle_set &piece, const indexed_triangle_set &holes) {
+        if (holes.indices.empty())
+            return true;
+        std::vector<TriangleMesh> out;
+        try {
+            MeshBoolean::mcut::make_boolean(TriangleMesh(piece), TriangleMesh(holes), out, "A_NOT_B");
+        } catch (const std::exception &e) {
+            BOOST_LOG_TRIVIAL(warning) << "PathCut: cutting the connector holes failed: " << e.what();
+            return false;
+        }
+        if (out.empty() || out.front().empty() || out.front().volume() <= 0.)
+            return false;
+        piece = std::move(out.front().its);
+        return true;
+    };
+    bool holes_to_cut = false, holes_from_cut = false;
+    if (connectors && m_holes_in_mesh) {
+        wxBusyCursor wait;
+        holes_to_cut   = cut_holes(*to_side, conn.holes_to);
+        holes_from_cut = cut_holes(*from_side, conn.holes_from);
+    }
 
     Model                          tmp;
     // TRN %1%: the name of the object that was cut
@@ -2233,8 +2265,9 @@ void GLGizmoPathCut::do_apply_cut(const std::shared_ptr<PathCutJob> &st)
             const std::string name = _u8L("Connector");
             if (is_from) {
                 add_part(no, name, conn.pegs, ModelVolumeType::MODEL_PART);
-                add_part(no, name, conn.holes_from, ModelVolumeType::NEGATIVE_VOLUME);
-            } else
+                if (!holes_from_cut)
+                    add_part(no, name, conn.holes_from, ModelVolumeType::NEGATIVE_VOLUME);
+            } else if (!holes_to_cut)
                 add_part(no, name, conn.holes_to, ModelVolumeType::NEGATIVE_VOLUME);
         }
         put_on_bed(no);
@@ -2290,6 +2323,9 @@ void GLGizmoPathCut::do_apply_cut(const std::shared_ptr<PathCutJob> &st)
         plater->get_notification_manager()->push_notification(NotificationType::CustomNotification,
                                                               NotificationManager::NotificationLevel::WarningNotificationLevel, text);
     };
+    if (connectors && m_holes_in_mesh && !(holes_to_cut && holes_from_cut))
+        warn(_u8L("Cut along path: the connector holes could not be cut into the pieces. They are kept as negative volumes, "
+                  "subtracted when slicing."));
     if (st->joined) {
         warn(st->conn.type == PathCut::ConnectorType::None ?
                  _u8L("Cut along path: the cut is made, but the object is still in one piece. Cut the remaining connection to separate it.") :

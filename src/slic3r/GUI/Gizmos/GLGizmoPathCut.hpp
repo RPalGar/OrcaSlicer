@@ -126,6 +126,7 @@ private:
     PathCut::ConnectorParams m_conn;
     bool               m_conn_manual{false};     // the user clicks where each connector goes
     bool               m_conn_force{false};      // ... and it goes there even where the checks say it does not fit
+    bool               m_holes_in_mesh{false};   // the connector holes are cut into the pieces, not negative volumes
     std::string        m_message;
     bool               m_message_is_error{false};
     const ModelObject *m_object{nullptr};        // object the points were picked on
