@@ -37505,3 +37505,37 @@ msgstr "Conectores: %1%"
 # AI Translated
 msgid "Remove all the points"
 msgstr "Quitar todos los puntos"
+
+# AI Translated
+msgid "Closed loop"
+msgstr "Lazo cerrado"
+
+# AI Translated
+msgid "Beginning (mm)"
+msgstr "Inicio (mm)"
+
+# AI Translated
+msgid "Ending (mm)"
+msgstr "Final (mm)"
+
+# AI Translated
+msgctxt "Number of connectors"
+msgid "Count"
+msgstr "Cantidad"
+
+# AI Translated
+msgid "Diameter (mm)"
+msgstr "Diámetro (mm)"
+
+# AI Translated
+msgid "Side (mm)"
+msgstr "Lado (mm)"
+
+# AI Translated
+msgctxt "Cut along path"
+msgid "Preview"
+msgstr "Vista previa"
+
+# AI Translated
+msgid "Take the cut direction from the current view"
+msgstr "Tomar la dirección de corte de la vista actual"
