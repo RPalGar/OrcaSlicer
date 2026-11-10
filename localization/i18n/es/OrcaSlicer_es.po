@@ -37539,3 +37539,15 @@ msgstr "Vista previa"
 # AI Translated
 msgid "Take the cut direction from the current view"
 msgstr "Tomar la dirección de corte de la vista actual"
+
+# AI Translated
+msgid "Cut the holes into the pieces"
+msgstr "Hacer los agujeros en las piezas"
+
+# AI Translated
+msgid "The holes are cut into the meshes of the pieces when the cut is made, so they show and are exported with them. Otherwise they are negative volumes, subtracted when slicing."
+msgstr "Los agujeros se hacen en las mallas de las piezas al realizar el corte, así que se ven y se exportan con ellas. Si no, son volúmenes negativos que se restan al laminar."
+
+# AI Translated
+msgid "Cut along path: the connector holes could not be cut into the pieces. They are kept as negative volumes, subtracted when slicing."
+msgstr "Cortar por ruta: no se han podido hacer los agujeros de los conectores en las piezas. Se mantienen como volúmenes negativos, que se restan al laminar."
