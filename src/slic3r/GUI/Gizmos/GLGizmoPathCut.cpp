@@ -35,7 +35,6 @@
 #include "libslic3r/libslic3r.h"
 
 #include <boost/log/trivial.hpp>
-#include <wx/utils.h>
 #include <glad/gl.h>
 #include <imgui/imgui.h>
 #include <wx/app.h>
@@ -1173,6 +1172,9 @@ struct PathCutJob
     bool                                      connectors_from_a{false}; // pegs stick out of side_a
     std::string                               connector_error;
     std::string                               error;
+    // Connector holes cut into the meshes (on request, when the cut is applied): the pieces with their holes.
+    bool                                      holes_done{false};
+    std::optional<indexed_triangle_set>       from_with_holes, to_with_holes;
 
     bool object_unchanged() const
     {
@@ -2132,10 +2134,69 @@ void GLGizmoPathCut::perform_cut()
     }).detach();
 }
 
+// The piece with the holes cut into it; empty if the boolean fails (the holes then stay negative volumes).
+static std::optional<indexed_triangle_set> cut_holes(const indexed_triangle_set &piece, const indexed_triangle_set &holes)
+{
+    std::vector<TriangleMesh> out;
+    try {
+        MeshBoolean::mcut::make_boolean(TriangleMesh(piece), TriangleMesh(holes), out, "A_NOT_B");
+    } catch (const std::exception &e) {
+        BOOST_LOG_TRIVIAL(warning) << "PathCut: cutting the connector holes failed: " << e.what();
+        return std::nullopt;
+    }
+    if (out.empty() || out.front().empty() || out.front().volume() <= 0.)
+        return std::nullopt;
+    return std::move(out.front().its);
+}
+
+// Cutting the holes into the meshes takes seconds on large ones: done on a thread of its own, as the cut,
+// before the cut is applied. Returns false when there is nothing to do, so the cut is applied right away.
+bool GLGizmoPathCut::start_cutting_holes(const std::shared_ptr<PathCutJob> &st)
+{
+    if (!m_holes_in_mesh || st->holes_done || st->grouped.side_a.indices.empty() || st->grouped.side_b.indices.empty())
+        return false;
+    // The connectors the cut will get: those placed by hand are built again, the same, when it is applied.
+    PathCut::ConnectorResult conn = st->placer ?
+        st->placer->build(m_placing ? m_spots : std::vector<PathCut::ConnectorSpot>{}) : st->connectors;
+    if (conn.positions.empty())
+        return false;
+
+    st->abort          = false; // a run cancelled before is dropped by its generation
+    m_busy             = true;
+    m_message          = _u8L("Cutting the holes into the pieces...");
+    m_message_is_error = false;
+    m_running          = st;
+    const unsigned generation = m_generation;
+    std::thread([this, st, generation, conn = std::move(conn)]() {
+        // Reads the sides only: nothing changes them before the cut is applied, on the UI thread, after this.
+        const indexed_triangle_set &from = st->connectors_from_a ? st->grouped.side_a : st->grouped.side_b;
+        const indexed_triangle_set &to   = st->connectors_from_a ? st->grouped.side_b : st->grouped.side_a;
+        std::optional<indexed_triangle_set> from_cut, to_cut;
+        if (!conn.holes_from.indices.empty() && !st->abort)
+            from_cut = cut_holes(from, conn.holes_from);
+        if (!conn.holes_to.indices.empty() && !st->abort)
+            to_cut = cut_holes(to, conn.holes_to);
+        if (wxTheApp)
+            wxTheApp->CallAfter([this, st, generation, from_cut = std::move(from_cut), to_cut = std::move(to_cut)]() mutable {
+                if (generation != m_generation || m_state != On || st->abort)
+                    return; // cancelled, or the tool was closed: nothing is applied
+                m_busy = false;
+                m_running.reset();
+                st->holes_done      = true;
+                st->from_with_holes = std::move(from_cut);
+                st->to_with_holes   = std::move(to_cut);
+                apply_cut(st);
+            });
+    }).detach();
+    return true;
+}
+
 // An exception escaping here (UI thread, job finalize or CallAfter) would end the application.
 void GLGizmoPathCut::apply_cut(std::shared_ptr<PathCutJob> st)
 {
     try {
+        if (start_cutting_holes(st))
+            return;
         do_apply_cut(st);
     } catch (const std::exception &e) {
         BOOST_LOG_TRIVIAL(error) << "PathCut: applying the cut failed: " << e.what();
@@ -2194,27 +2255,16 @@ void GLGizmoPathCut::do_apply_cut(const std::shared_ptr<PathCutJob> &st)
     indexed_triangle_set           *from_side  = st->connectors_from_a ? &grouped.side_a : &grouped.side_b;
     indexed_triangle_set           *to_side    = st->connectors_from_a ? &grouped.side_b : &grouped.side_a;
 
-    // Holes cut into the meshes when asked; a hole set the boolean fails on stays a negative volume.
-    auto cut_holes = [](indexed_triangle_set &piece, const indexed_triangle_set &holes) {
-        if (holes.indices.empty())
-            return true;
-        std::vector<TriangleMesh> out;
-        try {
-            MeshBoolean::mcut::make_boolean(TriangleMesh(piece), TriangleMesh(holes), out, "A_NOT_B");
-        } catch (const std::exception &e) {
-            BOOST_LOG_TRIVIAL(warning) << "PathCut: cutting the connector holes failed: " << e.what();
-            return false;
-        }
-        if (out.empty() || out.front().empty() || out.front().volume() <= 0.)
-            return false;
-        piece = std::move(out.front().its);
-        return true;
-    };
+    // Holes cut into the meshes on request (start_cutting_holes); a hole set the boolean failed on stays a
+    // negative volume.
     bool holes_to_cut = false, holes_from_cut = false;
-    if (connectors && m_holes_in_mesh) {
-        wxBusyCursor wait;
-        holes_to_cut   = cut_holes(*to_side, conn.holes_to);
-        holes_from_cut = cut_holes(*from_side, conn.holes_from);
+    if (connectors && st->holes_done) {
+        holes_from_cut = conn.holes_from.indices.empty() || st->from_with_holes.has_value();
+        holes_to_cut   = conn.holes_to.indices.empty() || st->to_with_holes.has_value();
+        if (st->from_with_holes)
+            *from_side = std::move(*st->from_with_holes);
+        if (st->to_with_holes)
+            *to_side = std::move(*st->to_with_holes);
     }
 
     Model                          tmp;
@@ -2323,7 +2373,7 @@ void GLGizmoPathCut::do_apply_cut(const std::shared_ptr<PathCutJob> &st)
         plater->get_notification_manager()->push_notification(NotificationType::CustomNotification,
                                                               NotificationManager::NotificationLevel::WarningNotificationLevel, text);
     };
-    if (connectors && m_holes_in_mesh && !(holes_to_cut && holes_from_cut))
+    if (connectors && st->holes_done && !(holes_to_cut && holes_from_cut))
         warn(_u8L("Cut along path: the connector holes could not be cut into the pieces. They are kept as negative volumes, "
                   "subtracted when slicing."));
     if (st->joined) {

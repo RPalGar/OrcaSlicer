@@ -67,6 +67,7 @@ private:
     void               apply_cut(std::shared_ptr<PathCutJob> job); // by value: callers pass m_pending
     void               do_apply_cut(const std::shared_ptr<PathCutJob> &job);
     void               cut_failed();
+    bool               start_cutting_holes(const std::shared_ptr<PathCutJob> &job);
     void               clear_pending();
     void               rebuild_cutter_preview();
     // Manual connectors: after the cut, the cut face is shown and each click on it places a connector.
