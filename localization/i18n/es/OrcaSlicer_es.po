@@ -37555,3 +37555,7 @@ msgstr "Cortar por ruta: no se han podido hacer los agujeros de los conectores e
 # AI Translated
 msgid "Cutting the holes into the pieces..."
 msgstr "Haciendo los agujeros en las piezas..."
+
+# AI Translated
+msgid "%1% s"
+msgstr "%1% s"
