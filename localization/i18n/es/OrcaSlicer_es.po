@@ -37551,3 +37551,7 @@ msgstr "Los agujeros se hacen en las mallas de las piezas al realizar el corte, 
 # AI Translated
 msgid "Cut along path: the connector holes could not be cut into the pieces. They are kept as negative volumes, subtracted when slicing."
 msgstr "Cortar por ruta: no se han podido hacer los agujeros de los conectores en las piezas. Se mantienen como volúmenes negativos, que se restan al laminar."
+
+# AI Translated
+msgid "Cutting the holes into the pieces..."
+msgstr "Haciendo los agujeros en las piezas..."
