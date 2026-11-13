@@ -1076,6 +1076,10 @@ void GLGizmoPathCut::on_render_input_window(float x, float y, float bottom_limit
         ImGui::ProgressBar(std::fmod(seconds, 2.f) / 2.f, ImVec2(ImGui::GetFontSize() * 20.f, ImGui::GetFontSize() * 0.4f), "");
         ImGui::SameLine();
         m_imgui->text(elapsed);
+        // Nothing else redraws the canvas while the cut runs (no mouse, no keys), so the bar would stand
+        // still: about ten frames a second. The timer only wakes the idle handler, which renders when the
+        // gizmo is dirty.
+        m_dirty = true;
         m_parent.schedule_extra_frame(100);
     }
 
