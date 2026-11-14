@@ -1079,7 +1079,7 @@ void GLGizmoPathCut::on_render_input_window(float x, float y, float bottom_limit
         // Nothing else redraws the canvas while the cut runs (no mouse, no keys), so the bar would stand
         // still: about ten frames a second. The timer only wakes the idle handler, which renders when the
         // gizmo is dirty.
-        m_dirty = true;
+        set_dirty();
         m_parent.schedule_extra_frame(100);
     }
 
