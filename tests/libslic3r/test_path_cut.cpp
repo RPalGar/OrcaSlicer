@@ -538,6 +538,53 @@ TEST_CASE("A tilted loop around a cylinder detaches its end", "[PathCut]")
     CHECK_THAT(its_volume(g.side_b), WithinAbs(half, 0.1 * half));
 }
 
+TEST_CASE("A flat loop cap cuts a box whose large faces cross it with no vertex inside it", "[PathCut]")
+{
+    // Box 10 x 10 x 100 of 12 triangles, tilted loop around its middle: every vertex is far outside the
+    // cap, only the long triangles of the sides pass through it.
+    const indexed_triangle_set box = its_make_cube(10., 10., 100.);
+    std::vector<PathCut::V3>   loop;
+    for (int i = 0; i < 12; ++i) {
+        const double a = 2. * PI * i / 12.;
+        loop.emplace_back(std::clamp(5. + 7. * std::cos(a), 0., 10.), std::clamp(5. + 7. * std::sin(a), 0., 10.), 50. + 3. * std::cos(a));
+    }
+    for (const bool flat : {true, false}) {
+        PathCut::LoopCutter lc = PathCut::make_loop_cutter(loop, 0.2, 1.5, [](const PathCut::V3 &p) { return p; }, flat);
+        REQUIRE(lc.valid());
+        REQUIRE(PathCut::fit_loop_margin(box, lc));
+        const PathCut::CutResult res = PathCut::cut_with_slab(box, lc, true);
+        REQUIRE(res.error.empty());
+        const auto parts = its_split(res.mesh);
+        REQUIRE(parts.size() == 2);
+        require_closed_parts(parts);
+        for (const auto &p : parts)
+            CHECK_THAT(its_volume(p), WithinAbs(5000., 500.));
+    }
+}
+
+TEST_CASE("A tilted loop around a finely divided cylinder detaches its end", "[PathCut]")
+{
+    // The sides of a cylinder of 1000 segments are long thin triangles; the surface runs along the rim
+    // of the cap far from the cut.
+    const double               r = 5.;
+    const indexed_triangle_set cyl = its_make_cylinder(r, 30., 2. * PI / 1000.);
+    std::vector<PathCut::V3>   loop;
+    for (int i = 0; i < 12; ++i) {
+        const double a = 2. * PI * i / 12.;
+        loop.emplace_back(r * std::cos(a), r * std::sin(a), 15. + 2. * std::cos(a));
+    }
+    for (const bool flat : {true, false}) {
+        PathCut::LoopCutter lc = PathCut::make_loop_cutter(loop, 0.2, 1.5, [](const PathCut::V3 &p) { return p; }, flat);
+        REQUIRE(lc.valid());
+        REQUIRE(PathCut::fit_loop_margin(cyl, lc));
+        const PathCut::CutResult res = PathCut::cut_with_slab(cyl, lc, true);
+        REQUIRE(res.error.empty());
+        const auto parts = its_split(res.mesh);
+        REQUIRE(parts.size() == 2);
+        require_closed_parts(parts);
+    }
+}
+
 TEST_CASE("A loop that misses part of the cross-section is reported instead of cutting halfway", "[PathCut]")
 {
     // Loop around one of two boxes standing side by side, with a cap so wide it reaches the other

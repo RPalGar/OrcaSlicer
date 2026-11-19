@@ -1637,8 +1637,20 @@ CutResult cut_with_slab(indexed_triangle_set its, const Cutter &cutter, bool bou
             closest = std::min(closest, std::max(std::abs(f[t[e]]) - hk, out[t[e]]));
         if (closest >= 2. * emax) return -1;
         if (bounded && emax > refine) {
-            const bool in0 = out[t[0]] < 0., in1 = out[t[1]] < 0., in2 = out[t[2]] < 0.;
-            if (in0 != in1 || in1 != in2) return ei; // across the rim
+            // The rim of the footprint only matters where the triangle meets the slab: decide inside or
+            // outside at the crossings with the faces of the slab and at the vertices inside it, not at
+            // the vertices alone. A large triangle can cross the slab inside the footprint with all its
+            // vertices outside it, and the rim can run along the surface far from the slab.
+            bool inside = false, outside = false;
+            for (int e = 0; e < 3; ++e) {
+                const int    a = t[e], b = t[(e + 1) % 3];
+                const double fa = f[a], fb = f[b];
+                if (std::abs(fa) < hk) (out[a] < 0. ? inside : outside) = true;
+                for (const double level : {hk, -hk})
+                    if ((fa - level) * (fb - level) < 0.)
+                        (cutter.outside(pos(a) + (pos(b) - pos(a)) * ((level - fa) / (fb - fa))) < 0. ? inside : outside) = true;
+            }
+            if (inside && (outside || out[t[0]] >= 0. || out[t[1]] >= 0. || out[t[2]] >= 0.)) return ei;
         }
         // Only edges a face of the slab crosses get a cut vertex: test those (the fields may also be
         // clamped far from the slab, which is not a bend).
@@ -1653,7 +1665,9 @@ CutResult cut_with_slab(indexed_triangle_set its, const Cutter &cutter, bool bou
     std::vector<size_t> cand;
     for (size_t i = 0; i < its.indices.size(); ++i)
         if (needs_split(its.indices[i]) >= 0) cand.push_back(i);
-    for (int pass = 0; pass < 24 && !cand.empty(); ++pass) {
+    // Each pass halves the longest edge of every triangle that still needs it, and no edge is split below
+    // the refine size, so this ends; the bound only catches a refinement that runs away all the same.
+    for (int pass = 0; !cand.empty(); ++pass) {
         std::unordered_map<uint64_t, int> mid;
         for (size_t i : cand) {
             const auto &t  = its.indices[i];
@@ -1662,6 +1676,10 @@ CutResult cut_with_slab(indexed_triangle_set its, const Cutter &cutter, bool bou
         }
         if (mid.empty())
             break;
+        if (pass == 64) {
+            res.error = L("The mesh could not be refined enough along the cut. Repair or remesh the model, or cut it elsewhere.");
+            return res;
+        }
         const size_t nv0 = its.vertices.size();
         std::vector<char> touched(nv0, 0);
         for (auto &[k, idx] : mid) {
