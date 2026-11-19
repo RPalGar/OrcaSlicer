@@ -68,10 +68,22 @@
 #include "slic3r/GUI/GLSelectionRectangle.hpp"
 #include "slic3r/GUI/GLShader.hpp"
 #include "slic3r/GUI/GUI_ObjectList.hpp"
-#include "slic3r/GUI/Gizmos/GLGizmoPathCut.hpp"
 #include "slic3r/GUI/Gizmos/GLGizmosManager.hpp"
+#include "slic3r/GUI/Jobs/Worker.hpp"
+#include <wx/glcanvas.h>
+#include "slic3r/GUI/NotificationManager.hpp"
+#include "slic3r/GUI/format.hpp"
+#include "libslic3r/AABBMesh.hpp"
+#include "libslic3r/LocalesUtils.hpp"
+#include "libslic3r/PathCut.hpp"
+#include <algorithm>
 #include <array>
+#include <chrono>
+#include <cfloat>
+#include <cstdlib>
+#include <limits>
 #include <optional>
+#include <tuple>
 #include "slic3r/GUI/I18N.hpp"
 #include "slic3r/GUI/ImGuiWrapper.hpp"
 #include "slic3r/GUI/PartPlate.hpp"
@@ -239,10 +251,83 @@ static void init_from_angle_arc(GLModel& model, double angle, double radius)
     model.init_from(std::move(init_data));
 }
 
+// Curve mode: the object is cut along a path picked on it from one view instead of a plane (see
+// docs/HLSD/path-cut.md). It works on points picked on the mesh, not on the cut plane the rest of this tool
+// is built around, so it has its own state, mouse handling and window; the Cut tool hands them over to it
+// while it is in Curve mode. The cut runs as a job on the Plater's UI job worker, is shown with the pieces
+// apart, and replaces the object only when the user performs it.
+struct CurveCutJob;
+
+class GLGizmoCut3D::Curve
+{
+public:
+    explicit Curve(GLGizmoCut3D &cut) : m_cut(cut), m_parent(cut.m_parent) {}
+
+    void               set_state(bool on);
+    bool               on_mouse(const wxMouseEvent &mouse_event);
+    bool               on_key(SLAGizmoEventType action); // Enter: preview, Esc: back to editing
+    void               render();
+    void               render_input_window(float x, float y, float bottom_limit);
+    CommonGizmosDataID requirements() const;
+
+private:
+    enum class Sweep : int { View = 0, Level = 1, Vertical = 2, Custom = 3 };
+    struct Limit { bool on{false}; float mm{3.f}; };
+
+    bool                raycast(const Vec2d &mouse_pos, Vec3d &hit_world) const;
+    void                add_point(const Vec3d &hit);
+    void                reset_path();
+    Vec3d               sweep_dir() const;
+    PathCut::ViewLimits view_limits() const;
+    void                rebuild_preview();
+    void                start_cut();
+    void                cut_done(const std::shared_ptr<CurveCutJob> &job);
+    void                apply_cut();
+    void                clear_pending();
+    void                show_object(bool show);
+    void                set_message(const std::string &text, bool error);
+    bool                previewing() const { return m_pending != nullptr; }
+
+    GLGizmoCut3D &m_cut;
+    GLCanvas3D   &m_parent;
+    bool          m_on{false};
+
+    std::vector<Vec3d> m_points;                     // picked points, world coordinates
+    const ModelObject *m_object{nullptr};            // object they were picked on
+    Transform3d        m_inst_matrix{Transform3d::Identity()}; // its instance then
+    Vec3d              m_view_dir{Vec3d::UnitY()};   // locked at the first point
+    Sweep              m_sweep{Sweep::View};         // direction the path is swept along
+    float              m_turn{0.f}, m_tilt{0.f};     // Sweep::Custom: around the vertical axis / below horizontal [deg]
+    float              m_kerf{0.2f};                 // clearance between the pieces [mm]
+    // Limits of the wall [mm]: in front of / behind the points along the sweep, past the first / last point
+    // along the path. Unchecked: through the whole object.
+    Limit              m_lim_front, m_lim_back{false, 20.f}, m_lim_start, m_lim_end;
+    bool               m_limits_open{false};
+    std::string        m_message;
+    bool               m_message_is_error{false};
+
+    GLModel m_curve, m_sphere, m_wall;               // the path, its points, the wall it sweeps (translucent)
+    bool    m_preview_dirty{true};
+    // Preview: the cut is computed and shown with the pieces apart; the object is hidden and untouched until
+    // the cut is performed. Any edit drops it.
+    std::shared_ptr<CurveCutJob> m_pending;
+    GLModel m_piece_stay, m_piece_moved;
+    Vec3d   m_piece_shift{Vec3d::Zero()}, m_piece_lift{Vec3d::Zero()};
+    bool    m_object_hidden{false};
+    std::shared_ptr<CurveCutJob> m_running;           // the cut on the job worker
+    std::chrono::steady_clock::time_point m_busy_since;
+
+    // A left press on the object adds a point on release, unless the mouse is dragged: then the view orbits.
+    bool  m_press_on_object{false}, m_press_adds_point{false}, m_orbiting{false}, m_right_press{false};
+    Vec2d m_press_pos{Vec2d::Zero()}, m_last_pos{Vec2d::Zero()}, m_right_pos{Vec2d::Zero()};
+    Vec3d m_press_hit{Vec3d::Zero()};
+};
+
 //! --
 
 GLGizmoCut3D::GLGizmoCut3D(GLCanvas3D& parent, const std::string& icon_filename, unsigned int sprite_id)
     : GLGizmoBase(parent, icon_filename, sprite_id)
+    , m_curve_tool(std::make_unique<Curve>(*this))
     , m_connectors_group_id (GrabberID::Count)
     , m_connector_type (CutConnectorType::Plug)
     , m_connector_style (int(CutConnectorStyle::Prism))
@@ -290,11 +375,10 @@ GLGizmoCut3D::GLGizmoCut3D(GLCanvas3D& parent, const std::string& icon_filename,
 //    update_connector_shape();
 }
 
+GLGizmoCut3D::~GLGizmoCut3D() = default;
+
 std::string GLGizmoCut3D::get_tooltip() const
 {
-    if (m_curve)
-        if (const GLGizmoPathCut *curve_tool = path_cut())
-            return curve_tool->get_tooltip();
     std::string tooltip;
     if (m_hover_id == Z || (m_dragging && m_hover_id == CutPlane)) {
         double koef = m_imperial_units ? GizmoObjectManipulation::mm_to_in : 1.0;
@@ -334,10 +418,8 @@ std::string GLGizmoCut3D::get_tooltip() const
 
 bool GLGizmoCut3D::on_mouse(const wxMouseEvent &mouse_event)
 {
-    if (m_curve) {
-        GLGizmoPathCut *curve_tool = path_cut();
-        return curve_tool != nullptr && curve_tool->on_mouse(mouse_event);
-    }
+    if (m_curve)
+        return m_curve_tool->on_mouse(mouse_event);
     Vec2i32 mouse_coord(mouse_event.GetX(), mouse_event.GetY());
     Vec2d mouse_pos = mouse_coord.cast<double>();
 
@@ -597,8 +679,11 @@ void GLGizmoCut3D::switch_to_mode(size_t new_mode)
     reset_cut_by_contours();
 }
 
-std::optional<GLGizmoCut3D::ModeButton> GLGizmoCut3D::render_mode_buttons(ImGuiWrapper &imgui, ModeButton active, float controls_x, float scale, bool enabled, bool is_dark)
+std::optional<GLGizmoCut3D::ModeButton> GLGizmoCut3D::render_mode_buttons(ModeButton active, bool enabled)
 {
+    ImGuiWrapper &imgui = *m_imgui;
+    const float   scale = m_parent.get_scale();
+    const bool    is_dark = m_is_dark_mode;
     // Same look as the tool type buttons of the painting tools.
     const std::array<wchar_t, 3> icons = is_dark ?
         std::array<wchar_t, 3>{ ImGui::CutModePlaneDarkIcon, ImGui::CutModeDovetailDarkIcon, ImGui::CutModePathDarkIcon } :
@@ -609,7 +694,7 @@ std::optional<GLGizmoCut3D::ModeButton> GLGizmoCut3D::render_mode_buttons(ImGuiW
     imgui.text(_u8L("Mode"));
     std::optional<ModeButton> clicked;
     for (size_t i = 0; i < icons.size(); ++i) {
-        ImGui::SameLine(i == 0 ? controls_x : 0.f);
+        ImGui::SameLine(i == 0 ? m_label_width : 0.f);
         const bool is_active = int(active) == int(i);
         ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize, 1.f);
         ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 3.f * scale);
@@ -631,23 +716,9 @@ std::optional<GLGizmoCut3D::ModeButton> GLGizmoCut3D::render_mode_buttons(ImGuiW
     return clicked;
 }
 
-void GLGizmoCut3D::select_mode(ModeButton mode)
-{
-    if (mode == ModeButton::Curve || size_t(mode) == m_mode)
-        return;
-    switch_to_mode(size_t(mode));
-    check_and_update_connectors_state();
-}
-
-GLGizmoPathCut *GLGizmoCut3D::path_cut() const
-{
-    return dynamic_cast<GLGizmoPathCut *>(m_parent.get_gizmos_manager().get_gizmo(GLGizmosManager::PathCut));
-}
-
 void GLGizmoCut3D::set_curve(bool curve)
 {
-    GLGizmoPathCut *curve_tool = path_cut();
-    if (curve == m_curve || curve_tool == nullptr)
+    if (curve == m_curve)
         return;
     m_curve = curve;
     if (m_state != On)
@@ -660,10 +731,10 @@ void GLGizmoCut3D::set_curve(bool curve)
             oc->release();
         }
         m_parent.set_use_color_clip_plane(false);
-        curve_tool->set_state(On);
+        m_curve_tool->set_state(true);
         m_parent.toggle_model_objects_visibility(true); // all objects in their own colors, as the Curve tool shows them
     } else {
-        curve_tool->set_state(Off);
+        m_curve_tool->set_state(false);
         m_parent.set_use_color_clip_plane(true);
     }
     // The two tools need different common data (the Curve tool picks points on the mesh).
@@ -678,8 +749,7 @@ void GLGizmoCut3D::set_curve(bool curve)
 
 bool GLGizmoCut3D::render_cut_mode_buttons(bool enabled)
 {
-    const std::optional<ModeButton> clicked = render_mode_buttons(*m_imgui, ModeButton(m_mode), m_label_width, m_parent.get_scale(),
-                                                                  enabled, m_is_dark_mode);
+    const std::optional<ModeButton> clicked = render_mode_buttons(ModeButton(m_mode), enabled);
     if (!clicked)
         return false;
     if (*clicked == ModeButton::Curve) {
@@ -1565,12 +1635,11 @@ void GLGizmoCut3D::apply_color_clip_plane_colors()
 
 void GLGizmoCut3D::on_set_state()
 {
-    GLGizmoPathCut *curve_tool = m_curve ? path_cut() : nullptr;
-    if (curve_tool != nullptr)
-        curve_tool->set_state(m_state == On ? On : Off);
+    if (m_curve)
+        m_curve_tool->set_state(m_state == On);
     if (m_state == On) {
-        m_parent.set_use_color_clip_plane(curve_tool == nullptr);
-        if (curve_tool != nullptr)
+        m_parent.set_use_color_clip_plane(!m_curve);
+        if (m_curve)
             m_parent.toggle_model_objects_visibility(true);
 
         update_bb();
@@ -1580,7 +1649,8 @@ void GLGizmoCut3D::on_set_state()
         // initiate archived values
         m_ar_plane_center   = m_plane_center;
         m_start_dragging_m  = m_rotation_m;
-        reset_cut_by_contours();
+        if (!m_curve) // no cut plane in Curve mode, its parts are not split by contours
+            reset_cut_by_contours();
 
         m_parent.request_extra_frame();
     }
@@ -2450,8 +2520,7 @@ void GLGizmoCut3D::PartSelection::turn_over_selection()
 void GLGizmoCut3D::on_render()
 {
     if (m_curve) {
-        if (GLGizmoPathCut *curve_tool = path_cut())
-            curve_tool->render();
+        m_curve_tool->render();
         return;
     }
     if (m_state == On) {
@@ -3321,8 +3390,7 @@ void GLGizmoCut3D::render_input_window_warning() const
 void GLGizmoCut3D::on_render_input_window(float x, float y, float bottom_limit)
 {
     if (m_curve) {
-        if (GLGizmoPathCut *curve_tool = path_cut())
-            curve_tool->render_input_window(x, y, bottom_limit);
+        m_curve_tool->render_input_window(x, y, bottom_limit);
         return;
     }
     GizmoImguiSetNextWIndowPos(x, y, ImGuiCond_Always, 0.0f, 0.0f);
@@ -4116,7 +4184,7 @@ void GLGizmoCut3D::process_selection_rectangle(CutConnectors &connectors)
 bool GLGizmoCut3D::gizmo_event(SLAGizmoEventType action, const Vec2d& mouse_position, bool shift_down, bool alt_down, bool control_down)
 {
     if (m_curve)
-        return false; // the Curve tool takes the mouse in on_mouse()
+        return m_curve_tool->on_key(action); // it takes the mouse in on_mouse()
     if (is_dragging() || m_connector_mode == CutConnectorMode::Auto)
         return false;
 
@@ -4190,8 +4258,7 @@ bool GLGizmoCut3D::gizmo_event(SLAGizmoEventType action, const Vec2d& mouse_posi
 
 CommonGizmosDataID GLGizmoCut3D::on_get_requirements() const {
     if (m_curve)
-        if (const GLGizmoPathCut *curve_tool = path_cut())
-            return curve_tool->get_requirements();
+        return m_curve_tool->requirements();
     return CommonGizmosDataID(
                 int(CommonGizmosDataID::SelectionInfo)
               | int(CommonGizmosDataID::InstancesHider)
@@ -4270,6 +4337,828 @@ void GLGizmoCut3D::apply_cut_connectors(ModelObject* mo, const std::string& conn
 }
 
 
+
+// ------------------------------------------------------------------------------------------------ Curve mode
+
+static const ColorRGBA CURVE_PATH_COLOR   = {0.f, 0.588f, 0.533f, 1.f}; // Orca teal
+static const ColorRGBA CURVE_POINT_COLOR  = {1.f, 0.55f, 0.f, 1.f};
+static const ColorRGBA CURVE_STAY_COLOR   = {0.55f, 0.72f, 0.70f, 1.f};
+static const ColorRGBA CURVE_MOVED_COLOR  = {0.95f, 0.62f, 0.25f, 1.f};
+
+// A cut in flight: what it is computed from (copied on the UI thread, the job never touches the Model, and
+// kept to detect edits made meanwhile) and what came out.
+struct CurveCutJob
+{
+    indexed_triangle_set     src; // the model parts joined, instance rotation and scale baked in, relative to its offset
+    std::vector<PathCut::V3> pts; // relative to the offset too
+    Vec3d                    view_dir{Vec3d::UnitY()};
+    float                    kerf{0.2f};
+    PathCut::ViewLimits      limits;
+    // Volumes that are not cut (negative volumes, modifiers, support blockers / enforcers): each goes to the
+    // pieces it is in, both if the cut runs through it. A negative volume only removes material of its own
+    // object, so a hole kept whole in both pieces is the hole cut in two.
+    struct Extra { size_t volume_idx; indexed_triangle_set mesh; };
+    std::vector<Extra>       extras;
+    size_t                   parts{0};
+    int                      obj_idx{-1};
+    const ModelObject       *mo{nullptr};
+    Vec3d                    offset{Vec3d::Zero()};
+    Transform3d              inst_matrix{Transform3d::Identity()};
+    struct VolumeState { size_t id; Transform3d matrix; std::shared_ptr<const TriangleMesh> mesh; };
+    std::vector<VolumeState> volumes; // the meshes are held so their addresses cannot be reused
+
+    PathCut::Grouped           grouped;
+    std::vector<unsigned char> extra_sides; // per extra: bit 0 in side_a, bit 1 in side_b
+    std::string                error;       // translated
+
+    bool object_unchanged() const
+    {
+        const Model &model = wxGetApp().plater()->model();
+        if (obj_idx < 0 || obj_idx >= int(model.objects.size()) || model.objects[obj_idx] != mo || mo->instances.size() != 1 ||
+            !mo->instances.front()->get_matrix().isApprox(inst_matrix) || mo->volumes.size() != volumes.size())
+            return false;
+        for (size_t i = 0; i < volumes.size(); ++i)
+            if (mo->volumes[i]->id().id != volumes[i].id || !mo->volumes[i]->get_matrix().isApprox(volumes[i].matrix) ||
+                mo->volumes[i]->get_mesh_shared_ptr() != volumes[i].mesh)
+                return false;
+        return true;
+    }
+};
+
+// Which pieces each volume that is not cut is in: those with material at some point of its surface (a hole
+// is partly in the material it removes, a modifier in the part it changes). Bounding boxes are not enough:
+// the box of one piece easily overlaps a hole of the other, which would then float away with it.
+static std::vector<unsigned char> extras_in_sides(const std::vector<CurveCutJob::Extra> &extras, const PathCut::Grouped &g)
+{
+    std::vector<unsigned char> out(extras.size(), 0);
+    const Vec3d                up = Vec3d(1e-4, 2e-4, 1.).normalized(); // off the axes, so the ray misses the edges
+    unsigned char              bit = 1;
+    for (const indexed_triangle_set *side : {&g.side_a, &g.side_b}) {
+        if (!side->indices.empty()) {
+            const AABBMesh aabb(*side);
+            auto inside = [&](const Vec3d &p) { return aabb.query_ray_hits(p, up).size() % 2 == 1; };
+            for (size_t k = 0; k < extras.size(); ++k) {
+                const indexed_triangle_set &m = extras[k].mesh;
+                // The vertices and points inside each triangle: a hole through the piece has its vertices outside it.
+                for (size_t t = 0; t < m.indices.size() && !(out[k] & bit); ++t) {
+                    const Vec3d a = m.vertices[m.indices[t][0]].cast<double>(), b = m.vertices[m.indices[t][1]].cast<double>(),
+                                c = m.vertices[m.indices[t][2]].cast<double>();
+                    constexpr int n = 4;
+                    for (int u = 0; u <= n && !(out[k] & bit); ++u)
+                        for (int w = 0; u + w <= n; ++w)
+                            if (inside(a + (b - a) * (double(u) / n) + (c - a) * (double(w) / n))) {
+                                out[k] |= bit;
+                                break;
+                            }
+                }
+            }
+        }
+        bit <<= 1;
+    }
+    return out;
+}
+
+// Moves the piece to the free spot of the current plate nearest to the right of `rest`, keeping a gap to it
+// and to every other object except `replaced` (the object being cut); just right of the rest when the plate
+// has no room. (Plater::find_new_position arranges on the first plate, wherever the object is.)
+static void place_piece(ModelObject &piece, const BoundingBoxf3 &rest, const ModelObject *replaced)
+{
+    constexpr double           gap = 5., step = 2.;
+    Plater                    *plater = wxGetApp().plater();
+    std::vector<BoundingBoxf3> obstacles{rest};
+    for (const ModelObject *o : plater->model().objects)
+        if (o != replaced)
+            for (size_t i = 0; i < o->instances.size(); ++i)
+                obstacles.emplace_back(o->instance_bounding_box(i));
+    const BoundingBoxf3 bb   = piece.instance_bounding_box(0);
+    const Vec2d         size = (bb.max - bb.min).head<2>();
+    const BoundingBoxf3 bed  = plater->get_partplate_list().get_curr_plate()->get_build_volume();
+    auto is_free = [&](const Vec2d &min) {
+        const Vec2d max = min + size;
+        if (min.x() < bed.min.x() || min.y() < bed.min.y() || max.x() > bed.max.x() || max.y() > bed.max.y())
+            return false;
+        for (const BoundingBoxf3 &o : obstacles)
+            if (min.x() < o.max.x() + gap && max.x() > o.min.x() - gap && min.y() < o.max.y() + gap && max.y() > o.min.y() - gap)
+                return false;
+        return true;
+    };
+    const Vec2d target(rest.max.x() + gap, rest.min.y());
+    Vec2d       best    = target;
+    double      best_d2 = std::numeric_limits<double>::max();
+    for (double x = bed.min.x(); x + size.x() <= bed.max.x(); x += step)
+        for (double y = bed.min.y(); y + size.y() <= bed.max.y(); y += step)
+            if (const double d2 = (Vec2d(x, y) - target).squaredNorm(); d2 < best_d2 && is_free(Vec2d(x, y))) {
+                best    = Vec2d(x, y);
+                best_d2 = d2;
+            }
+    const Vec2d delta = best - bb.min.head<2>();
+    piece.instances[0]->set_offset(piece.instances[0]->get_offset() + Vec3d(delta.x(), delta.y(), 0.));
+    piece.invalidate_bounding_box();
+}
+
+CommonGizmosDataID GLGizmoCut3D::Curve::requirements() const
+{
+    return CommonGizmosDataID(int(CommonGizmosDataID::SelectionInfo) | int(CommonGizmosDataID::InstancesHider) |
+                              int(CommonGizmosDataID::Raycaster) | int(CommonGizmosDataID::ObjectClipper));
+}
+
+void GLGizmoCut3D::Curve::set_state(bool on)
+{
+    if (!on && m_running) // the cut still running is dropped: it would apply later, on whatever is done by then
+        wxGetApp().plater()->get_ui_job_worker().cancel();
+    m_running.reset();
+    m_on = on;
+    reset_path();
+    m_message.clear();
+}
+
+void GLGizmoCut3D::Curve::set_message(const std::string &text, bool error)
+{
+    m_message          = text;
+    m_message_is_error = error;
+    m_parent.set_as_dirty();
+}
+
+void GLGizmoCut3D::Curve::reset_path()
+{
+    clear_pending();
+    m_points.clear();
+    m_object        = nullptr;
+    m_preview_dirty = true;
+}
+
+void GLGizmoCut3D::Curve::clear_pending()
+{
+    if (m_pending && !m_message_is_error) // the note about the preview goes with it, an error stays
+        m_message.clear();
+    m_pending.reset();
+    m_piece_stay.reset();
+    m_piece_moved.reset();
+    show_object(true);
+}
+
+// While the preview is shown, the object itself is hidden so only the pieces are seen.
+void GLGizmoCut3D::Curve::show_object(bool show)
+{
+    if (show == !m_object_hidden)
+        return;
+    const Selection   &selection = m_parent.get_selection();
+    const Model       &model     = wxGetApp().plater()->model();
+    const int          obj_idx   = selection.get_object_idx();
+    const ModelObject *mo        = obj_idx >= 0 && obj_idx < int(model.objects.size()) ? model.objects[obj_idx] : nullptr;
+    if (show) {
+        m_parent.toggle_model_objects_visibility(true);
+        m_object_hidden = false;
+    } else if (mo != nullptr) {
+        m_parent.toggle_model_objects_visibility(false, mo, selection.get_instance_idx());
+        m_object_hidden = true;
+    }
+    m_parent.set_as_dirty();
+}
+
+bool GLGizmoCut3D::Curve::raycast(const Vec2d &mouse_pos, Vec3d &hit_world) const
+{
+    CommonGizmosDataPool *c    = m_cut.m_c;
+    const ModelObject    *mo   = c->selection_info() ? c->selection_info()->model_object() : nullptr;
+    const int             inst = m_parent.get_selection().get_instance_idx();
+    if (mo == nullptr || inst < 0 || inst >= int(mo->instances.size()) || c->raycaster() == nullptr)
+        return false;
+    const auto        &raycasters = c->raycaster()->raycasters();
+    const Camera      &camera     = wxGetApp().plater()->get_camera();
+    const Transform3d  inst_m     = mo->instances[inst]->get_matrix();
+    double             best       = std::numeric_limits<double>::max();
+    for (size_t i = 0; i < mo->volumes.size() && i < raycasters.size(); ++i) {
+        if (!mo->volumes[i]->is_model_part())
+            continue;
+        const Transform3d trafo = inst_m * mo->volumes[i]->get_matrix();
+        Vec3f             hit, normal;
+        if (raycasters[i]->unproject_on_mesh(mouse_pos, trafo, camera, hit, normal, c->object_clipper()->get_clipping_plane())) {
+            const Vec3d w = trafo * hit.cast<double>();
+            if (const double d = (camera.get_position() - w).squaredNorm(); d < best) {
+                best      = d;
+                hit_world = w;
+            }
+        }
+    }
+    return best < std::numeric_limits<double>::max();
+}
+
+void GLGizmoCut3D::Curve::add_point(const Vec3d &hit)
+{
+    const ModelObject *mo = m_cut.m_c->selection_info() ? m_cut.m_c->selection_info()->model_object() : nullptr;
+    if (mo == nullptr)
+        return;
+    if (m_object != mo)
+        m_points.clear();
+    m_object = mo;
+    if (m_points.empty()) {
+        m_view_dir    = wxGetApp().plater()->get_camera().get_dir_forward();
+        m_inst_matrix = mo->instances.front()->get_matrix();
+    }
+    clear_pending();
+    m_points.push_back(hit);
+    m_message.clear();
+    m_preview_dirty = true;
+    m_parent.set_as_dirty();
+}
+
+bool GLGizmoCut3D::Curve::on_mouse(const wxMouseEvent &mouse_event)
+{
+    if (m_running) // the scene stays as it is while a cut runs (zooming is fine)
+        return mouse_event.GetWheelRotation() == 0;
+    const Vec2d mouse_pos(mouse_event.GetX(), mouse_event.GetY());
+    if (mouse_event.LeftDown()) {
+        m_press_on_object = m_orbiting = false; // a lost release must not leave a press behind
+        if (mouse_event.CmdDown())
+            return false;
+        Vec3d      hit;
+        const bool on_part = raycast(mouse_pos, hit);
+        // Empty space: the canvas orbits. On the object the press is kept from the canvas, which would move the
+        // object; while the preview is shown the object is hidden and every press is kept, so a click on the
+        // pieces does not deselect it.
+        if (!on_part && m_parent.get_first_hover_volume_idx() < 0 && !m_pending)
+            return false;
+        m_press_on_object  = true;
+        m_press_adds_point = on_part && !previewing();
+        m_press_pos = m_last_pos = mouse_pos;
+        m_press_hit        = hit;
+        return true;
+    }
+    if (m_press_on_object && mouse_event.Dragging() && mouse_event.LeftIsDown()) {
+        if (!m_orbiting && (mouse_pos - m_press_pos).norm() > 4.) {
+            m_orbiting = true;
+            if (!m_parent.has_mouse_capture())
+                m_parent.get_wxglcanvas()->CaptureMouse(); // released by the canvas on button up
+        }
+        // Orbit as the canvas does on empty space, with the user's settings, around the selected object.
+        const AppConfig *cfg = wxGetApp().app_config;
+        if (m_orbiting && std::atoi(cfg->get("left_mouse_drag_action").c_str()) == int(GLCanvas3D::MouseAction::Rotation)) {
+            const std::string mult = cfg->get("camera_orbit_mult");
+            const Vec2d rot = (mouse_pos - m_last_pos) * (PI * 0.8 / 180.) * (mult.empty() ? 1. : string_to_double_decimal_point(mult));
+            Camera &camera  = wxGetApp().plater()->get_camera();
+            if (cfg->get_bool("use_free_camera"))
+                camera.rotate_local_around_target(Vec3d(rot.y(), rot.x(), 0.));
+            else {
+                camera.recover_from_free_camera();
+                camera.rotate_on_sphere_with_target(rot.x(), rot.y(), true, m_parent.get_selection().get_bounding_box().center());
+            }
+            camera.auto_type(Camera::EType::Perspective);
+            m_parent.set_as_dirty();
+        }
+        m_last_pos = mouse_pos;
+        return true;
+    }
+    if (m_press_on_object && mouse_event.LeftUp()) {
+        m_press_on_object = false;
+        if (!m_orbiting && m_press_adds_point)
+            add_point(m_press_hit);
+        m_orbiting = false;
+        return true;
+    }
+    // A right click removes the last point; a right drag pans the view as usual.
+    if (mouse_event.RightDown()) {
+        m_right_press = true;
+        m_right_pos   = mouse_pos;
+        return false;
+    }
+    if (mouse_event.RightUp() && m_right_press) {
+        m_right_press = false;
+        if ((mouse_pos - m_right_pos).norm() <= 4. && !m_points.empty() && !previewing()) {
+            m_points.pop_back();
+            m_preview_dirty = true;
+            m_parent.set_as_dirty();
+            return true;
+        }
+    }
+    return false;
+}
+
+bool GLGizmoCut3D::Curve::on_key(SLAGizmoEventType action)
+{
+    if (m_running)
+        return false;
+    if (action == SLAGizmoEventType::ApplyChanges && !previewing() && m_points.size() >= 2) {
+        wxGetApp().CallAfter([this]() { start_cut(); });
+        return true;
+    }
+    if (action == SLAGizmoEventType::Escape && previewing()) { // back to editing; Esc again closes the tool
+        clear_pending();
+        m_preview_dirty = true;
+        return true;
+    }
+    return false;
+}
+
+// The view direction locked at the first point, or forced level with the bed, vertical, or set by hand.
+Vec3d GLGizmoCut3D::Curve::sweep_dir() const
+{
+    switch (m_sweep) {
+    case Sweep::Level: {
+        const Vec3d d(m_view_dir.x(), m_view_dir.y(), 0.);
+        return d.norm() > 1e-6 ? Vec3d(d.normalized()) : Vec3d(Vec3d::UnitY());
+    }
+    case Sweep::Vertical: return m_view_dir.z() > 0. ? Vec3d(Vec3d::UnitZ()) : Vec3d(-Vec3d::UnitZ());
+    case Sweep::Custom: {
+        const double turn = m_turn * PI / 180., tilt = m_tilt * PI / 180.;
+        return {std::cos(tilt) * std::cos(turn), std::cos(tilt) * std::sin(turn), -std::sin(tilt)};
+    }
+    default: return m_view_dir;
+    }
+}
+
+PathCut::ViewLimits GLGizmoCut3D::Curve::view_limits() const
+{
+    PathCut::ViewLimits l;
+    l.front = m_lim_front.on ? m_lim_front.mm : -1.;
+    l.back  = m_lim_back.on ? m_lim_back.mm : -1.;
+    l.start = m_lim_start.on ? m_lim_start.mm : -1.;
+    l.end   = m_lim_end.on ? m_lim_end.mm : -1.;
+    return l;
+}
+
+// The path through the points and the wall it sweeps, clipped to a little past the object where unlimited.
+void GLGizmoCut3D::Curve::rebuild_preview()
+{
+    m_preview_dirty = false;
+    m_curve.reset();
+    m_wall.reset();
+    if (!m_sphere.is_initialized())
+        m_sphere.init_from(smooth_sphere(16, 1.f));
+    const std::vector<PathCut::V3> pts(m_points.begin(), m_points.end());
+    if (pts.size() < 2)
+        return;
+    GLModel::Geometry line;
+    line.format = {GLModel::Geometry::EPrimitiveType::LineStrip, GLModel::Geometry::EVertexLayout::P3};
+    for (const PathCut::V3 &p : PathCut::smooth_path(pts)) {
+        line.add_vertex(Vec3f(p.cast<float>()));
+        line.add_index(unsigned(line.vertices_count() - 1));
+    }
+    m_curve.init_from(std::move(line));
+
+    const BoundingBoxf3       bb = m_parent.get_selection().get_bounding_box();
+    const PathCut::ViewCutter vc = PathCut::make_view_cutter(pts, sweep_dir(), bb.min, bb.max, m_kerf, view_limits());
+    if (!bb.defined || !vc.valid())
+        return;
+    double lo = std::numeric_limits<double>::max(), hi = -lo;
+    for (int c = 0; c < 8; ++c) {
+        const double h = vc.frame.height(Vec3d(c & 1 ? bb.max.x() : bb.min.x(), c & 2 ? bb.max.y() : bb.min.y(), c & 4 ? bb.max.z() : bb.min.z()));
+        lo = std::min(lo, h);
+        hi = std::max(hi, h);
+    }
+    if (vc.limit_depth) {
+        lo = std::max(lo, vc.h_min);
+        hi = std::min(hi, vc.h_max);
+    }
+    const double      reach = bb.size().norm() * 0.6;
+    const PathCut::V2 c     = vc.frame.to2d(bb.center());
+    GLModel::Geometry g;
+    g.format = {GLModel::Geometry::EPrimitiveType::Triangles, GLModel::Geometry::EVertexLayout::P3};
+    for (size_t i = 0; i + 1 < vc.path.size(); ++i) {
+        PathCut::V2 a = vc.path[i], b = vc.path[i + 1];
+        if ((i == 0 && !vc.limit_start) || (i + 2 == vc.path.size() && !vc.limit_end)) {
+            if ((a - c).norm() > reach) a = c + (a - c).normalized() * reach;
+            if ((b - c).norm() > reach) b = c + (b - c).normalized() * reach;
+        }
+        const unsigned base = unsigned(g.vertices_count());
+        for (const auto &[q, h] : {std::pair(a, lo), std::pair(b, lo), std::pair(b, hi), std::pair(a, hi)})
+            g.add_vertex(Vec3f(vc.frame.to3d(q, h).cast<float>()));
+        g.add_triangle(base, base + 1, base + 2);
+        g.add_triangle(base, base + 2, base + 3);
+    }
+    m_wall.init_from(std::move(g));
+}
+
+void GLGizmoCut3D::Curve::render()
+{
+    if (m_points.empty())
+        return;
+    if (m_preview_dirty)
+        rebuild_preview();
+    const Camera      &camera = wxGetApp().plater()->get_camera();
+    const Transform3d &view   = camera.get_view_matrix();
+    if (previewing()) {
+        if (GLShaderProgram *shader = wxGetApp().get_shader("gouraud_light")) {
+            shader->start_using();
+            shader->set_uniform("projection_matrix", camera.get_projection_matrix());
+            shader->set_uniform("emission_factor", 0.1f);
+            shader->set_uniform("view_normal_matrix", Matrix3d(view.matrix().block(0, 0, 3, 3)));
+            for (auto [model, shift, color] : {std::tuple(&m_piece_stay, m_piece_lift, CURVE_STAY_COLOR),
+                                               std::tuple(&m_piece_moved, Vec3d(m_piece_shift + m_piece_lift), CURVE_MOVED_COLOR)}) {
+                shader->set_uniform("view_model_matrix", view * Geometry::translation_transform(m_pending->offset + shift));
+                model->set_color(color);
+                model->render();
+            }
+            shader->stop_using();
+        }
+    } else if (m_wall.is_initialized()) {
+        if (GLShaderProgram *shader = wxGetApp().get_shader("flat")) {
+            glsafe(::glDisable(GL_CULL_FACE));
+            glsafe(::glEnable(GL_BLEND));
+            glsafe(::glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA));
+            shader->start_using();
+            shader->set_uniform("view_model_matrix", view);
+            shader->set_uniform("projection_matrix", camera.get_projection_matrix());
+            m_wall.set_color(ColorRGBA(CURVE_PATH_COLOR.r(), CURVE_PATH_COLOR.g(), CURVE_PATH_COLOR.b(), 0.25f));
+            m_wall.render();
+            shader->stop_using();
+            glsafe(::glDisable(GL_BLEND));
+            glsafe(::glEnable(GL_CULL_FACE));
+        }
+    }
+
+    // The path and its points twice: faint through everything, so the whole path stays readable, then solid
+    // where nothing is in front of them, drawn a hair towards the viewer so the surface they lie on does not
+    // hide them.
+    const BoundingBoxf3 sel_bb = m_parent.get_selection().get_bounding_box();
+    const Vec3d         toward = -camera.get_dir_forward() * std::clamp(sel_bb.size().norm() * 0.003, 0.05, 0.6);
+    const Matrix4d     &proj   = camera.get_projection_matrix().matrix();
+    const double        vp_h   = std::max(1, int(camera.get_viewport()[3]));
+    const double        max_r  = std::clamp(sel_bb.size().norm() * 0.004, 0.15, 1.2);
+    glsafe(::glEnable(GL_BLEND));
+    glsafe(::glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA));
+    for (const bool hidden_pass : {true, false}) {
+        const Transform3d bias  = hidden_pass ? Transform3d::Identity() : Transform3d(Geometry::translation_transform(toward));
+        const float       alpha = hidden_pass ? 0.25f : 1.f;
+        if (hidden_pass)
+            glsafe(::glDisable(GL_DEPTH_TEST));
+        else
+            glsafe(::glEnable(GL_DEPTH_TEST));
+        GLShaderProgram *shader = wxGetApp().get_shader("flat");
+        if (shader != nullptr && m_curve.is_initialized()) {
+            shader->start_using();
+            shader->set_uniform("view_model_matrix", view * bias);
+            shader->set_uniform("projection_matrix", camera.get_projection_matrix());
+            shader->set_uniform("width", 0.4f);
+            m_curve.set_color(ColorRGBA(CURVE_PATH_COLOR.r(), CURVE_PATH_COLOR.g(), CURVE_PATH_COLOR.b(), alpha));
+            m_curve.render();
+            shader->stop_using();
+        }
+        if ((shader = wxGetApp().get_shader("gouraud_light")) == nullptr)
+            continue;
+        shader->start_using();
+        shader->set_uniform("projection_matrix", camera.get_projection_matrix());
+        shader->set_uniform("emission_factor", 0.5f);
+        m_sphere.set_color(ColorRGBA(CURVE_POINT_COLOR.r(), CURVE_POINT_COLOR.g(), CURVE_POINT_COLOR.b(), alpha));
+        for (const Vec3d &p : m_points) {
+            // A few pixels across however far the view is zoomed in: one pixel at the point is 2 w / (P11 h).
+            const Vec4d       pv    = proj * (view * Vec4d(p.x(), p.y(), p.z(), 1.));
+            const double      r     = std::min(max_r, 8. * std::abs(pv.w()) / (std::abs(proj(1, 1)) * vp_h));
+            const Transform3d model = bias * Geometry::translation_transform(p) * Geometry::scale_transform(r);
+            shader->set_uniform("view_model_matrix", view * model);
+            shader->set_uniform("view_normal_matrix", Matrix3d(view.matrix().block(0, 0, 3, 3) * model.matrix().block(0, 0, 3, 3).inverse().transpose()));
+            m_sphere.render();
+        }
+        shader->stop_using();
+    }
+    glsafe(::glDisable(GL_BLEND));
+    glsafe(::glEnable(GL_DEPTH_TEST));
+}
+
+void GLGizmoCut3D::Curve::start_cut()
+{
+    if (m_running)
+        return;
+    clear_pending();
+    const Selection &selection = m_parent.get_selection();
+    const int        obj_idx   = selection.get_object_idx();
+    Plater          *plater    = wxGetApp().plater();
+    // Never silently: a preview button that does nothing looks broken.
+    ModelObject *mo = obj_idx >= 0 && obj_idx < int(plater->model().objects.size()) ? plater->model().objects[obj_idx] : nullptr;
+    if (mo == nullptr || mo != m_object) {
+        reset_path();
+        return set_message(_u8L("Select the object to cut and place the points on it again."), true);
+    }
+    // The cut replaces the object by its pieces, so other copies of it would go too.
+    if (mo->instances.size() > 1)
+        return set_message(_u8L("This object has several copies. Cutting it would remove the other copies: make them separate "
+                                "objects first, then cut one of them."), true);
+    const ModelInstance *mi = mo->instances.front();
+    if (!mi->get_matrix().isApprox(m_inst_matrix)) {
+        reset_path();
+        return set_message(_u8L("The object was moved since the points were placed. Place them again."), true);
+    }
+
+    // Millimetres as printed: the instance rotation and scale are baked into the meshes, the offset is kept.
+    auto st         = std::make_shared<CurveCutJob>();
+    st->obj_idx     = obj_idx;
+    st->mo          = mo;
+    st->offset      = mi->get_offset();
+    st->inst_matrix = mi->get_matrix();
+    const Transform3d inst_no_offset = mi->get_transformation().get_matrix_no_offset();
+    for (size_t i = 0; i < mo->volumes.size(); ++i) {
+        const ModelVolume *v = mo->volumes[i];
+        st->volumes.push_back({v->id().id, v->get_matrix(), v->get_mesh_shared_ptr()});
+        indexed_triangle_set its = v->mesh().its;
+        its_transform(its, inst_no_offset * v->get_matrix(), true);
+        if (v->is_model_part()) {
+            its_merge(st->src, its);
+            ++st->parts;
+        } else
+            st->extras.push_back({i, std::move(its)});
+    }
+    for (const Vec3d &p : m_points)
+        st->pts.emplace_back(p - st->offset);
+    st->view_dir = sweep_dir();
+    st->kerf     = m_kerf;
+    st->limits   = view_limits();
+
+    m_running    = st;
+    m_busy_since = std::chrono::steady_clock::now();
+    set_message(_u8L("Cutting, please wait..."), false);
+    queue_job(plater->get_ui_job_worker(),
+        [st](Job::Ctl &ctl) {
+            auto canceled = [&ctl]() { return ctl.was_canceled(); };
+            ctl.update_status(0, _u8L("Cutting along the path"));
+            BOOST_LOG_TRIVIAL(info) << "Cut along path: " << st->src.indices.size() << " triangles, kerf " << st->kerf;
+            PathCut::make_edge_manifold(st->src);
+            const BoundingBoxf3       bb = Slic3r::bounding_box(st->src);
+            const PathCut::ViewCutter vc = PathCut::make_view_cutter(st->pts, st->view_dir, bb.min, bb.max, st->kerf, st->limits);
+            if (!vc.valid()) {
+                st->error = vc.error;
+                return;
+            }
+            const PathCut::CutResult res = PathCut::cut_with_slab(std::move(st->src), vc, 0.5, canceled);
+            if (canceled() || !(st->error = res.error).empty())
+                return;
+            bool joined = false;
+            st->grouped = PathCut::group_cut(res, vc, &joined);
+            if (joined)
+                st->error = _u8L("The cut does not separate the object: it is still connected around the path. Make the path "
+                                 "cross the object completely, or change the limits.");
+            else if (st->grouped.side_a.indices.empty() || st->grouped.side_b.indices.empty())
+                st->error = _u8L("The path did not split the object. Make sure it crosses the object completely.");
+            else if (!st->extras.empty())
+                st->extra_sides = extras_in_sides(st->extras, st->grouped);
+        },
+        [this, st](bool canceled, std::exception_ptr &eptr) {
+            if (m_running != st)
+                return; // the tool was closed or the cut cancelled meanwhile
+            m_running.reset();
+            if (eptr) {
+                try { std::rethrow_exception(eptr); } catch (const std::exception &e) {
+                    BOOST_LOG_TRIVIAL(error) << "Cut along path: " << e.what();
+                }
+                eptr = nullptr; // handled here
+                st->error = _u8L("The cut failed. Try a simpler path or a model with fewer triangles.");
+            }
+            if (canceled)
+                return set_message(_u8L("Cut cancelled."), false);
+            cut_done(st);
+        });
+    m_parent.set_as_dirty();
+}
+
+// The cut is computed: show the pieces apart, the smaller one (detached when the cut is performed) moved away
+// from the other along the line between their centres.
+void GLGizmoCut3D::Curve::cut_done(const std::shared_ptr<CurveCutJob> &st)
+{
+    if (!st->error.empty())
+        return set_message(st->error, true);
+    if (!st->object_unchanged()) {
+        reset_path();
+        return set_message(_u8L("The object was changed while it was being cut. Cut it again."), true);
+    }
+    m_pending = st;
+    const bool                  a_moves = std::abs(its_volume(st->grouped.side_a)) <= std::abs(its_volume(st->grouped.side_b));
+    const indexed_triangle_set &moved   = a_moves ? st->grouped.side_a : st->grouped.side_b;
+    const indexed_triangle_set &stay    = a_moves ? st->grouped.side_b : st->grouped.side_a;
+    m_piece_stay.init_from(stay);
+    m_piece_moved.init_from(moved);
+    m_piece_shift = PathCut::preview_shift(moved, stay);
+    m_piece_lift  = Vec3d(0., 0., PathCut::preview_lift(moved, stay, m_piece_shift));
+    show_object(false);
+    set_message(_u8L("Preview: the pieces are shown apart. Perform the cut if it is right, or edit it."), false);
+}
+
+// An exception escaping here (UI thread, from a CallAfter) would end the application.
+void GLGizmoCut3D::Curve::apply_cut()
+{
+    const std::shared_ptr<CurveCutJob> st = m_pending;
+    clear_pending();
+    if (!st || !st->object_unchanged()) {
+        reset_path();
+        return set_message(_u8L("The object was changed while it was being cut. Cut it again."), true);
+    }
+    try {
+        Plater            *plater     = wxGetApp().plater();
+        ModelObject       *mo         = plater->model().objects[st->obj_idx];
+        const ModelVolume *first_part = *std::find_if(mo->volumes.begin(), mo->volumes.end(), [](const ModelVolume *v) { return v->is_model_part(); });
+        // The detached piece (the smaller one) first, then the rest.
+        std::pair<const indexed_triangle_set *, unsigned char> sides[2] = {{&st->grouped.side_a, 1}, {&st->grouped.side_b, 2}};
+        if (std::abs(its_volume(*sides[0].first)) > std::abs(its_volume(*sides[1].first)))
+            std::swap(sides[0], sides[1]);
+        // TRN %1%: the name of the object that was cut
+        const std::string names[2] = {GUI::format(_u8L("%1% - piece"), mo->name), GUI::format(_u8L("%1% - rest"), mo->name)};
+        Model tmp;
+        for (int i = 0; i < 2; ++i) {
+            ModelObject *no = nullptr;
+            mo->clone_for_cut(&no);
+            tmp.objects.push_back(no); // deleted with tmp
+            no->clear_instances();
+            no->cut_connectors.clear();
+            no->cut_id.invalidate();
+            no->name        = names[i];
+            ModelVolume *nv = no->add_volume(TriangleMesh(*sides[i].first));
+            nv->name        = names[i];
+            nv->config.apply(first_part->config);
+            nv->set_material_id(first_part->material_id());
+            for (size_t k = 0; k < st->extras.size(); ++k)
+                if (st->extra_sides[k] & sides[i].second) {
+                    const ModelVolume *src = mo->volumes[st->extras[k].volume_idx];
+                    ModelVolume       *ev  = no->add_volume(TriangleMesh(st->extras[k].mesh), src->type());
+                    ev->name               = src->name;
+                    ev->config.apply(src->config);
+                }
+            no->add_instance()->set_offset(st->offset);
+            no->invalidate_bounding_box();
+            no->ensure_on_bed();
+        }
+        place_piece(*tmp.objects[0], tmp.objects[1]->instance_bounding_box(0), mo);
+
+        m_parent.reset_all_gizmos();
+        Plater::TakeSnapshot snapshot(plater, _u8L("Cut along path"));
+        if (mo->is_cut()) // the other pieces of an earlier cut with connectors lose their link to this one
+            wxGetApp().obj_list()->invalidate_cut_info_for_object(st->obj_idx);
+        plater->apply_cut_object_to_model(size_t(st->obj_idx), tmp.objects);
+        if (st->parts > 1)
+            plater->get_notification_manager()->push_notification(NotificationType::CustomNotification,
+                NotificationManager::NotificationLevel::WarningNotificationLevel,
+                _u8L("Cut along path: the parts of the object were joined into one before cutting."));
+    } catch (const std::exception &e) {
+        BOOST_LOG_TRIVIAL(error) << "Cut along path: applying the cut failed: " << e.what();
+        wxGetApp().plater()->get_notification_manager()->push_notification(NotificationType::CustomNotification,
+            NotificationManager::NotificationLevel::ErrorNotificationLevel, _u8L("The cut could not be applied."));
+    }
+}
+
+void GLGizmoCut3D::Curve::render_input_window(float x, float y, float bottom_limit)
+{
+    ImGuiWrapper &imgui   = *m_cut.m_imgui;
+    const bool    busy    = m_running != nullptr;
+    auto          changed = [this]() { // a preview made with the old settings is dropped
+        clear_pending();
+        m_preview_dirty = true;
+    };
+    // A preview of an object changed meanwhile (moved, edited elsewhere) cannot be performed.
+    if (m_pending && !m_pending->object_unchanged()) {
+        clear_pending();
+        set_message(_u8L("The object was changed during the preview. Make the preview again."), true);
+    }
+
+    ImGuiWrapper::push_toolbar_style(m_parent.get_scale());
+    ImGui::SetNextWindowSizeConstraints(ImVec2(0.f, 0.f), ImVec2(FLT_MAX, std::max(100.f, bottom_limit - y)));
+    m_cut.GizmoImguiSetNextWIndowPos(x, y, ImGuiCond_Always, 0.0f, 0.0f);
+    m_cut.GizmoImguiBegin(m_cut.get_name(), ImGuiWindowFlags_NoMove | ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoTitleBar);
+    // The Cut tool's frame padding and label column, so the mode row and the fields stay in place.
+    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(6.0f, 4.0f * m_parent.get_gizmos_manager().get_layout_scale()));
+    const std::vector<std::string> sweeps{_u8L("From the view"), _u8L("Level with the bed"), _u8L("Vertical"), _u8L("Custom")};
+    float label_w = 0.f;
+    for (const std::string &l : {_u8L("Mode"), _u8L("Clearance (mm)"), _u8L("Cut direction"), _u8L("Turn (deg)"), _u8L("Tilt (deg)"),
+                                 _u8L("In front (mm)"), _u8L("Behind (mm)"), _u8L("Beginning (mm)"), _u8L("Ending (mm)")})
+        label_w = std::max(label_w, ImGui::CalcTextSize(l.c_str()).x);
+    const float field_x = std::max(m_cut.m_label_width, ImGui::GetStyle().WindowPadding.x + ImGui::GetFrameHeight() * 1.5f + label_w);
+    float       field_w = ImGui::CalcTextSize("000.00").x * 1.5f + 2.f * (ImGui::GetFrameHeight() + ImGui::GetStyle().ItemInnerSpacing.x);
+    for (const std::string &s : sweeps)
+        field_w = std::max(field_w, ImGui::CalcTextSize(s.c_str()).x + ImGui::GetFrameHeight() + 3.f * ImGui::GetStyle().FramePadding.x);
+
+    if (const std::optional<ModeButton> clicked = m_cut.render_mode_buttons(ModeButton::Curve, !busy))
+        wxGetApp().CallAfter([this, mode = size_t(*clicked)]() {
+            m_cut.set_curve(false);
+            if (mode != m_cut.m_mode) {
+                m_cut.switch_to_mode(mode);
+                m_cut.check_and_update_connectors_state();
+            }
+        });
+    ImGui::Separator();
+
+    imgui.disabled_begin(busy || previewing());
+    ImGui::AlignTextToFramePadding();
+    imgui.text(GUI::format(_u8L("Points: %1%"), m_points.size()));
+    ImGui::SameLine();
+    if (imgui.button(_L("Undo point"), ImVec2(0, 0), !m_points.empty())) {
+        m_points.pop_back();
+        changed();
+    }
+    auto float_row = [&](const std::string &label, const char *id, float &value, float step, float lo, float hi, const char *fmt) {
+        ImGui::AlignTextToFramePadding();
+        imgui.text(label);
+        ImGui::SameLine(field_x);
+        ImGui::PushItemWidth(field_w);
+        if (ImGui::InputFloat(id, &value, step, step * 5.f, fmt))
+            changed();
+        ImGui::PopItemWidth();
+        value = std::clamp(value, lo, hi);
+    };
+    float_row(_u8L("Clearance (mm)"), "##curve_kerf", m_kerf, 0.05f, 0.02f, 2.f, "%.2f");
+    // The direction the path is swept along: as seen when the first point was placed, level with the bed (a cut
+    // parallel to the bed for a path drawn from the front), vertical, or set by hand.
+    int sweep = int(m_sweep);
+    if (m_cut.render_combo(_u8L("Cut direction"), sweeps, sweep, field_x, field_w)) {
+        if (Sweep(sweep) == Sweep::Custom) { // starting from the current direction
+            const Vec3d d = sweep_dir();
+            m_turn        = float(std::atan2(d.y(), d.x()) * 180. / PI);
+            m_tilt        = float(std::asin(std::clamp(-d.z(), -1., 1.)) * 180. / PI);
+        }
+        m_sweep = Sweep(sweep);
+        changed();
+    }
+    if (m_sweep == Sweep::View) {
+        ImGui::SameLine();
+        if (m_cut.render_reset_button("curve_view_dir", _u8L("Take the cut direction from the current view"))) {
+            m_view_dir = wxGetApp().plater()->get_camera().get_dir_forward();
+            changed();
+        }
+    } else if (m_sweep == Sweep::Custom) {
+        float_row(_u8L("Turn (deg)"), "##curve_turn", m_turn, 1.f, -180.f, 180.f, "%.0f");
+        float_row(_u8L("Tilt (deg)"), "##curve_tilt", m_tilt, 1.f, -90.f, 90.f, "%.0f");
+    }
+    // How far the wall reaches: through everything unless limited. Collapsed, the title tells whether a limit is set.
+    const bool any_limit = m_lim_front.on || m_lim_back.on || m_lim_start.on || m_lim_end.on;
+    ImGui::PushStyleVar(ImGuiStyleVar_IndentSpacing, 0.f);
+    m_limits_open = ImGui::TreeNodeEx(((!m_limits_open && any_limit ? _u8L("Limits (enabled)") : _u8L("Limits")) + "###curve_limits").c_str(),
+                                      ImGuiTreeNodeFlags_SpanAvailWidth | ImGuiTreeNodeFlags_FramePadding);
+    if (m_limits_open) {
+        for (auto [label, lim, id] : {std::tuple(_L("In front (mm)"), &m_lim_front, "##curve_front"), std::tuple(_L("Behind (mm)"), &m_lim_back, "##curve_back"),
+                                      std::tuple(_L("Beginning (mm)"), &m_lim_start, "##curve_start"), std::tuple(_L("Ending (mm)"), &m_lim_end, "##curve_end")}) {
+            if (imgui.bbl_checkbox(label, lim->on))
+                changed();
+            if (lim->on) {
+                ImGui::SameLine(field_x);
+                ImGui::PushItemWidth(field_w);
+                if (ImGui::InputFloat(id, &lim->mm, 0.5f, 5.f, "%.1f"))
+                    changed();
+                ImGui::PopItemWidth();
+                lim->mm = std::clamp(lim->mm, 0.f, 1000.f);
+            }
+        }
+        ImGui::TreePop();
+    }
+    ImGui::PopStyleVar();
+    imgui.disabled_end();
+
+    // Bottom bar, as in the Cut tool: the tips and the editing actions on the left, the main action and Cancel
+    // (closes the tool) on the right.
+    ImGui::Separator();
+    GLGizmoUtils::render_tooltip_button(&imgui, m_parent, {{_L("Left mouse button"), _L("Add a point along the line to cut")},
+                                                           {_L("Right mouse button"), _L("Remove the last point")}}, x, y);
+    ImGui::SameLine();
+    if (busy) {
+        GLGizmoUtils::begin_right_aligned_buttons({_L("Cancel")});
+        if (imgui.button(_L("Cancel"))) {
+            m_running.reset(); // its result is dropped when the worker hands it back
+            wxGetApp().plater()->get_ui_job_worker().cancel();
+            set_message(_u8L("Cut cancelled."), false);
+        }
+    } else {
+        if (previewing()) {
+            if (imgui.button(_L("Edit cut"))) {
+                clear_pending();
+                m_preview_dirty = true;
+            }
+        } else {
+            imgui.disabled_begin(m_points.empty());
+            if (imgui.button(_L("Reset"), _L("Remove all the points"))) {
+                reset_path();
+                m_message.clear();
+            }
+            imgui.disabled_end();
+            ImGui::SameLine();
+            GLGizmoUtils::push_orca_button_style();
+            // TRN Button of the Curve mode of the Cut tool: computes the cut and shows the pieces apart before it is made.
+            if (imgui.button(_L_CONTEXT("Preview", "Cut along path"), ImVec2(0, 0), m_points.size() >= 2))
+                wxGetApp().CallAfter([this]() { start_cut(); });
+            GLGizmoUtils::pop_orca_button_style();
+        }
+        ImGui::SameLine();
+        GLGizmoUtils::begin_right_aligned_buttons({_L("Perform cut"), _L("Cancel")});
+        GLGizmoUtils::push_orca_button_style();
+        if (imgui.button(_L("Perform cut"), ImVec2(0, 0), previewing()))
+            wxGetApp().CallAfter([this]() { if (previewing()) apply_cut(); });
+        GLGizmoUtils::pop_orca_button_style();
+        ImGui::SameLine();
+        if (imgui.button(_L("Cancel")))
+            wxGetApp().CallAfter([this]() { m_parent.reset_all_gizmos(); });
+    }
+
+    // Notes and warnings below the bottom bar, so the controls stay in place.
+    if (!m_message.empty()) {
+        ImGui::Separator();
+        ImGui::PushTextWrapPos(ImGui::GetFontSize() * 26.f);
+        if (m_message_is_error)
+            ImGuiWrapper::text_colored(ImGuiWrapper::COL_ORANGE_LIGHT, m_message);
+        else
+            imgui.text(m_message);
+        ImGui::PopTextWrapPos();
+    }
+    if (busy) { // the seconds taken, so the tool is seen working (the cut does not report how far it is)
+        // TRN %1%: whole seconds since the cut started
+        imgui.text(GUI::format(_u8L("%1% s"), int(std::chrono::duration<float>(std::chrono::steady_clock::now() - m_busy_since).count())));
+        m_parent.schedule_extra_frame(500);
+    }
+    ImGui::PopStyleVar();
+    m_cut.GizmoImguiEnd();
+    ImGuiWrapper::pop_toolbar_style();
+}
 
 } // namespace GUI
 } // namespace Slic3r

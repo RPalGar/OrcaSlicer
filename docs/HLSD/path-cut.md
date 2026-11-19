@@ -40,14 +40,14 @@ constraints). The pieces earcut leaves open there are closed with fans.
 
 ## GUI
 
-The tool is the Curve mode of the Cut tool. It has no toolbar icon of its own: the Cut tool shows its
-modes (Planar, Dovetail, Curve) as a row of icon buttons. In Curve mode `GLGizmoCut3D` stays the active
-gizmo and hands rendering, the mouse, its window and its common data requirements to `GLGizmoPathCut`,
-which draws the same row of modes at the top of the window to go back. `GLGizmoPathCut` stays a class of
-its own because it works on points picked on the mesh rather than on the cut plane the Cut tool is
-built around; `GLGizmosManager::active_path_cut()` gives it when the Cut tool shows it.
+Cut along path is the Curve mode of the Cut tool, next to Planar and Dovetail in its row of mode buttons; it
+has no toolbar icon of its own. In Curve mode `GLGizmoCut3D` hands rendering, the mouse, the keyboard
+(Enter: preview, Esc: back to editing), its window and its common data requirements to
+`GLGizmoCut3D::Curve`, which works on points picked on the mesh rather than on the cut plane the rest of the
+tool is built around.
 
-`GLGizmoPathCut` collects the points, runs the cut as a background job on a copy of the mesh, shows
-a preview with the pieces moved apart, and replaces the object with the pieces only when the user
-applies the cut, as one undo step. The job is dropped when the tool is closed or the object changes
-meanwhile. The tool keeps no state in the project file.
+`Curve` collects the points, runs the cut as a job on the Plater's UI job worker on a copy of the mesh, shows
+a preview with the pieces apart, and replaces the object with the pieces only when the user performs the
+cut, as one undo step. Volumes that are not cut (negative volumes, modifiers) go with the pieces they are in.
+The job is dropped when the tool is closed or cancelled, and the preview when the object changes meanwhile.
+The tool keeps no state in the project file.

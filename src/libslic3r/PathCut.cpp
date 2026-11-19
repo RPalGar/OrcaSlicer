@@ -782,6 +782,8 @@ double remove_self_loops(std::vector<V2> &q)
 }
 
 
+std::vector<V3> smooth_path(const std::vector<V3> &points) { return catmull_rom(points, false, 12); }
+
 ViewCutter make_view_cutter(const std::vector<V3> &points, const V3 &view_dir, const V3 &bb_min, const V3 &bb_max, double kerf,
                             const ViewLimits &limits)
 {

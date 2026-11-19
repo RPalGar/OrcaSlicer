@@ -37,7 +37,6 @@ namespace GUI {
 
 class GLCanvas3D;
 class ClippingPlane;
-class GLGizmoPathCut;
 enum class SLAGizmoEventType : unsigned char;
 class CommonGizmosDataPool;
 //BBS: GUI refactor: add object manipulation
@@ -104,7 +103,6 @@ public:
         Assembly,
         Simplify,
         BrimEars,
-        PathCut,
         //SlaSupports,
         // BBS
         //FaceRecognition,
@@ -303,8 +301,8 @@ public:
     EType get_current_type() const { return m_current; }
     GLGizmoBase* get_current() const;
     GLGizmoBase *get_gizmo(GLGizmosManager::EType type) const;
-    // The "Cut along path" tool while the Cut tool shows it in its place (its Curve mode), else null.
-    GLGizmoPathCut *active_path_cut() const;
+    // The Cut tool is open in its Curve mode (cut along a path picked on the object).
+    bool is_cut_curve() const;
     EType get_gizmo_from_name(const std::string& gizmo_name) const;
 
     bool is_running() const;

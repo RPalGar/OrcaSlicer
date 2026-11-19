@@ -95,6 +95,9 @@ private:
 ViewCutter make_view_cutter(const std::vector<V3> &points, const V3 &view_dir, const V3 &bb_min, const V3 &bb_max, double kerf,
                             const ViewLimits &limits = {});
 
+// The picked points joined by the same smooth curve the cut follows (for drawing the path).
+std::vector<V3> smooth_path(const std::vector<V3> &points);
+
 // First crossing of two non-adjacent segments of an open polyline, searching from the start: the segments
 // i < j and the crossing point. Returns false when the polyline does not cross itself.
 bool first_self_crossing(const std::vector<V2> &q, size_t &si, size_t &sj, V2 &x);
