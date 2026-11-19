@@ -78,7 +78,9 @@
 #include "libslic3r/PathCut.hpp"
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
+#include <memory>
 #include <cfloat>
 #include <cstdlib>
 #include <limits>
@@ -315,6 +317,7 @@ private:
     Vec3d   m_piece_shift{Vec3d::Zero()}, m_piece_lift{Vec3d::Zero()};
     bool    m_object_hidden{false};
     std::shared_ptr<CurveCutJob> m_running;           // the cut on the job worker
+    std::shared_ptr<char> m_alive{std::make_shared<char>()}; // the job's result is dropped once the tool is gone
     std::chrono::steady_clock::time_point m_busy_since;
 
     // A left press on the object adds a point on release, unless the mouse is dragged: then the view orbits.
@@ -4370,6 +4373,9 @@ struct CurveCutJob
     PathCut::Grouped           grouped;
     std::vector<unsigned char> extra_sides; // per extra: bit 0 in side_a, bit 1 in side_b
     std::string                error;       // translated
+    // Set by the tool to drop the cut: the job worker is shared, and cancelling it would stop whatever job it
+    // runs at that moment, which need not be this one.
+    std::atomic<bool>          dropped{false};
 
     bool object_unchanged() const
     {
@@ -4464,8 +4470,8 @@ CommonGizmosDataID GLGizmoCut3D::Curve::requirements() const
 
 void GLGizmoCut3D::Curve::set_state(bool on)
 {
-    if (!on && m_running) // the cut still running is dropped: it would apply later, on whatever is done by then
-        wxGetApp().plater()->get_ui_job_worker().cancel();
+    if (m_running) // a cut still running is dropped: it would apply later, on whatever is done by then
+        m_running->dropped = true;
     m_running.reset();
     m_on = on;
     reset_path();
@@ -4838,6 +4844,18 @@ void GLGizmoCut3D::Curve::start_cut()
         return set_message(_u8L("The object was moved since the points were placed. Place them again."), true);
     }
 
+    // The parts are joined into one before cutting and the pieces get the settings of the first one: refuse
+    // when that would lose the settings or filament of another part.
+    const ModelVolume *first_part = nullptr;
+    for (const ModelVolume *v : mo->volumes)
+        if (v->is_model_part()) {
+            if (first_part == nullptr)
+                first_part = v;
+            else if (v->material_id() != first_part->material_id() || !(v->config.get() == first_part->config.get()))
+                return set_message(_u8L("The parts of this object have different settings or filaments, which the cut would not "
+                                        "keep: it joins the parts into one. Split the object into separate objects first."), true);
+        }
+
     // Millimetres as printed: the instance rotation and scale are baked into the meshes, the offset is kept.
     auto st         = std::make_shared<CurveCutJob>();
     st->obj_idx     = obj_idx;
@@ -4865,9 +4883,11 @@ void GLGizmoCut3D::Curve::start_cut()
     m_running    = st;
     m_busy_since = std::chrono::steady_clock::now();
     set_message(_u8L("Cutting, please wait..."), false);
-    queue_job(plater->get_ui_job_worker(),
+    const bool queued = queue_job(plater->get_ui_job_worker(),
         [st](Job::Ctl &ctl) {
-            auto canceled = [&ctl]() { return ctl.was_canceled(); };
+            auto canceled = [&ctl, &st]() { return st->dropped || ctl.was_canceled(); };
+            if (canceled())
+                return;
             ctl.update_status(0, _u8L("Cutting along the path"));
             BOOST_LOG_TRIVIAL(info) << "Cut along path: " << st->src.indices.size() << " triangles, kerf " << st->kerf;
             PathCut::make_edge_manifold(st->src);
@@ -4890,9 +4910,9 @@ void GLGizmoCut3D::Curve::start_cut()
             else if (!st->extras.empty())
                 st->extra_sides = extras_in_sides(st->extras, st->grouped);
         },
-        [this, st](bool canceled, std::exception_ptr &eptr) {
-            if (m_running != st)
-                return; // the tool was closed or the cut cancelled meanwhile
+        [this, alive = std::weak_ptr<char>(m_alive), st](bool canceled, std::exception_ptr &eptr) {
+            if (alive.expired() || m_running != st)
+                return; // the tool is gone, was closed or the cut cancelled meanwhile
             m_running.reset();
             if (eptr) {
                 try { std::rethrow_exception(eptr); } catch (const std::exception &e) {
@@ -4905,6 +4925,10 @@ void GLGizmoCut3D::Curve::start_cut()
                 return set_message(_u8L("Cut cancelled."), false);
             cut_done(st);
         });
+    if (!queued) {
+        m_running.reset();
+        set_message(_u8L("The cut could not be started. Try again."), true);
+    }
     m_parent.set_as_dirty();
 }
 
@@ -5105,8 +5129,8 @@ void GLGizmoCut3D::Curve::render_input_window(float x, float y, float bottom_lim
     if (busy) {
         GLGizmoUtils::begin_right_aligned_buttons({_L("Cancel")});
         if (imgui.button(_L("Cancel"))) {
-            m_running.reset(); // its result is dropped when the worker hands it back
-            wxGetApp().plater()->get_ui_job_worker().cancel();
+            m_running->dropped = true;
+            m_running.reset();
             set_message(_u8L("Cut cancelled."), false);
         }
     } else {
