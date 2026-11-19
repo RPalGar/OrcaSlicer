@@ -97,6 +97,16 @@ double polygon_area(const std::vector<V2> &poly)
     return 0.5 * a;
 }
 
+// Parameter of the point of segment ab closest to q, and its distance to q.
+double closest_on_segment(const V2 &q, const V2 &a, const V2 &b, double &dist)
+{
+    const V2     ab = b - a;
+    const double l2 = ab.squaredNorm();
+    const double t  = l2 > 0. ? std::clamp((q - a).dot(ab) / l2, 0., 1.) : 0.;
+    dist            = (q - (a + ab * t)).norm();
+    return t;
+}
+
 
 uint64_t edge_key(int a, int b) { return a < b ? (uint64_t(uint32_t(a)) << 32) | uint32_t(b) : (uint64_t(uint32_t(b)) << 32) | uint32_t(a); }
 
@@ -597,10 +607,8 @@ void ViewCutter::nearest(const V2 &q, size_t &seg, double &t, double &dist) cons
 {
     dist = std::numeric_limits<double>::max();
     for (size_t i = 0; i + 1 < path.size(); ++i) {
-        const V2     ab = path[i + 1] - path[i];
-        const double l2 = ab.squaredNorm();
-        const double tt = l2 > 0. ? std::clamp((q - path[i]).dot(ab) / l2, 0., 1.) : 0.;
-        const double d  = (q - (path[i] + ab * tt)).norm();
+        double       d;
+        const double tt = closest_on_segment(q, path[i], path[i + 1], d);
         if (d < dist) { dist = d; seg = i; t = tt; }
     }
 }
@@ -618,14 +626,12 @@ void ViewCutter::build_grid(const V2 &mn, const V2 &mx)
         const V2 lo = path[i].cwiseMin(path[i + 1]) - V2(reach + cell, reach + cell), hi = path[i].cwiseMax(path[i + 1]) + V2(reach + cell, reach + cell);
         const int x0 = std::max(0, int((lo.x() - grid_min.x()) / cell)), x1 = std::min(nx - 1, int((hi.x() - grid_min.x()) / cell));
         const int y0 = std::max(0, int((lo.y() - grid_min.y()) / cell)), y1 = std::min(ny - 1, int((hi.y() - grid_min.y()) / cell));
-        const V2  d  = path[i + 1] - path[i];
         for (int y = y0; y <= y1; ++y)
             for (int x = x0; x <= x1; ++x) {
                 // keep only cells the (expanded) segment really passes near
-                const V2     c  = grid_min + V2((x + 0.5) * cell, (y + 0.5) * cell);
-                const double l2 = d.squaredNorm();
-                const double t  = l2 > 0. ? std::clamp((c - path[i]).dot(d) / l2, 0., 1.) : 0.;
-                if ((c - (path[i] + d * t)).norm() <= reach + 0.75 * cell)
+                double d;
+                closest_on_segment(grid_min + V2((x + 0.5) * cell, (y + 0.5) * cell), path[i], path[i + 1], d);
+                if (d <= reach + 0.75 * cell)
                     cell_segs[size_t(y) * nx + x].push_back(int(i));
             }
     }
@@ -647,10 +653,8 @@ bool ViewCutter::nearest_in_grid(const V2 &q, size_t &seg, double &t, double &di
     if (x < 0 || y < 0 || x >= nx || y >= ny) return false;
     dist = std::numeric_limits<double>::max();
     for (int i : cell_segs[size_t(y) * nx + x]) {
-        const V2     ab = path[i + 1] - path[i];
-        const double l2 = ab.squaredNorm();
-        const double tt = l2 > 0. ? std::clamp((q - path[i]).dot(ab) / l2, 0., 1.) : 0.;
-        const double dd = (q - (path[i] + ab * tt)).norm();
+        double       dd;
+        const double tt = closest_on_segment(q, path[i], path[i + 1], dd);
         if (dd < dist) { dist = dd; seg = size_t(i); t = tt; }
     }
     return dist <= reach;
@@ -1029,6 +1033,7 @@ CutResult cut_with_slab(indexed_triangle_set its, const ViewCutter &cutter, doub
         f.resize(its.vertices.size());
         out.resize(its.vertices.size(), -1.);
         for (size_t i = from; i < its.vertices.size(); ++i) {
+            if ((i & 0xffff) == 0 && stop()) return;
             const V3 p = pos(int(i));
             f[i]       = cutter.field(p);
             if (bounded) out[i] = cutter.outside(p);
@@ -1085,8 +1090,10 @@ CutResult cut_with_slab(indexed_triangle_set its, const ViewCutter &cutter, doub
         return -1;
     };
     std::vector<size_t> cand;
-    for (size_t i = 0; i < its.indices.size(); ++i)
+    for (size_t i = 0; i < its.indices.size(); ++i) {
+        if ((i & 0xffff) == 0 && stop()) return {};
         if (needs_split(its.indices[i]) >= 0) cand.push_back(i);
+    }
     // Each pass halves the longest edge of every triangle that still needs it, and no edge is split below
     // the refine size, so this ends; the bound only catches a refinement that runs away all the same.
     for (int pass = 0; !cand.empty(); ++pass) {
@@ -1129,6 +1136,7 @@ CutResult cut_with_slab(indexed_triangle_set its, const ViewCutter &cutter, doub
     {
         constexpr double snap = 2e-3, step = 1e-3;
         for (size_t v = 0; v < its.vertices.size(); ++v) {
+            if ((v & 0xffff) == 0 && stop()) return {};
             if (bounded && out[v] >= 0.) continue;
             for (int level : {1, -1}) {
                 const double x = level > 0 ? f[v] - hk : -f[v] - hk;
@@ -1194,6 +1202,7 @@ CutResult cut_with_slab(indexed_triangle_set its, const ViewCutter &cutter, doub
     std::unordered_map<uint64_t, size_t> cut_owner;
     std::unordered_map<uint64_t, int>    removed; // bounded cut only, values unused
     for (size_t ti = 0; ti < its.indices.size(); ++ti) {
+        if ((ti & 0xffff) == 0 && stop()) return {};
         const auto &t = its.indices[ti];
         if (!active_t(ti)) {
             kept.push_back(t);
@@ -1229,13 +1238,13 @@ CutResult cut_with_slab(indexed_triangle_set its, const ViewCutter &cutter, doub
             const int fan = first_cross == 0 ? 1 : first_cross == np - 1 ? np - 2 : first_cross;
             cut_owner.emplace(edge_key(x0, x1), base + size_t(fan - 1));
         }
-        if ((ti & 0xffff) == 0 && stop()) return {};
     }
     // A triangle outside the limits must not border a clipped one: that means the surface runs through
     // the rim of the wall, i.e. the wall ends inside a part it cuts.
     if (bounded)
-        for (size_t ti : inactive_touching) {
-            const auto &t = its.indices[ti];
+        for (size_t k = 0; k < inactive_touching.size(); ++k) {
+            if ((k & 0xffff) == 0 && stop()) return {};
+            const auto &t = its.indices[inactive_touching[k]];
             for (int e = 0; e < 3; ++e)
                 for (auto *m : {&cross[0], &cross[1], &removed})
                     if (m->count(edge_key(t[e], t[(e + 1) % 3]))) {

@@ -222,21 +222,36 @@ TEST_CASE("A limited view wall ending inside a coarse box is reported, not silen
     CHECK_FALSE(res.error.empty());
 }
 
-TEST_CASE("A view wall through a coarse box long along the path cuts it", "[PathCut]")
+TEST_CASE("Limited view walls on coarse oblique faces cut what they go through and report what they end inside", "[PathCut]")
 {
-    // 10 x 10 x 100 box, two triangles per face, cut across the middle by a slightly tilted path seen from
-    // the front, with the depth limited to just past the box: the long faces cross the wall far from their
-    // vertices.
-    const indexed_triangle_set box = its_make_cube(10., 10., 100.);
-    const std::vector<PathCut::V3> pts{{-1., 0., 48.}, {5., 0., 50.}, {11., 0., 52.}};
-    PathCut::ViewLimits lim;
-    lim.back = 12.;
-    lim.front = 1.;
-    const PathCut::ViewCutter vc = PathCut::make_view_cutter(pts, PathCut::V3::UnitY(), PathCut::V3::Zero(), PathCut::V3(10., 10., 100.), 0.2, lim);
-    REQUIRE(vc.limited());
-    const PathCut::CutResult res = PathCut::cut_with_slab(box, vc);
-    REQUIRE(res.error.empty());
-    const auto parts = its_split(res.mesh);
-    CHECK(parts.size() == 2);
-    require_closed_parts(parts);
+    // Large faces oblique to the view, crossed by the wall far from their vertices.
+    for (const float deg : {30.f, 45.f, 60.f}) {
+        const std::vector<PathCut::V3> pts{{-80., 60., 10.}, {0., 60., 11.}, {80., 60., 9.}};
+        // A box long along the view, rotated: 10 mm of depth end inside it.
+        indexed_triangle_set box = its_make_cube(20., 100., 20.);
+        its_translate(box, Vec3f(-10.f, -50.f, 0.f));
+        its_rotate_z(box, float(deg * PI / 180.));
+        its_translate(box, Vec3f(0.f, 60.f, 0.f));
+        PathCut::ViewLimits narrow;
+        narrow.front = narrow.back = 5.;
+        const BoundingBoxf3 bb = bounding_box(box);
+        const PathCut::ViewCutter vc = PathCut::make_view_cutter(pts, PathCut::V3::UnitY(), bb.min, bb.max, 0.2, narrow);
+        CHECK_FALSE(PathCut::cut_with_slab(box, vc).error.empty());
+        // A thin plate, rotated: the depth limits just cover it.
+        indexed_triangle_set plate = its_make_cube(40., 2., 20.);
+        its_translate(plate, Vec3f(-20.f, -1.f, 0.f));
+        its_rotate_z(plate, float(deg * PI / 180.));
+        its_translate(plate, Vec3f(0.f, 60.f, 0.f));
+        const BoundingBoxf3 pb = bounding_box(plate);
+        PathCut::ViewLimits tight;
+        tight.front = 60. - pb.min.y() + 0.1;
+        tight.back  = pb.max.y() - 60. + 0.1;
+        const PathCut::ViewCutter pc = PathCut::make_view_cutter(pts, PathCut::V3::UnitY(), pb.min, pb.max, 0.2, tight);
+        REQUIRE(pc.limited());
+        const PathCut::CutResult res = PathCut::cut_with_slab(plate, pc);
+        REQUIRE(res.error.empty());
+        const auto parts = its_split(res.mesh);
+        CHECK(parts.size() == 2);
+        require_closed_parts(parts);
+    }
 }

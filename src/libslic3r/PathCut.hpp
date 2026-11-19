@@ -136,7 +136,8 @@ Grouped group_cut(const CutResult &cut, const ViewCutter &cutter, bool *joined =
 
 // Preview of a cut: how far the detached piece is drawn apart from the piece that stays, along the line
 // between their bounding box centres (straight up when they share a centre): 10 % of the detached piece's
-// size, between 6 and 30 mm. Zero when either piece is empty.
+// size, between 6 and 30 mm. Zero when either piece is empty. Both meshes must have no unused vertices, as
+// group_cut() returns them.
 V3 preview_shift(const indexed_triangle_set &moved, const indexed_triangle_set &stay);
 // How far both pieces are drawn raised so that the detached piece, drawn `shift` apart, does not go below
 // the lowest point of the object. Zero otherwise.
