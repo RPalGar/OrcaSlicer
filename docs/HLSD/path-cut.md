@@ -2,66 +2,41 @@
 
 ## Purpose and scope
 
-The "Cut along path" gizmo splits an object along a line the user draws on it, where the planar Cut
-tool can only split along a plane. It is meant for figures and organic models (sculpted, scanned or
-AI-generated meshes, often with millions of triangles) that have to be printed in pieces: a head
-along the hair line, an arm at the shoulder, a tail where it joins the body. Like the planar cut,
-it can add connectors so the printed pieces register when glued.
+Cut along path splits an object along a line the user draws on it, where the planar Cut tool can only
+split along a plane. It is meant for figures and organic models (sculpted, scanned or AI-generated
+meshes, often with millions of triangles) that have to be printed in pieces: a head along the hair line,
+a figure along the folds of its clothes.
 
-The tool has two modes:
-
-- **View path**: points picked from one view direction. The smoothed path is swept along the view
-  direction into a thin wall that splits the whole object. Optional limits (start, end, depth) stop
-  the wall inside the object; then it only cuts where it reaches the outside surface.
-- **Loop**: points picked on the surface around the region to detach. A curved cap spanning the
-  loop detaches only that region, even when the loop is not planar. With "Follow the model's edges"
-  the loop snaps to the creases of the mesh and the cut runs exactly along mesh edges.
-
-Several loops can be cut one after the other without leaving the tool; the faces already cut are
-shown in orange.
+The points are picked from one view direction. The smoothed path is swept along the view direction into
+a thin wall that splits the whole object. Optional limits (start, end, depth) stop the wall inside the
+object; then it only cuts the parts it goes all the way through.
 
 ## Geometry
 
-The geometry lives in two header-only files under `src/libslic3r/`, which only depend on Eigen,
-admesh, earcut and TBB, so `tests/libslic3r/test_path_cut.cpp` tests them without the rest of
-libslic3r.
+`src/libslic3r/PathCut.hpp` / `.cpp`, tested by `tests/libslic3r/test_path_cut.cpp`.
 
-A general mesh boolean is far too slow on the meshes this tool is for, so neither mode uses one.
-`PathCutGeometry.hpp` describes the cut as a signed field `f` over the mesh — the distance across
-the wall (`ViewCutter`) or the height above the cap (`LoopCutter`) — and the slab `|f| < kerf / 2`
-is the clearance left between the pieces. Triangles near the slab are refined where the field bends,
-clipped against the two level sets `f = ±kerf / 2`, with each edge crossing computed once so the
-result stays watertight, and the openings are closed with caps triangulated in a 2D chart of each
-level set (`detail::close_cut_faces`, shared by all cutters). Cost is linear in the triangle count
-and only the triangles near the slab are touched.
+A general mesh boolean is far too slow on the meshes this tool is for, so the cut does not use one. The
+wall is a signed field `f` over the mesh, the distance across it (`ViewCutter`), and `|f| < kerf / 2` is
+the clearance left between the pieces. `cut_with_slab` refines the triangles near the wall where the field
+bends or where they cross the rim of a limited wall, clips them against the two level sets
+`f = ±kerf / 2`, with each edge crossing computed once so the result stays watertight, and closes the
+openings with caps triangulated in a 2D chart of each level set (arc length along the path, height along
+the view direction). Cost is linear in the triangle count and only the triangles near the wall are
+touched.
 
 Rules that shape the result:
 
-- A wall that ends inside the object does not cut there (`foreign_bands`): only the parts of the
-  slab that reach the outside surface split the object, so a limited path cuts what it crosses and
-  leaves the rest whole.
-- A loop also cuts the walls of holes it spans, so a hole through the region comes out open.
-- `cut_along_edge_loop` cuts exactly along a chain of mesh edges found by `CreaseGraph` (a
-  dihedral-weighted shortest path in a corridor around the picked loop). When it fails, the gizmo
-  falls back to `cut_along_loop`.
+- A limited wall that ends inside a part does not cut it: only the parts the wall goes all the way through
+  are split, and when the wall ends inside every part it reaches, the cut is refused with a message.
+- `make_edge_manifold` runs first: zero-thickness sheets and edges shared by more than two faces, common
+  in sculpted and AI-generated meshes, would leave openings the caps cannot close.
+- `group_cut` assigns every resulting part to a side by the cut face it carries. A part carrying both cut
+  faces is still connected around the wall; the cut is then reported as not separating the object.
 
-`CutResult` reports what is still connected after the cut, so the gizmo can show where the cut
-does not separate the object instead of producing one piece.
-
-## Connectors
-
-`PathCutConnectors.hpp` places plugs or dowels (cylinder or square) on the curved cut face. All
-connectors share one axis, the direction the cut face comes apart in (`pull_direction`), so they
-slide out of their holes together even across a U-shaped face. A spot fits only where both pieces
-have material all around it, deep enough, with a wall left, and where the face under it is flat
-enough; the check casts lines parallel to the axis through a grid of the projected triangles.
-Connectors are spread out automatically or placed by clicking; the user can tilt the axis, and can
-force a connector where the check rejects it.
-
-The holes are negative volumes of the pieces, as in the Cut tool, so applying a cut stays fast on
-any mesh. On request they are cut into the meshes instead (an mcut difference, only when the cut is
-applied), so the pieces show and export with their holes; a hole set the boolean fails on is kept as
-a negative volume.
+The caps are triangulated with earcut followed by Delaunay edge flips rather than with
+`Triangulation`: where the cut grazes the surface the rings of a cap can touch or cross themselves at
+micrometre scale, which `Triangulation` does not accept (it needs unique points and non-crossing
+constraints). The pieces earcut leaves open there are closed with fans.
 
 ## GUI
 

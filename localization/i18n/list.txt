@@ -237,8 +237,7 @@ src/libslic3r/Zipper.cpp
 src/libslic3r/PrintObject.cpp
 src/libslic3r/PrintObjectSlice.cpp
 src/libslic3r/PlaceholderParser.cpp
-src/libslic3r/PathCutConnectors.hpp
-src/libslic3r/PathCutGeometry.hpp
+src/libslic3r/PathCut.cpp
 src/libslic3r/Support/TreeSupport.cpp
 src/libslic3r/Model.cpp
 src/libslic3r/Format/OBJ.cpp
