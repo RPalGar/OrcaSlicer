@@ -1,5 +1,6 @@
 #include "PathCut.hpp"
 
+#include "AABBMesh.hpp"
 #include "I18N.hpp"
 #include "TriangleMesh.hpp"
 
@@ -870,6 +871,192 @@ ViewCutter make_view_cutter(const std::vector<V3> &points, const V3 &view_dir, c
 }
 
 
+// ------------------------------------------------------------------------------------------------ loop
+
+void LoopCutter::spoke_at(double ang, double &r, double &h) const
+{
+    const size_t n  = angles.size();
+    ang             = angles[0] + std::fmod(std::fmod(ang - angles[0], 2. * PI) + 2. * PI, 2. * PI);
+    const size_t i  = size_t(std::upper_bound(angles.begin(), angles.end(), ang) - angles.begin());
+    const size_t i0 = (i + n - 1) % n, i1 = i % n;
+    double       a0 = angles[i0], a1 = angles[i1];
+    if (a1 <= a0) a1 += 2. * PI;
+    if (ang < a0) ang += 2. * PI;
+    const double t = a1 - a0 > 1e-12 ? (ang - a0) / (a1 - a0) : 0.;
+    r = radius[i0] * (1. - t) + radius[i1] * t;
+    h = hloop[i0] * (1. - t) + hloop[i1] * t;
+}
+
+// Smoothstep from the mean height at the centre to the loop's height at the loop, flat beyond it: no cone
+// tip at the centre and no crease along the loop.
+double LoopCutter::cap_height(const V2 &q, double *outside) const
+{
+    const V2     d  = q - center;
+    const double rr = d.norm();
+    double       r, h;
+    spoke_at(std::atan2(d.y(), d.x()), r, h);
+    if (outside) *outside = rr - (r + margin);
+    const double s = r > 1e-12 ? std::min(1., rr / r) : 1.;
+    const double w = s * s * (3. - 2. * s);
+    return hmean * (1. - w) + h * w;
+}
+
+int LoopCutter::side(const V3 &p) const
+{
+    double       out = 0.;
+    const double dz  = frame.height(p) - cap_height(frame.to2d(p), &out);
+    if (out > 0. || std::abs(dz) > 2. * kerf + 1e-3)
+        return 0;
+    return dz > 0. ? 1 : -1;
+}
+
+std::string LoopCutter::rim_error() const
+{
+    return _u8L("The loop does not go all the way around the part. Place the points around it, or widen the cap margin.");
+}
+
+LoopCutter make_loop_cutter(const std::vector<V3> &loop_points, double kerf, double margin, const std::function<V3(const V3 &)> &snap,
+                            bool flat)
+{
+    LoopCutter lc;
+    lc.kerf   = kerf;
+    lc.margin = margin;
+    const std::vector<V3> pts = remove_close_points(loop_points, 1e-3, true);
+    if (pts.size() < 3) {
+        lc.error = _u8L("The loop needs at least three points.");
+        return lc;
+    }
+    std::vector<V3> dense = catmull_rom(pts, true, 16);
+    for (V3 &p : dense) p = snap(p);
+    dense   = remove_close_points(dense, 1e-4, true);
+    lc.loop = dense;
+
+    // Mean plane of the loop: the direction it encloses the most area seen from (its vector area). Unlike a
+    // least-squares plane this stays right for strongly non-planar (saddle) loops.
+    V3 c = V3::Zero();
+    for (const V3 &p : dense) c += p;
+    c /= double(dense.size());
+    V3 varea = V3::Zero();
+    for (size_t i = 0; i < dense.size(); ++i) varea += (dense[i] - c).cross(dense[(i + 1) % dense.size()] - c);
+    const std::string degenerate = _u8L("The loop encloses no area. Place the points around the part.");
+    if (varea.norm() < 1e-9) {
+        lc.error = degenerate;
+        return lc;
+    }
+    lc.frame = frame_from_normal(varea, c);
+
+    std::vector<V2>     q;
+    std::vector<double> h;
+    for (const V3 &p : dense) { q.push_back(lc.frame.to2d(p)); h.push_back(lc.frame.height(p)); }
+    const double area = polygon_area(q);
+    if (std::abs(area) < 1e-9) {
+        lc.error = degenerate;
+        return lc;
+    }
+    if (area < 0.) { std::reverse(q.begin(), q.end()); std::reverse(h.begin(), h.end()); }
+    V2 cc = V2::Zero();
+    for (size_t i = 0; i < q.size(); ++i) {
+        const V2 &a = q[i], &b = q[(i + 1) % q.size()];
+        cc += (a + b) * (a.x() * b.y() - b.x() * a.y());
+    }
+    lc.center = cc / (6. * std::abs(area));
+
+    // The cap is a height field over spokes from the centre, so the loop must wind once around it. Snapping
+    // the smoothed loop to a bumpy surface makes it wobble back here and there: those few points are dropped.
+    const size_t        n = q.size();
+    std::vector<double> ang(n), rad(n);
+    double              winding = 0.;
+    for (size_t i = 0; i < n; ++i) {
+        const V2 d = q[i] - lc.center;
+        ang[i] = std::atan2(d.y(), d.x());
+        rad[i] = d.norm();
+    }
+    for (size_t i = 0; i < n; ++i)
+        winding += std::remainder(ang[(i + 1) % n] - ang[i], 2. * PI);
+    const size_t first = size_t(std::min_element(ang.begin(), ang.end()) - ang.begin());
+    std::rotate(ang.begin(), ang.begin() + long(first), ang.end());
+    std::rotate(rad.begin(), rad.begin() + long(first), rad.end());
+    std::rotate(h.begin(), h.begin() + long(first), h.end());
+    std::vector<double> a2, r2, h2;
+    for (size_t i = 0; i < n; ++i)
+        if (rad[i] > 1e-6 && (a2.empty() || ang[i] > a2.back() + 1e-9)) { a2.push_back(ang[i]); r2.push_back(rad[i]); h2.push_back(h[i]); }
+    if (std::abs(winding) < PI || a2.size() < 8 || a2.size() * 2 < n) {
+        lc.error = _u8L("The loop folds back on itself seen from its mean plane. Place the points more evenly around the part.");
+        return lc;
+    }
+    // Low-pass the radius and height profiles (truncated Fourier series): the snapped loop is noisy, and a
+    // smooth cap needs far fewer triangles and cuts more cleanly.
+    auto smooth = [&a2](const std::vector<double> &y, int harmonics) {
+        const size_t        m = a2.size();
+        std::vector<double> w(m), out(m, 0.);
+        for (size_t i = 0; i < m; ++i) w[i] = 0.5 * std::fmod(a2[(i + 1) % m] - a2[(i + m - 1) % m] + 4. * PI, 2. * PI); // trapezoid weights
+        for (int k = 0; k <= harmonics; ++k) {
+            double ck = 0., sk = 0.;
+            for (size_t i = 0; i < m; ++i) { ck += w[i] * y[i] * std::cos(k * a2[i]); sk += w[i] * y[i] * std::sin(k * a2[i]); }
+            ck /= k == 0 ? 2. * PI : PI;
+            sk /= PI;
+            for (size_t i = 0; i < m; ++i) out[i] += ck * std::cos(k * a2[i]) + sk * std::sin(k * a2[i]);
+        }
+        return out;
+    };
+    lc.radius = smooth(r2, 8);
+    lc.hloop  = smooth(h2, 4);
+    lc.angles = std::move(a2);
+    if (*std::min_element(lc.radius.begin(), lc.radius.end()) < 1e-3) {
+        lc.error = _u8L("The loop is too irregular. Place the points more evenly around the part.");
+        lc.angles.clear();
+        return lc;
+    }
+    double hm = 0.;
+    for (double x : lc.hloop) hm += x;
+    lc.hmean = hm / double(lc.hloop.size());
+    if (flat)
+        std::fill(lc.hloop.begin(), lc.hloop.end(), lc.hmean);
+    return lc;
+}
+
+bool fit_loop_margin(const indexed_triangle_set &its, LoopCutter &lc, double max_margin)
+{
+    constexpr double bin = 0.25, gap = 2.;
+    const size_t     nbins = size_t(max_margin / bin) + 1;
+    std::vector<int> hits(nbins, 0);
+    auto record = [&](const V3 &p) {
+        const double rr = lc.outside(p) + lc.margin; // distance outside the loop itself
+        if (rr >= 0. && rr < max_margin) ++hits[size_t(rr / bin)];
+    };
+    const double        band = 0.5 * lc.kerf;
+    std::vector<double> f(its.vertices.size());
+    for (size_t i = 0; i < f.size(); ++i) f[i] = lc.field(its.vertices[i].cast<double>());
+    // Where the surface meets the cap: vertices inside the slab, and the crossings of the cap's middle
+    // sampled along each triangle (the faces of low-poly models are much larger than a bin).
+    for (const auto &t : its.indices) {
+        if (std::min({f[t[0]], f[t[1]], f[t[2]]}) > band || std::max({f[t[0]], f[t[1]], f[t[2]]}) < -band) continue;
+        V3  x[2];
+        int nx = 0;
+        for (int e = 0; e < 3; ++e) {
+            const double fa = f[t[e]], fb = f[t[(e + 1) % 3]];
+            const V3     a = its.vertices[t[e]].cast<double>(), b = its.vertices[t[(e + 1) % 3]].cast<double>();
+            if (std::abs(fa) <= band) record(a);
+            if ((fa < 0.) != (fb < 0.) && nx < 2) x[nx++] = a + (b - a) * (fa / (fa - fb));
+        }
+        if (nx == 2) {
+            const int steps = std::min(4000, int((x[1] - x[0]).norm() / bin) + 1);
+            for (int k = 0; k <= steps; ++k) record(x[0] + (x[1] - x[0]) * (double(k) / steps));
+        }
+    }
+    const size_t need = size_t(gap / bin);
+    size_t       run  = 0;
+    for (size_t b = size_t(std::max(0., lc.margin - 0.5 * gap) / bin); b < nbins; ++b) {
+        run = hits[b] == 0 ? run + 1 : 0;
+        if (run >= need) {
+            lc.margin = (double(b + 1) - 0.5 * double(need)) * bin;
+            return true;
+        }
+    }
+    return false;
+}
+
+
 // ------------------------------------------------------------------------------------------------ cleanup
 
 // Sculpted / AI meshes often carry zero-thickness sheets (the same triangle twice with opposite
@@ -1170,7 +1357,7 @@ CutResult cut_with_slab(indexed_triangle_set its, const Cutter &cutter, double r
     };
     // Parts of the model the limited wall ends inside are not cut (see foreign_bands).
     std::vector<char> foreign;
-    if (bounded) foreign = foreign_bands(its, f, out, hk);
+    if (bounded && cutter.skips_parts_it_ends_in()) foreign = foreign_bands(its, f, out, hk);
     auto active_t = [&](size_t ti) {
         const auto &t = its.indices[ti];
         return !bounded || (out[t[0]] < 0. && out[t[1]] < 0. && out[t[2]] < 0. && (foreign.empty() || !foreign[ti]));
@@ -1340,16 +1527,26 @@ Grouped group_cut(const CutResult &cut, const Cutter &cutter, bool *joined)
         }
         parts[c].indices.push_back(nt);
     }
-    Grouped g;
+    // Parts untouched by the cut go to the side most of their vertices are on. Where the cutter cannot tell
+    // (away from a loop cap), they go with a part of side a they lie in (a pin in the detached foot), else to b.
     for (size_t i = 0; i < parts.size(); ++i) {
         if (label[i] == 2 && joined) *joined = true;
-        if (label[i] == 0) { // untouched by the cut: the side most of its vertices are on
-            const auto  &vs   = parts[i].vertices;
-            const size_t step = std::max<size_t>(1, vs.size() / 4000);
-            long         vote = 0;
-            for (size_t k = 0; k < vs.size(); k += step) vote += cutter.side(vs[k].cast<double>());
-            label[i] = vote > 0 ? 1 : -1;
-        }
+        if (label[i] != 0) continue;
+        const auto  &vs   = parts[i].vertices;
+        const size_t step = std::max<size_t>(1, vs.size() / 4000);
+        long         vote = 0;
+        for (size_t k = 0; k < vs.size(); k += step) vote += cutter.side(vs[k].cast<double>());
+        label[i] = vote > 0 ? 1 : vote < 0 ? -1 : 0;
+    }
+    for (size_t i = 0; i < parts.size(); ++i) {
+        if (label[i] != 0) continue;
+        label[i] = -1;
+        const Vec3d p = parts[i].vertices.front().cast<double>();
+        for (size_t j = 0; j < parts.size() && label[i] < 0; ++j)
+            if (label[j] == 1 && AABBMesh(parts[j]).query_ray_hit(p, Vec3d(1e-4, 2e-4, 1.).normalized()).is_inside()) label[i] = 1;
+    }
+    Grouped g;
+    for (size_t i = 0; i < parts.size(); ++i) {
         if (std::abs(its_volume(parts[i])) < 1.f) ++g.n_small;
         if (label[i] == 1) { its_merge(g.side_a, parts[i]); ++g.n_a; }
         else               { its_merge(g.side_b, parts[i]); ++g.n_b; }

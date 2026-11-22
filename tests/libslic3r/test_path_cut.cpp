@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
+#include <functional>
 #include <map>
 #include <tuple>
 #include <utility>
@@ -254,4 +255,130 @@ TEST_CASE("Limited view walls on coarse oblique faces cut what they go through a
         CHECK(parts.size() == 2);
         require_closed_parts(parts);
     }
+}
+
+namespace {
+
+std::vector<PathCut::V3> ring(double r, int n, const std::function<double(double)> &z)
+{
+    std::vector<PathCut::V3> loop;
+    for (int i = 0; i < n; ++i) {
+        const double a = 2. * PI * i / n;
+        loop.emplace_back(r * std::cos(a), r * std::sin(a), z(a));
+    }
+    return loop;
+}
+
+const auto no_snap = [](const PathCut::V3 &p) { return p; };
+
+} // namespace
+
+TEST_CASE("A loop cap leaves other parts of the model next to the loop uncut", "[PathCut]")
+{
+    // Cylinder r = 5 and a 5 x 10 x 30 box 3 mm beside it, both crossing the plane of a loop around the
+    // cylinder at z = 15. The cap stops in the free ring between them: only the cylinder is cut.
+    indexed_triangle_set model = its_make_cylinder(5., 30.);
+    indexed_triangle_set box   = its_make_cube(5., 10., 30.);
+    its_translate(box, Vec3f(8.f, -5.f, 0.f));
+    its_merge(model, box);
+    for (const bool flat : {true, false}) {
+        PathCut::LoopCutter lc = PathCut::make_loop_cutter(ring(5., 12, [](double) { return 15.; }), 0.2, 1.5, no_snap, flat);
+        REQUIRE(lc.valid());
+        REQUIRE(PathCut::fit_loop_margin(model, lc));
+        const PathCut::CutResult res = PathCut::cut_with_slab(model, lc);
+        REQUIRE(res.error.empty());
+        const auto parts = its_split(res.mesh);
+        REQUIRE(parts.size() == 3);
+        require_closed_parts(parts);
+        CHECK(std::any_of(parts.begin(), parts.end(), [](const indexed_triangle_set &p) { return std::abs(its_volume(p) - 1500.) < 1.; }));
+    }
+}
+
+TEST_CASE("A tilted loop around a cylinder detaches its end", "[PathCut]")
+{
+    // The finer cylinders have long thin side faces the cap rim runs across.
+    const double r = 5.;
+    for (const double segments : {36., 180., 360., 1000.}) {
+        CAPTURE(segments);
+        const indexed_triangle_set cyl = its_make_cylinder(r, 30., 2. * PI / segments);
+        PathCut::LoopCutter lc = PathCut::make_loop_cutter(ring(r, 12, [](double a) { return 15. + 2. * std::cos(a); }), 0.2, 1.5, no_snap, false);
+        REQUIRE(lc.valid());
+        REQUIRE(PathCut::fit_loop_margin(cyl, lc));
+        const PathCut::CutResult res = PathCut::cut_with_slab(cyl, lc);
+        REQUIRE(res.error.empty());
+        require_closed_parts(its_split(res.mesh));
+        bool                   joined = false;
+        const PathCut::Grouped g      = PathCut::group_cut(res, lc, &joined);
+        CHECK_FALSE(joined);
+        REQUIRE(g.n_a == 1);
+        REQUIRE(g.n_b == 1);
+        const double half = PI * r * r * 15.;
+        CHECK_THAT(its_volume(g.side_a), WithinAbs(half, 0.1 * half));
+        CHECK_THAT(its_volume(g.side_b), WithinAbs(half, 0.1 * half));
+    }
+}
+
+TEST_CASE("A tilted flat loop around a long box detaches its end", "[PathCut]")
+{
+    // All the box's vertices are outside the cap: only its long side faces cross it.
+    const indexed_triangle_set box = its_make_cube(10., 10., 100.);
+    std::vector<PathCut::V3>   loop;
+    const PathCut::V3          corners[4] = {{0, 0, 0}, {10, 0, 0}, {10, 10, 0}, {0, 10, 0}};
+    for (int s = 0; s < 4; ++s)
+        for (int k = 0; k < 4; ++k) {
+            PathCut::V3 p = corners[s] + (corners[(s + 1) % 4] - corners[s]) * (k / 4.);
+            p.z()         = 50. + 3. * (p.x() - 5.) / 5.;
+            loop.push_back(p);
+        }
+    PathCut::LoopCutter lc = PathCut::make_loop_cutter(loop, 0.2, 1.5, no_snap, true);
+    REQUIRE(lc.valid());
+    REQUIRE(PathCut::fit_loop_margin(box, lc));
+    const PathCut::CutResult res = PathCut::cut_with_slab(box, lc);
+    REQUIRE(res.error.empty());
+    const auto parts = its_split(res.mesh);
+    CHECK(parts.size() == 2);
+    require_closed_parts(parts);
+}
+
+TEST_CASE("A flat loop cap cuts along the mean plane of the loop", "[PathCut]")
+{
+    const double               kerf = 0.2;
+    const indexed_triangle_set cyl  = its_make_cylinder(5., 30.);
+    PathCut::LoopCutter lc = PathCut::make_loop_cutter(ring(5., 12, [](double a) { return 15. + 1.5 * std::cos(2. * a); }), kerf, 1.5, no_snap, true);
+    REQUIRE(lc.valid());
+    REQUIRE(PathCut::fit_loop_margin(cyl, lc));
+    const PathCut::CutResult res = PathCut::cut_with_slab(cyl, lc);
+    REQUIRE(res.error.empty());
+    require_closed_parts(its_split(res.mesh));
+    for (size_t i = res.first_cap; i < res.mesh.indices.size(); ++i)
+        for (int k = 0; k < 3; ++k) {
+            const PathCut::V3 p = res.mesh.vertices[size_t(res.mesh.indices[i][k])].cast<double>();
+            CHECK_THAT(std::abs(lc.frame.height(p) - lc.hmean), WithinAbs(0.5 * kerf, 1e-3));
+        }
+}
+
+TEST_CASE("A loop whose cap runs into another part is reported instead of cutting halfway", "[PathCut]")
+{
+    // Loop around one of two boxes standing side by side, with a cap margin reaching the other box.
+    indexed_triangle_set legs = its_make_cube(4., 4., 20.);
+    indexed_triangle_set leg2 = its_make_cube(4., 4., 20.);
+    its_translate(leg2, Vec3f(6.f, 0.f, 0.f));
+    its_merge(legs, leg2);
+    std::vector<PathCut::V3> loop = ring(2.9, 8, [](double) { return 10.; });
+    for (auto &p : loop) p += PathCut::V3(2., 2., 0.);
+    PathCut::LoopCutter lc = PathCut::make_loop_cutter(loop, 0.2, 5., no_snap, true);
+    REQUIRE(lc.valid());
+    CHECK_FALSE(PathCut::cut_with_slab(legs, lc).error.empty());
+}
+
+TEST_CASE("A loop that folds back on itself is rejected", "[PathCut]")
+{
+    std::vector<PathCut::V3> loop; // figure eight
+    for (int i = 0; i < 16; ++i) {
+        const double t = 2. * PI * i / 16.;
+        loop.emplace_back(10. * std::sin(t), 5. * std::sin(2. * t), 0.);
+    }
+    const PathCut::LoopCutter lc = PathCut::make_loop_cutter(loop, 0.2, 1.5, no_snap, true);
+    CHECK_FALSE(lc.valid());
+    CHECK_FALSE(lc.error.empty());
 }
