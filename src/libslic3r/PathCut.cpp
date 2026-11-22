@@ -214,7 +214,7 @@ void delaunay_flips(std::vector<stl_triangle_vertex_indices> &tris, const UV &uv
 // set and refines them so they follow curved walls. Cut edges that receive cap vertices split the
 // triangle owning them (cut_owner: cut edge -> index in its.indices), keeping the mesh watertight.
 // Returns 0 when done, 1 on an error (in res.error), 2 when canceled.
-int close_cut_faces(indexed_triangle_set &its, std::vector<std::pair<int, int>> (&cap_edges)[2], const ViewCutter &cutter,
+int close_cut_faces(indexed_triangle_set &its, std::vector<std::pair<int, int>> (&cap_edges)[2], const Cutter &cutter,
                     const std::unordered_map<uint64_t, size_t> &cut_owner, CutResult &res, const std::function<bool()> &canceled)
 {
     auto stop = [&]() { return canceled && canceled(); };
@@ -723,6 +723,11 @@ std::vector<std::pair<V2, V2>> ViewCutter::kinks(double tol) const
     return out;
 }
 
+std::string ViewCutter::rim_error() const
+{
+    return _u8L("The cut ends inside the object. Increase or remove the limits, or start and end the path beyond the part.");
+}
+
 V2 ViewCutter::chart(const V3 &p) const
 {
     size_t seg; double t, d;
@@ -1019,7 +1024,7 @@ size_t make_edge_manifold(indexed_triangle_set &its)
 }
 
 
-CutResult cut_with_slab(indexed_triangle_set its, const ViewCutter &cutter, double refine, const std::function<bool()> &canceled)
+CutResult cut_with_slab(indexed_triangle_set its, const Cutter &cutter, double refine, const std::function<bool()> &canceled)
 {
     CutResult    res;
     const bool   bounded = cutter.limited(); // the wall only exists where cutter.outside(p) < 0
@@ -1248,7 +1253,7 @@ CutResult cut_with_slab(indexed_triangle_set its, const ViewCutter &cutter, doub
             for (int e = 0; e < 3; ++e)
                 for (auto *m : {&cross[0], &cross[1], &removed})
                     if (m->count(edge_key(t[e], t[(e + 1) % 3]))) {
-                        res.error = _u8L("The cut ends inside the object. Increase or remove the limits, or start and end the path beyond the part.");
+                        res.error = cutter.rim_error();
                         return res;
                     }
         }
@@ -1308,7 +1313,7 @@ double preview_lift(const indexed_triangle_set &moved, const indexed_triangle_se
 
 // The parts are found with a union-find over the vertices instead of its_split(), which would lose the
 // cut face marks (CutResult::level) the parts are assigned by.
-Grouped group_cut(const CutResult &cut, const ViewCutter &cutter, bool *joined)
+Grouped group_cut(const CutResult &cut, const Cutter &cutter, bool *joined)
 {
     const indexed_triangle_set &its = cut.mesh;
     std::vector<int>            dsu(its.vertices.size());

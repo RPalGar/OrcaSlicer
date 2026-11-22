@@ -42,33 +42,54 @@ struct ViewLimits
     double front{-1.}, back{-1.}; // in front of / behind the picked points, along the sweep direction
 };
 
+// The surface cut_with_slab() removes the slab around: a signed field whose zero set is the middle of the
+// slab, and a 2D chart of the slab's faces to triangulate the caps in.
+struct Cutter
+{
+    double      kerf{0.}; // slab thickness = clearance between the parts
+    std::string error;    // translated; set when the cutter could not be built
+
+    virtual ~Cutter() = default;
+    // Whether the slab has a rim inside the object (see outside()).
+    virtual bool   limited() const = 0;
+    // Signed distance across the slab, positive on the side of level +1 (may be clamped far from it).
+    virtual double field(const V3 &p) const = 0;
+    // How far a point lies outside a limited slab, negative inside it.
+    virtual double outside(const V3 &) const { return -1.; }
+    // Which side of the cut a point away from the slab is on: +1, -1, or 0 when that cannot be told.
+    virtual int    side(const V3 &p) const = 0;
+    // Chart of the slab faces, and back to the face of the given level (+1 / -1).
+    virtual V2     chart(const V3 &p) const = 0;
+    virtual V3     lift(const V2 &chart_pos, int level) const = 0;
+    // Chart lines where the slab bends by more than `tol`; between two of them it is planar.
+    virtual std::vector<std::pair<V2, V2>> kinks(double /*tol*/) const { return {}; }
+    // Message when the surface runs through the rim of a limited slab.
+    virtual std::string rim_error() const = 0;
+};
+
 // The wall swept from a path in the view plane (built by make_view_cutter).
-struct ViewCutter
+struct ViewCutter final : Cutter
 {
     Frame               frame;
     std::vector<V2>     path; // smoothed + extended path in the view plane
     std::vector<double> arc;  // arc length at each path point
-    double              kerf{0.};
     // Limits (see ViewLimits): the wall may stop short past the first / last picked point and span only
     // heights [h_min, h_max] along the sweep direction.
     bool                limit_start{false}, limit_end{false}, limit_depth{false};
     double              h_min{0.}, h_max{0.};
-    std::string         error; // translated
     bool valid() const { return error.empty() && path.size() >= 2; }
-    bool limited() const { return limit_start || limit_end || limit_depth; }
+    bool limited() const override { return limit_start || limit_end || limit_depth; }
 
     // +1 left of the path, -1 right of it.
-    int    side(const V3 &p) const { return exact_field(frame.to2d(p)) >= 0. ? 1 : -1; }
-    // Signed distance across the wall, positive on the left of the path (clamped far from it).
-    double field(const V3 &p) const;
-    // How far a point lies outside the limited wall (negative inside it, always inside when unlimited).
-    double outside(const V3 &p) const;
-    // Chart of the wall faces: (arc length along the path, height along the view direction), and back
-    // to the face of the given level (+1 / -1).
-    V2     chart(const V3 &p) const;
-    V3     lift(const V2 &chart_pos, int level) const;
-    // Chart lines where the wall bends by more than `tol`; between two of them it is planar.
-    std::vector<std::pair<V2, V2>> kinks(double tol) const;
+    int    side(const V3 &p) const override { return exact_field(frame.to2d(p)) >= 0. ? 1 : -1; }
+    // Distance across the wall, positive on the left of the path.
+    double field(const V3 &p) const override;
+    double outside(const V3 &p) const override;
+    // (arc length along the path, height along the view direction)
+    V2     chart(const V3 &p) const override;
+    V3     lift(const V2 &chart_pos, int level) const override;
+    std::vector<std::pair<V2, V2>> kinks(double tol) const override;
+    std::string rim_error() const override;
 
     // Acceleration grid over the view plane: segments near each cell, and for cells with none, which
     // side of the path the whole cell is on.
@@ -119,7 +140,7 @@ struct CutResult
 // Removes the wall from a closed mesh and closes the openings.
 //  refine:   edges longer than this near the wall are split before clipping [mm].
 //  canceled: polled now and then; when it returns true the cut stops with an empty result.
-CutResult cut_with_slab(indexed_triangle_set its, const ViewCutter &cutter, double refine = 0.5,
+CutResult cut_with_slab(indexed_triangle_set its, const Cutter &cutter, double refine = 0.5,
                         const std::function<bool()> &canceled = {});
 
 struct Grouped
@@ -132,7 +153,7 @@ struct Grouped
 // Parts without a cut face go to the side of the cutter most of their vertices are on. A part carrying both
 // cut faces is still connected around the cut (an arm resting on a leg, say): it goes to side b and
 // `joined` is set.
-Grouped group_cut(const CutResult &cut, const ViewCutter &cutter, bool *joined = nullptr);
+Grouped group_cut(const CutResult &cut, const Cutter &cutter, bool *joined = nullptr);
 
 // Preview of a cut: how far the detached piece is drawn apart from the piece that stays, along the line
 // between their bounding box centres (straight up when they share a centre): 10 % of the detached piece's
