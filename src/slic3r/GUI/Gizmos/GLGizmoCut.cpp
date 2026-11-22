@@ -274,6 +274,9 @@ public:
 
 private:
     enum class Sweep : int { View = 0, Level = 1, Vertical = 2, Custom = 3 };
+    // Path: an open line swept along a direction through the object. Loop: a closed line around the region to
+    // detach, spanned by a cap.
+    enum class Shape : int { Path = 0, Loop = 1 };
     struct Limit { bool on{false}; float mm{3.f}; };
 
     bool                raycast(const Vec2d &mouse_pos, Vec3d &hit_world) const;
@@ -281,6 +284,7 @@ private:
     void                reset_path();
     Vec3d               sweep_dir() const;
     PathCut::ViewLimits view_limits() const;
+    size_t              min_points() const { return m_shape == Shape::Loop ? 3 : 2; }
     void                rebuild_preview();
     void                start_cut();
     void                cut_done(const std::shared_ptr<CurveCutJob> &job);
@@ -298,7 +302,10 @@ private:
     const ModelObject *m_object{nullptr};            // object they were picked on
     Transform3d        m_inst_matrix{Transform3d::Identity()}; // its instance then
     Vec3d              m_view_dir{Vec3d::UnitY()};   // locked at the first point
+    Shape              m_shape{Shape::Path};
     Sweep              m_sweep{Sweep::View};         // direction the path is swept along
+    bool               m_flat{true};                 // Shape::Loop: flat cut face, else following the loop's heights
+    float              m_margin{1.5f};               // Shape::Loop: how far the cap reaches past the loop [mm]
     float              m_turn{0.f}, m_tilt{0.f};     // Sweep::Custom: around the vertical axis / below horizontal [deg]
     float              m_kerf{0.2f};                 // clearance between the pieces [mm]
     // Limits of the wall [mm]: in front of / behind the points along the sweep, past the first / last point
@@ -4357,6 +4364,8 @@ struct CurveCutJob
     Vec3d                    view_dir{Vec3d::UnitY()};
     float                    kerf{0.2f};
     PathCut::ViewLimits      limits;
+    bool                     loop{false}, flat{true};
+    float                    margin{1.5f};
     // Volumes that are not cut (negative volumes, modifiers, support blockers / enforcers): each goes to the
     // pieces it is in, both if the cut runs through it. A negative volume only removes material of its own
     // object, so a hole kept whole in both pieces is the hole cut in two.
@@ -4643,7 +4652,7 @@ bool GLGizmoCut3D::Curve::on_key(SLAGizmoEventType action)
 {
     if (m_running)
         return false;
-    if (action == SLAGizmoEventType::ApplyChanges && !previewing() && m_points.size() >= 2) {
+    if (action == SLAGizmoEventType::ApplyChanges && !previewing() && m_points.size() >= min_points()) {
         wxGetApp().CallAfter([this]() { start_cut(); });
         return true;
     }
@@ -4693,13 +4702,46 @@ void GLGizmoCut3D::Curve::rebuild_preview()
     const std::vector<PathCut::V3> pts(m_points.begin(), m_points.end());
     if (pts.size() < 2)
         return;
-    GLModel::Geometry line;
-    line.format = {GLModel::Geometry::EPrimitiveType::LineStrip, GLModel::Geometry::EVertexLayout::P3};
-    for (const PathCut::V3 &p : PathCut::smooth_path(pts)) {
-        line.add_vertex(Vec3f(p.cast<float>()));
-        line.add_index(unsigned(line.vertices_count() - 1));
+    auto draw_line = [this](const std::vector<PathCut::V3> &line_pts, bool closed) {
+        GLModel::Geometry line;
+        line.format = {GLModel::Geometry::EPrimitiveType::LineStrip, GLModel::Geometry::EVertexLayout::P3};
+        for (size_t i = 0; i < line_pts.size() + (closed ? 1 : 0); ++i) {
+            line.add_vertex(Vec3f(line_pts[i % line_pts.size()].cast<float>()));
+            line.add_index(unsigned(line.vertices_count() - 1));
+        }
+        m_curve.init_from(std::move(line));
+    };
+    if (m_shape == Shape::Loop) {
+        // The loop as the cut follows it, and the cap spanning it out to the margin.
+        const PathCut::LoopCutter lc = PathCut::make_loop_cutter(pts, m_kerf, m_margin, [](const PathCut::V3 &p) { return p; }, m_flat);
+        if (!lc.valid()) {
+            draw_line(pts, true);
+            return;
+        }
+        draw_line(lc.loop, true);
+        constexpr int     spokes = 72, rings = 8;
+        GLModel::Geometry g;
+        g.format = {GLModel::Geometry::EPrimitiveType::Triangles, GLModel::Geometry::EVertexLayout::P3};
+        g.add_vertex(Vec3f(lc.lift(lc.center, 0).cast<float>()));
+        for (int k = 1; k <= rings; ++k)
+            for (int i = 0; i < spokes; ++i) {
+                const double      a = 2. * PI * i / spokes;
+                const PathCut::V2 d(std::cos(a), std::sin(a));
+                double            outside; // of the unit point on the spoke: the cap reaches 1 - outside
+                lc.cap_height(lc.center + d, &outside);
+                g.add_vertex(Vec3f(lc.lift(lc.center + d * ((1. - outside) * k / rings), 0).cast<float>()));
+            }
+        auto at = [](int k, int i) { return unsigned(k == 0 ? 0 : 1 + (k - 1) * spokes + (i % spokes)); };
+        for (int i = 0; i < spokes; ++i) g.add_triangle(at(0, 0), at(1, i), at(1, i + 1));
+        for (int k = 1; k < rings; ++k)
+            for (int i = 0; i < spokes; ++i) {
+                g.add_triangle(at(k, i), at(k + 1, i), at(k + 1, i + 1));
+                g.add_triangle(at(k, i), at(k + 1, i + 1), at(k, i + 1));
+            }
+        m_wall.init_from(std::move(g));
+        return;
     }
-    m_curve.init_from(std::move(line));
+    draw_line(PathCut::smooth_path(pts), false);
 
     const BoundingBoxf3       bb = m_parent.get_selection().get_bounding_box();
     const PathCut::ViewCutter vc = PathCut::make_view_cutter(pts, sweep_dir(), bb.min, bb.max, m_kerf, view_limits());
@@ -4879,6 +4921,9 @@ void GLGizmoCut3D::Curve::start_cut()
     st->view_dir = sweep_dir();
     st->kerf     = m_kerf;
     st->limits   = view_limits();
+    st->loop     = m_shape == Shape::Loop;
+    st->flat     = m_flat;
+    st->margin   = m_margin;
 
     m_running    = st;
     m_busy_since = std::chrono::steady_clock::now();
@@ -4891,22 +4936,37 @@ void GLGizmoCut3D::Curve::start_cut()
             ctl.update_status(0, _u8L("Cutting along the path"));
             BOOST_LOG_TRIVIAL(info) << "Cut along path: " << st->src.indices.size() << " triangles, kerf " << st->kerf;
             PathCut::make_edge_manifold(st->src);
-            const BoundingBoxf3       bb = Slic3r::bounding_box(st->src);
-            const PathCut::ViewCutter vc = PathCut::make_view_cutter(st->pts, st->view_dir, bb.min, bb.max, st->kerf, st->limits);
-            if (!vc.valid()) {
-                st->error = vc.error;
+            std::unique_ptr<PathCut::Cutter> cutter;
+            if (st->loop) {
+                // The smoothed loop is put back on the surface the points were picked on.
+                const AABBMesh aabb(st->src);
+                auto           lc = std::make_unique<PathCut::LoopCutter>(PathCut::make_loop_cutter(st->pts, st->kerf, st->margin,
+                    [&aabb](const PathCut::V3 &p) { int i; Vec3d c; aabb.squared_distance(p, i, c); return PathCut::V3(c); }, st->flat));
+                if (lc->valid() && !PathCut::fit_loop_margin(st->src, *lc))
+                    lc->error = _u8L("The cap spanning the loop runs into another part of the model. Place the loop where the part "
+                                     "is free all around it.");
+                cutter = std::move(lc);
+            } else {
+                const BoundingBoxf3 bb = Slic3r::bounding_box(st->src);
+                cutter = std::make_unique<PathCut::ViewCutter>(PathCut::make_view_cutter(st->pts, st->view_dir, bb.min, bb.max, st->kerf, st->limits));
+            }
+            if (!cutter->error.empty()) {
+                st->error = cutter->error;
                 return;
             }
-            const PathCut::CutResult res = PathCut::cut_with_slab(std::move(st->src), vc, 0.5, canceled);
+            const PathCut::CutResult res = PathCut::cut_with_slab(std::move(st->src), *cutter, 0.5, canceled);
             if (canceled() || !(st->error = res.error).empty())
                 return;
             bool joined = false;
-            st->grouped = PathCut::group_cut(res, vc, &joined);
+            st->grouped = PathCut::group_cut(res, *cutter, &joined);
             if (joined)
-                st->error = _u8L("The cut does not separate the object: it is still connected around the path. Make the path "
-                                 "cross the object completely, or change the limits.");
+                st->error = st->loop ? _u8L("The cut does not separate the object: it is still connected past the loop. Place the loop "
+                                            "around a part that is free all around.")
+                                     : _u8L("The cut does not separate the object: it is still connected around the path. Make the path "
+                                            "cross the object completely, or change the limits.");
             else if (st->grouped.side_a.indices.empty() || st->grouped.side_b.indices.empty())
-                st->error = _u8L("The path did not split the object. Make sure it crosses the object completely.");
+                st->error = st->loop ? _u8L("The loop did not split the object. Place the points all around the part to detach.")
+                                     : _u8L("The path did not split the object. Make sure it crosses the object completely.");
             else if (!st->extras.empty())
                 st->extra_sides = extras_in_sides(st->extras, st->grouped);
         },
@@ -5036,14 +5096,17 @@ void GLGizmoCut3D::Curve::render_input_window(float x, float y, float bottom_lim
     // The Cut tool's frame padding and label column, so the mode row and the fields stay in place.
     ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(6.0f, 4.0f * m_parent.get_gizmos_manager().get_layout_scale()));
     const std::vector<std::string> sweeps{_u8L("From the view"), _u8L("Level with the bed"), _u8L("Vertical"), _u8L("Custom")};
+    // TRN Shapes of the line picked in the Curve mode of the Cut tool: an open line, or a closed one around a part.
+    const std::vector<std::string> shapes{_u8L("Open path"), _u8L("Closed loop")};
     float label_w = 0.f;
-    for (const std::string &l : {_u8L("Mode"), _u8L("Clearance (mm)"), _u8L("Cut direction"), _u8L("Turn (deg)"), _u8L("Tilt (deg)"),
-                                 _u8L("In front (mm)"), _u8L("Behind (mm)"), _u8L("Beginning (mm)"), _u8L("Ending (mm)")})
+    for (const std::string &l : {_u8L("Mode"), _u8L("Shape"), _u8L("Clearance (mm)"), _u8L("Cut direction"), _u8L("Turn (deg)"), _u8L("Tilt (deg)"),
+                                 _u8L("Cap margin (mm)"), _u8L("In front (mm)"), _u8L("Behind (mm)"), _u8L("Beginning (mm)"), _u8L("Ending (mm)")})
         label_w = std::max(label_w, ImGui::CalcTextSize(l.c_str()).x);
     const float field_x = std::max(m_cut.m_label_width, ImGui::GetStyle().WindowPadding.x + ImGui::GetFrameHeight() * 1.5f + label_w);
     float       field_w = ImGui::CalcTextSize("000.00").x * 1.5f + 2.f * (ImGui::GetFrameHeight() + ImGui::GetStyle().ItemInnerSpacing.x);
-    for (const std::string &s : sweeps)
-        field_w = std::max(field_w, ImGui::CalcTextSize(s.c_str()).x + ImGui::GetFrameHeight() + 3.f * ImGui::GetStyle().FramePadding.x);
+    for (const std::vector<std::string> *items : {&sweeps, &shapes})
+        for (const std::string &s : *items)
+            field_w = std::max(field_w, ImGui::CalcTextSize(s.c_str()).x + ImGui::GetFrameHeight() + 3.f * ImGui::GetStyle().FramePadding.x);
 
     if (const std::optional<ModeButton> clicked = m_cut.render_mode_buttons(ModeButton::Curve, !busy))
         wxGetApp().CallAfter([this, mode = size_t(*clicked)]() {
@@ -5073,57 +5136,69 @@ void GLGizmoCut3D::Curve::render_input_window(float x, float y, float bottom_lim
         ImGui::PopItemWidth();
         value = std::clamp(value, lo, hi);
     };
-    float_row(_u8L("Clearance (mm)"), "##curve_kerf", m_kerf, 0.05f, 0.02f, 2.f, "%.2f");
-    // The direction the path is swept along: as seen when the first point was placed, level with the bed (a cut
-    // parallel to the bed for a path drawn from the front), vertical, or set by hand.
-    int sweep = int(m_sweep);
-    if (m_cut.render_combo(_u8L("Cut direction"), sweeps, sweep, field_x, field_w)) {
-        if (Sweep(sweep) == Sweep::Custom) { // starting from the current direction
-            const Vec3d d = sweep_dir();
-            m_turn        = float(std::atan2(d.y(), d.x()) * 180. / PI);
-            m_tilt        = float(std::asin(std::clamp(-d.z(), -1., 1.)) * 180. / PI);
-        }
-        m_sweep = Sweep(sweep);
+    int shape = int(m_shape);
+    if (m_cut.render_combo(_u8L("Shape"), shapes, shape, field_x, field_w)) {
+        m_shape = Shape(shape);
         changed();
     }
-    if (m_sweep == Sweep::View) {
-        ImGui::SameLine();
-        if (m_cut.render_reset_button("curve_view_dir", _u8L("Take the cut direction from the current view"))) {
-            m_view_dir = wxGetApp().plater()->get_camera().get_dir_forward();
+    float_row(_u8L("Clearance (mm)"), "##curve_kerf", m_kerf, 0.05f, 0.02f, 2.f, "%.2f");
+    if (m_shape == Shape::Loop) {
+        // The cap reaches this far past the loop at least, further where the surface bulges past it.
+        float_row(_u8L("Cap margin (mm)"), "##curve_margin", m_margin, 0.5f, 0.5f, 30.f, "%.1f");
+        if (imgui.bbl_checkbox(_L("Flat cut face"), m_flat))
+            changed();
+    } else {
+        // The direction the path is swept along: as seen when the first point was placed, level with the bed (a cut
+        // parallel to the bed for a path drawn from the front), vertical, or set by hand.
+        int sweep = int(m_sweep);
+        if (m_cut.render_combo(_u8L("Cut direction"), sweeps, sweep, field_x, field_w)) {
+            if (Sweep(sweep) == Sweep::Custom) { // starting from the current direction
+                const Vec3d d = sweep_dir();
+                m_turn        = float(std::atan2(d.y(), d.x()) * 180. / PI);
+                m_tilt        = float(std::asin(std::clamp(-d.z(), -1., 1.)) * 180. / PI);
+            }
+            m_sweep = Sweep(sweep);
             changed();
         }
-    } else if (m_sweep == Sweep::Custom) {
-        float_row(_u8L("Turn (deg)"), "##curve_turn", m_turn, 1.f, -180.f, 180.f, "%.0f");
-        float_row(_u8L("Tilt (deg)"), "##curve_tilt", m_tilt, 1.f, -90.f, 90.f, "%.0f");
-    }
-    // How far the wall reaches: through everything unless limited. Collapsed, the title tells whether a limit is set.
-    const bool any_limit = m_lim_front.on || m_lim_back.on || m_lim_start.on || m_lim_end.on;
-    ImGui::PushStyleVar(ImGuiStyleVar_IndentSpacing, 0.f);
-    m_limits_open = ImGui::TreeNodeEx(((!m_limits_open && any_limit ? _u8L("Limits (enabled)") : _u8L("Limits")) + "###curve_limits").c_str(),
-                                      ImGuiTreeNodeFlags_SpanAvailWidth | ImGuiTreeNodeFlags_FramePadding);
-    if (m_limits_open) {
-        for (auto [label, lim, id] : {std::tuple(_L("In front (mm)"), &m_lim_front, "##curve_front"), std::tuple(_L("Behind (mm)"), &m_lim_back, "##curve_back"),
-                                      std::tuple(_L("Beginning (mm)"), &m_lim_start, "##curve_start"), std::tuple(_L("Ending (mm)"), &m_lim_end, "##curve_end")}) {
-            if (imgui.bbl_checkbox(label, lim->on))
+        if (m_sweep == Sweep::View) {
+            ImGui::SameLine();
+            if (m_cut.render_reset_button("curve_view_dir", _u8L("Take the cut direction from the current view"))) {
+                m_view_dir = wxGetApp().plater()->get_camera().get_dir_forward();
                 changed();
-            if (lim->on) {
-                ImGui::SameLine(field_x);
-                ImGui::PushItemWidth(field_w);
-                if (ImGui::InputFloat(id, &lim->mm, 0.5f, 5.f, "%.1f"))
-                    changed();
-                ImGui::PopItemWidth();
-                lim->mm = std::clamp(lim->mm, 0.f, 1000.f);
             }
+        } else if (m_sweep == Sweep::Custom) {
+            float_row(_u8L("Turn (deg)"), "##curve_turn", m_turn, 1.f, -180.f, 180.f, "%.0f");
+            float_row(_u8L("Tilt (deg)"), "##curve_tilt", m_tilt, 1.f, -90.f, 90.f, "%.0f");
         }
-        ImGui::TreePop();
+        // How far the wall reaches: through everything unless limited. Collapsed, the title tells whether a limit is set.
+        const bool any_limit = m_lim_front.on || m_lim_back.on || m_lim_start.on || m_lim_end.on;
+        ImGui::PushStyleVar(ImGuiStyleVar_IndentSpacing, 0.f);
+        m_limits_open = ImGui::TreeNodeEx(((!m_limits_open && any_limit ? _u8L("Limits (enabled)") : _u8L("Limits")) + "###curve_limits").c_str(),
+                                          ImGuiTreeNodeFlags_SpanAvailWidth | ImGuiTreeNodeFlags_FramePadding);
+        if (m_limits_open) {
+            for (auto [label, lim, id] : {std::tuple(_L("In front (mm)"), &m_lim_front, "##curve_front"), std::tuple(_L("Behind (mm)"), &m_lim_back, "##curve_back"),
+                                          std::tuple(_L("Beginning (mm)"), &m_lim_start, "##curve_start"), std::tuple(_L("Ending (mm)"), &m_lim_end, "##curve_end")}) {
+                if (imgui.bbl_checkbox(label, lim->on))
+                    changed();
+                if (lim->on) {
+                    ImGui::SameLine(field_x);
+                    ImGui::PushItemWidth(field_w);
+                    if (ImGui::InputFloat(id, &lim->mm, 0.5f, 5.f, "%.1f"))
+                        changed();
+                    ImGui::PopItemWidth();
+                    lim->mm = std::clamp(lim->mm, 0.f, 1000.f);
+                }
+            }
+            ImGui::TreePop();
+        }
+        ImGui::PopStyleVar();
     }
-    ImGui::PopStyleVar();
     imgui.disabled_end();
 
     // Bottom bar, as in the Cut tool: the tips and the editing actions on the left, the main action and Cancel
     // (closes the tool) on the right.
     ImGui::Separator();
-    GLGizmoUtils::render_tooltip_button(&imgui, m_parent, {{_L("Left mouse button"), _L("Add a point along the line to cut")},
+    GLGizmoUtils::render_tooltip_button(&imgui, m_parent, {{_L("Left mouse button"), m_shape == Shape::Loop ? _L("Add a point around the part to detach") : _L("Add a point along the line to cut")},
                                                            {_L("Right mouse button"), _L("Remove the last point")}}, x, y);
     ImGui::SameLine();
     if (busy) {
@@ -5149,7 +5224,7 @@ void GLGizmoCut3D::Curve::render_input_window(float x, float y, float bottom_lim
             ImGui::SameLine();
             GLGizmoUtils::push_orca_button_style();
             // TRN Button of the Curve mode of the Cut tool: computes the cut and shows the pieces apart before it is made.
-            if (imgui.button(_L_CONTEXT("Preview", "Cut along path"), ImVec2(0, 0), m_points.size() >= 2))
+            if (imgui.button(_L_CONTEXT("Preview", "Cut along path"), ImVec2(0, 0), m_points.size() >= min_points()))
                 wxGetApp().CallAfter([this]() { start_cut(); });
             GLGizmoUtils::pop_orca_button_style();
         }
