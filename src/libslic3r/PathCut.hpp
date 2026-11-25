@@ -124,22 +124,25 @@ std::vector<V3> smooth_path(const std::vector<V3> &points);
 
 // A cap spanning a loop picked around the region to detach (built by make_loop_cutter): a smooth height field
 // over the loop's mean plane, from the loop's mean height at its centre to the loop itself at the loop, flat
-// beyond. The slab only extends `margin` past the loop, so only the surface the cap spans is cut.
+// beyond. The cap only reaches its rim, a little past the section of the part around the loop (see
+// fit_loop_margin), so only that part is cut.
 struct LoopCutter final : Cutter
 {
+    static constexpr int spokes = 360; // profiles below are sampled at angles 2 pi k / spokes around center
+
     Frame               frame;
     V2                  center{V2::Zero()};
-    std::vector<double> angles; // spoke angles around center, increasing
     std::vector<double> radius; // loop radius per spoke
     std::vector<double> hloop;  // loop height above the mean plane per spoke
+    std::vector<double> rim;    // how far the cap reaches per spoke
     double              hmean{0.};
-    double              margin{0.};
-    std::vector<V3>     loop; // the smoothed loop (for drawing it)
-    bool valid() const { return error.empty() && angles.size() >= 3; }
+    double              margin{0.}; // requested reach past the loop
+    std::vector<V3>     loop;       // the smoothed loop (for drawing it)
+    bool valid() const { return error.empty() && radius.size() == size_t(spokes); }
     bool limited() const override { return true; }
 
     // Height of the cap above the mean plane at a point of the plane; `outside` is how far the point lies
-    // outside the cap (loop + margin), negative inside.
+    // outside the cap's rim, negative inside.
     double cap_height(const V2 &q, double *outside = nullptr) const;
     // Height above the cap.
     double field(const V3 &p) const override { return frame.height(p) - cap_height(frame.to2d(p)); }
@@ -150,22 +153,21 @@ struct LoopCutter final : Cutter
     V2     chart(const V3 &p) const override { return frame.to2d(p); }
     V3     lift(const V2 &q, int level) const override { return frame.to3d(q, cap_height(q) + 0.5 * kerf * level); }
     std::string rim_error() const override;
-
-private:
-    void spoke_at(double angle, double &r, double &h) const;
 };
 
 // loop_points: points on the surface around the region to detach (closed, at least 3). The smoothed loop is
 // put back on the surface with `snap`. flat: the cap is the loop's mean plane, for a flat cut face, instead
-// of following the loop's heights.
+// of following the loop's heights. The rim is set `margin` past the loop; fit_loop_margin() fits it to the
+// model.
 LoopCutter make_loop_cutter(const std::vector<V3> &loop_points, double kerf, double margin, const std::function<V3(const V3 &)> &snap,
                             bool flat);
 
-// Picked loops are coarse, so the surface often bulges a little past the smoothed loop (ribs, folds, fingers).
-// Widens the margin, starting from the requested one, to the first ring around the loop where the surface does
-// not cross the cap, so the rim of the cap stays in empty space. Returns false when there is no such ring
-// within `max_margin` (the cap would run into another part of the model).
-bool fit_loop_margin(const indexed_triangle_set &its, LoopCutter &lc, double max_margin = 30.);
+// Fits the cap's rim to the model: the section of the part the loop goes around (where the surface crosses
+// the cap around its centre) often bulges a little past the smoothed loop (ribs, folds, fingers), and other
+// parts of the model may come close (a hand resting on a hip). Per spoke, the rim is put `margin` past that
+// section, or halfway to another part when that is nearer. Fails with `error` set when the section reaches
+// far past the loop (the loop does not go around the part) or another part leaves no room for the rim.
+bool fit_loop_margin(const indexed_triangle_set &its, LoopCutter &lc);
 
 // First crossing of two non-adjacent segments of an open polyline, searching from the start: the segments
 // i < j and the crossing point. Returns false when the polyline does not cross itself.

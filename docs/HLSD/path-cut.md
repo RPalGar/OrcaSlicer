@@ -34,10 +34,17 @@ Rules that shape the result:
 
 - A limited wall that ends inside a part does not cut it: only the parts the wall goes all the way through
   are split, and when the wall ends inside every part it reaches, the cut is refused with a message.
-- The loop's cap is a height field over spokes from its centre, smoothed so it needs few triangles, and only
-  reaches a margin past the loop. `fit_loop_margin` widens the margin to the first free ring around the loop,
-  so the rim of the cap does not end inside a bulge next to the loop; a surface crossing the rim all the same
-  means the loop does not go around the part, and the cut is refused.
+- The loop's cap is a height field over evenly spaced spokes from its centre (the outermost crossing of each
+  spoke with the loop, so a loop snapped to a bumpy surface may wobble), smoothed so it needs few triangles.
+  A loop that crosses itself seen from its mean plane is refused; small curls from points placed close
+  together are cut out. Snaps that move a point of the loop far (onto a nearby part, or across a thin one)
+  are not kept.
+- The cap only reaches its rim. `fit_loop_margin` finds where the surface crosses the cap: the curves going
+  around the centre are the section of the part the loop is on, the others belong to other parts. Per
+  spoke the rim is put the cap margin past that section, or halfway to another part when one is nearer, so
+  only the part the loop goes around is cut. A section reaching far past the loop means the loop does not go
+  around the part, and no room between the section and another part means the cap would run into it: both
+  are refused.
 - `make_edge_manifold` runs first: zero-thickness sheets and edges shared by more than two faces, common
   in sculpted and AI-generated meshes, would leave openings the caps cannot close.
 - `group_cut` assigns every resulting part to a side by the cut face it carries; a part the cut does not touch

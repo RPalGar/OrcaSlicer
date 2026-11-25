@@ -17,6 +17,7 @@
 #include <cstdint>
 #include <functional>
 #include <limits>
+#include <numeric>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -873,32 +874,38 @@ ViewCutter make_view_cutter(const std::vector<V3> &points, const V3 &view_dir, c
 
 // ------------------------------------------------------------------------------------------------ loop
 
-void LoopCutter::spoke_at(double ang, double &r, double &h) const
+namespace {
+
+// Profile value at an angle around the centre, linearly between the spokes.
+double at_angle(const std::vector<double> &profile, double ang)
 {
-    const size_t n  = angles.size();
-    ang             = angles[0] + std::fmod(std::fmod(ang - angles[0], 2. * PI) + 2. * PI, 2. * PI);
-    const size_t i  = size_t(std::upper_bound(angles.begin(), angles.end(), ang) - angles.begin());
-    const size_t i0 = (i + n - 1) % n, i1 = i % n;
-    double       a0 = angles[i0], a1 = angles[i1];
-    if (a1 <= a0) a1 += 2. * PI;
-    if (ang < a0) ang += 2. * PI;
-    const double t = a1 - a0 > 1e-12 ? (ang - a0) / (a1 - a0) : 0.;
-    r = radius[i0] * (1. - t) + radius[i1] * t;
-    h = hloop[i0] * (1. - t) + hloop[i1] * t;
+    const int    n = LoopCutter::spokes;
+    const double x = std::fmod(std::fmod(ang / (2. * PI), 1.) + 1., 1.) * n;
+    const int    i = std::min(int(x), n - 1);
+    const double t = x - i;
+    return profile[size_t(i)] * (1. - t) + profile[size_t((i + 1) % n)] * t;
 }
+
+int spoke_of(const V2 &d)
+{
+    const int n = LoopCutter::spokes;
+    return (int(std::lround(std::atan2(d.y(), d.x()) / (2. * PI) * n)) % n + n) % n;
+}
+
+} // namespace
 
 // Smoothstep from the mean height at the centre to the loop's height at the loop, flat beyond it: no cone
 // tip at the centre and no crease along the loop.
 double LoopCutter::cap_height(const V2 &q, double *outside) const
 {
-    const V2     d  = q - center;
-    const double rr = d.norm();
-    double       r, h;
-    spoke_at(std::atan2(d.y(), d.x()), r, h);
-    if (outside) *outside = rr - (r + margin);
+    const V2     d   = q - center;
+    const double rr  = d.norm();
+    const double ang = std::atan2(d.y(), d.x());
+    const double r   = at_angle(radius, ang);
+    if (outside) *outside = rr - at_angle(rim, ang);
     const double s = r > 1e-12 ? std::min(1., rr / r) : 1.;
     const double w = s * s * (3. - 2. * s);
-    return hmean * (1. - w) + h * w;
+    return hmean * (1. - w) + at_angle(hloop, ang) * w;
 }
 
 int LoopCutter::side(const V3 &p) const
@@ -926,85 +933,133 @@ LoopCutter make_loop_cutter(const std::vector<V3> &loop_points, double kerf, dou
         lc.error = _u8L("The loop needs at least three points.");
         return lc;
     }
-    std::vector<V3> dense = catmull_rom(pts, true, 16);
-    for (V3 &p : dense) p = snap(p);
-    dense   = remove_close_points(dense, 1e-4, true);
-    lc.loop = dense;
+    const std::vector<V3> picked = remove_close_points(catmull_rom(pts, true, 16), 1e-4, true);
 
     // Mean plane of the loop: the direction it encloses the most area seen from (its vector area). Unlike a
     // least-squares plane this stays right for strongly non-planar (saddle) loops.
-    V3 c = V3::Zero();
-    for (const V3 &p : dense) c += p;
-    c /= double(dense.size());
-    V3 varea = V3::Zero();
-    for (size_t i = 0; i < dense.size(); ++i) varea += (dense[i] - c).cross(dense[(i + 1) % dense.size()] - c);
     const std::string degenerate = _u8L("The loop encloses no area. Place the points around the part.");
+    V3 c = V3::Zero();
+    for (const V3 &p : picked) c += p;
+    c /= double(picked.size());
+    V3 varea = V3::Zero();
+    for (size_t i = 0; i < picked.size(); ++i) varea += (picked[i] - c).cross(picked[(i + 1) % picked.size()] - c);
     if (varea.norm() < 1e-9) {
         lc.error = degenerate;
         return lc;
     }
     lc.frame = frame_from_normal(varea, c);
 
-    std::vector<V2>     q;
-    std::vector<double> h;
-    for (const V3 &p : dense) { q.push_back(lc.frame.to2d(p)); h.push_back(lc.frame.height(p)); }
+    // The cap is a height field over the mean plane, so the loop seen from it must not cross itself. Tiny
+    // curls from points placed close together are tolerated.
+    std::vector<V2> q;
+    for (const V3 &p : picked) q.push_back(lc.frame.to2d(p));
+    double perimeter = 0.;
+    for (size_t i = 0; i < q.size(); ++i) perimeter += (q[(i + 1) % q.size()] - q[i]).norm();
+    const std::string folds = _u8L("The loop folds back on itself seen from its mean plane. Place the points more evenly around the part.");
+    {
+        // A crossing splits the loop in two: the smaller one is a curl, or the loop folds back when it is large.
+        std::vector<V2> open = q;
+        open.push_back(q.front());
+        size_t i, j;
+        V2     x;
+        while (open.size() > 4 && first_self_crossing(open, i, j, x)) {
+            double inner = (open[i + 1] - x).norm() + (open[j] - x).norm(), total = 0.;
+            for (size_t k = i + 1; k < j; ++k) inner += (open[k + 1] - open[k]).norm();
+            for (size_t k = 0; k + 1 < open.size(); ++k) total += (open[k + 1] - open[k]).norm();
+            if (std::min(inner, total - inner) > 0.1 * perimeter) {
+                lc.error = folds;
+                return lc;
+            }
+            std::vector<V2> out;
+            if (inner <= total - inner) {
+                out.assign(open.begin(), open.begin() + long(i) + 1);
+                out.push_back(x);
+                out.insert(out.end(), open.begin() + long(j) + 1, open.end());
+            } else {
+                out.push_back(x);
+                out.insert(out.end(), open.begin() + long(i) + 1, open.begin() + long(j) + 1);
+                out.push_back(x);
+            }
+            open.swap(out);
+        }
+    }
     const double area = polygon_area(q);
     if (std::abs(area) < 1e-9) {
         lc.error = degenerate;
         return lc;
     }
-    if (area < 0.) { std::reverse(q.begin(), q.end()); std::reverse(h.begin(), h.end()); }
     V2 cc = V2::Zero();
     for (size_t i = 0; i < q.size(); ++i) {
         const V2 &a = q[i], &b = q[(i + 1) % q.size()];
         cc += (a + b) * (a.x() * b.y() - b.x() * a.y());
     }
-    lc.center = cc / (6. * std::abs(area));
+    lc.center = cc / (6. * area);
+    double rmean = 0.;
+    for (const V2 &p : q) rmean += (p - lc.center).norm();
+    rmean /= double(q.size());
 
-    // The cap is a height field over spokes from the centre, so the loop must wind once around it. Snapping
-    // the smoothed loop to a bumpy surface makes it wobble back here and there: those few points are dropped.
-    const size_t        n = q.size();
-    std::vector<double> ang(n), rad(n);
-    double              winding = 0.;
-    for (size_t i = 0; i < n; ++i) {
-        const V2 d = q[i] - lc.center;
-        ang[i] = std::atan2(d.y(), d.x());
-        rad[i] = d.norm();
+    // Put the smoothed loop back on the surface. A point of the spline far inside a thin part may be nearest
+    // to another part of the model (a body the arm rests against), or to the far side: such snaps are not kept.
+    std::vector<V3> dense = picked;
+    for (V3 &p : dense) {
+        const V3 s = snap(p);
+        if ((s - p).norm() < 0.3 * rmean)
+            p = s;
     }
-    for (size_t i = 0; i < n; ++i)
-        winding += std::remainder(ang[(i + 1) % n] - ang[i], 2. * PI);
-    const size_t first = size_t(std::min_element(ang.begin(), ang.end()) - ang.begin());
-    std::rotate(ang.begin(), ang.begin() + long(first), ang.end());
-    std::rotate(rad.begin(), rad.begin() + long(first), rad.end());
-    std::rotate(h.begin(), h.begin() + long(first), h.end());
-    std::vector<double> a2, r2, h2;
-    for (size_t i = 0; i < n; ++i)
-        if (rad[i] > 1e-6 && (a2.empty() || ang[i] > a2.back() + 1e-9)) { a2.push_back(ang[i]); r2.push_back(rad[i]); h2.push_back(h[i]); }
-    if (std::abs(winding) < PI || a2.size() < 8 || a2.size() * 2 < n) {
-        lc.error = _u8L("The loop folds back on itself seen from its mean plane. Place the points more evenly around the part.");
+    lc.loop = dense;
+
+    // Radius and height of the loop along evenly spaced spokes from the centre: the outermost crossing of each
+    // spoke, which skips the small wobbles a loop snapped to a bumpy surface makes.
+    const int           n = LoopCutter::spokes;
+    std::vector<V2>     qs;
+    std::vector<double> hs;
+    for (const V3 &p : dense) { qs.push_back(lc.frame.to2d(p) - lc.center); hs.push_back(lc.frame.height(p)); }
+    std::vector<double> r(size_t(n), -1.), h(size_t(n), 0.);
+    for (size_t i = 0; i < qs.size(); ++i) {
+        const size_t j = (i + 1) % qs.size();
+        const V2 &a = qs[i], &b = qs[j];
+        const double cr = a.x() * b.y() - a.y() * b.x();
+        double a0 = std::atan2(a.y(), a.x()), da = std::remainder(std::atan2(b.y(), b.x()) - a0, 2. * PI);
+        if (std::abs(cr) < 1e-12 || std::abs(da) < 1e-12)
+            continue;
+        if (da < 0.) a0 += da, da = -da;
+        // Spokes whose angle lies within the segment's angular span.
+        for (int k = int(std::ceil(a0 / (2. * PI) * n)); k <= int(std::floor((a0 + da) / (2. * PI) * n)); ++k) {
+            const double ang = 2. * PI * k / n;
+            const V2     dir(std::cos(ang), std::sin(ang));
+            const V2     e   = b - a;
+            const double den = dir.x() * e.y() - dir.y() * e.x();
+            if (std::abs(den) < 1e-15)
+                continue;
+            const double t  = std::clamp((dir.x() * a.y() - dir.y() * a.x()) / -den, 0., 1.);
+            const V2     x  = a + e * t;
+            const double rr = x.dot(dir);
+            const size_t kk = size_t((k % n + n) % n);
+            if (rr > r[kk]) { r[kk] = rr; h[kk] = hs[i] * (1. - t) + hs[j] * t; }
+        }
+    }
+    if (*std::min_element(r.begin(), r.end()) < 1e-3) {
+        lc.error = _u8L("The loop is too irregular. Place the points more evenly around the part.");
         return lc;
     }
     // Low-pass the radius and height profiles (truncated Fourier series): the snapped loop is noisy, and a
     // smooth cap needs far fewer triangles and cuts more cleanly.
-    auto smooth = [&a2](const std::vector<double> &y, int harmonics) {
-        const size_t        m = a2.size();
-        std::vector<double> w(m), out(m, 0.);
-        for (size_t i = 0; i < m; ++i) w[i] = 0.5 * std::fmod(a2[(i + 1) % m] - a2[(i + m - 1) % m] + 4. * PI, 2. * PI); // trapezoid weights
+    auto smooth = [n](const std::vector<double> &y, int harmonics) {
+        std::vector<double> out(size_t(n), 0.);
         for (int k = 0; k <= harmonics; ++k) {
             double ck = 0., sk = 0.;
-            for (size_t i = 0; i < m; ++i) { ck += w[i] * y[i] * std::cos(k * a2[i]); sk += w[i] * y[i] * std::sin(k * a2[i]); }
-            ck /= k == 0 ? 2. * PI : PI;
-            sk /= PI;
-            for (size_t i = 0; i < m; ++i) out[i] += ck * std::cos(k * a2[i]) + sk * std::sin(k * a2[i]);
+            for (int i = 0; i < n; ++i) { const double a = 2. * PI * i / n; ck += y[size_t(i)] * std::cos(k * a); sk += y[size_t(i)] * std::sin(k * a); }
+            ck *= (k == 0 ? 1. : 2.) / n;
+            sk *= 2. / n;
+            for (int i = 0; i < n; ++i) { const double a = 2. * PI * i / n; out[size_t(i)] += ck * std::cos(k * a) + sk * std::sin(k * a); }
         }
         return out;
     };
-    lc.radius = smooth(r2, 8);
-    lc.hloop  = smooth(h2, 4);
-    lc.angles = std::move(a2);
+    lc.radius = smooth(r, 8);
+    lc.hloop  = smooth(h, 4);
     if (*std::min_element(lc.radius.begin(), lc.radius.end()) < 1e-3) {
         lc.error = _u8L("The loop is too irregular. Place the points more evenly around the part.");
-        lc.angles.clear();
+        lc.radius.clear();
         return lc;
     }
     double hm = 0.;
@@ -1012,48 +1067,104 @@ LoopCutter make_loop_cutter(const std::vector<V3> &loop_points, double kerf, dou
     lc.hmean = hm / double(lc.hloop.size());
     if (flat)
         std::fill(lc.hloop.begin(), lc.hloop.end(), lc.hmean);
+    lc.rim = lc.radius;
+    for (double &x : lc.rim) x += margin;
     return lc;
 }
 
-bool fit_loop_margin(const indexed_triangle_set &its, LoopCutter &lc, double max_margin)
+bool fit_loop_margin(const indexed_triangle_set &its, LoopCutter &lc)
 {
-    constexpr double bin = 0.25, gap = 2.;
-    const size_t     nbins = size_t(max_margin / bin) + 1;
-    std::vector<int> hits(nbins, 0);
-    auto record = [&](const V3 &p) {
-        const double rr = lc.outside(p) + lc.margin; // distance outside the loop itself
-        if (rr >= 0. && rr < max_margin) ++hits[size_t(rr / bin)];
-    };
-    const double        band = 0.5 * lc.kerf;
+    const int n = LoopCutter::spokes;
+    // Where the surface crosses the middle of the cap (extended past the rim): closed curves, one per piece of
+    // surface. Each crossing point lies on a mesh edge, so the segments of one curve share their edge keys.
     std::vector<double> f(its.vertices.size());
-    for (size_t i = 0; i < f.size(); ++i) f[i] = lc.field(its.vertices[i].cast<double>());
-    // Where the surface meets the cap: vertices inside the slab, and the crossings of the cap's middle
-    // sampled along each triangle (the faces of low-poly models are much larger than a bin).
+    for (size_t i = 0; i < f.size(); ++i) f[i] = lc.frame.height(its.vertices[i].cast<double>()) - lc.cap_height(lc.frame.to2d(its.vertices[i].cast<double>()));
+    struct Seg { V2 a, b; uint64_t ka, kb; };
+    std::vector<Seg>                       segs;
+    std::unordered_map<uint64_t, size_t>   key_id;
+    auto id_of = [&key_id](uint64_t k) { return key_id.emplace(k, key_id.size()).first->second; };
     for (const auto &t : its.indices) {
-        if (std::min({f[t[0]], f[t[1]], f[t[2]]}) > band || std::max({f[t[0]], f[t[1]], f[t[2]]}) < -band) continue;
-        V3  x[2];
-        int nx = 0;
-        for (int e = 0; e < 3; ++e) {
-            const double fa = f[t[e]], fb = f[t[(e + 1) % 3]];
-            const V3     a = its.vertices[t[e]].cast<double>(), b = its.vertices[t[(e + 1) % 3]].cast<double>();
-            if (std::abs(fa) <= band) record(a);
-            if ((fa < 0.) != (fb < 0.) && nx < 2) x[nx++] = a + (b - a) * (fa / (fa - fb));
+        V2       x[2];
+        uint64_t k[2];
+        int      nx = 0;
+        for (int e = 0; e < 3 && nx < 2; ++e) {
+            const int ia = t[e], ib = t[(e + 1) % 3];
+            if ((f[ia] < 0.) == (f[ib] < 0.)) continue;
+            const V3 a = its.vertices[ia].cast<double>(), b = its.vertices[ib].cast<double>();
+            x[nx] = lc.frame.to2d(a + (b - a) * (f[ia] / (f[ia] - f[ib]))) - lc.center;
+            k[nx++] = edge_key(ia, ib);
         }
-        if (nx == 2) {
-            const int steps = std::min(4000, int((x[1] - x[0]).norm() / bin) + 1);
-            for (int k = 0; k <= steps; ++k) record(x[0] + (x[1] - x[0]) * (double(k) / steps));
+        if (nx == 2) { segs.push_back({x[0], x[1], k[0], k[1]}); id_of(k[0]); id_of(k[1]); }
+    }
+    std::vector<size_t> parent(key_id.size());
+    std::iota(parent.begin(), parent.end(), 0);
+    auto find = [&parent](size_t i) { while (parent[i] != i) i = parent[i] = parent[parent[i]]; return i; };
+    for (const Seg &s : segs) parent[find(key_id[s.ka])] = find(key_id[s.kb]);
+    // A curve going around the centre is the section of the part the loop is on: a ray from the centre
+    // crosses it an odd number of times.
+    std::unordered_map<size_t, int> crossings;
+    const V2 ray(std::cos(0.1234), std::sin(0.1234));
+    for (const Seg &s : segs) {
+        const double ca = ray.x() * s.a.y() - ray.y() * s.a.x(), cb = ray.x() * s.b.y() - ray.y() * s.b.x();
+        if ((ca < 0.) != (cb < 0.) && (s.a + (s.b - s.a) * (ca / (ca - cb))).dot(ray) > 0.)
+            ++crossings[find(key_id[s.ka])];
+    }
+    // Per spoke: how far the own section reaches, and how near any other surface comes.
+    std::vector<double> own(size_t(n), 0.), other(size_t(n), std::numeric_limits<double>::max());
+    bool any_own = false;
+    for (const Seg &s : segs) {
+        const bool   is_own = crossings[find(key_id[s.ka])] % 2 == 1;
+        const int    steps  = std::min(4000, int((s.b - s.a).norm() / 0.1) + 1);
+        any_own |= is_own;
+        for (int i = 0; i <= steps; ++i) {
+            const V2     p  = s.a + (s.b - s.a) * (double(i) / steps);
+            const size_t k  = size_t(spoke_of(p));
+            const double rr = p.norm();
+            if (is_own) own[k] = std::max(own[k], rr);
+            else        other[k] = std::min(other[k], rr);
         }
     }
-    const size_t need = size_t(gap / bin);
-    size_t       run  = 0;
-    for (size_t b = size_t(std::max(0., lc.margin - 0.5 * gap) / bin); b < nbins; ++b) {
-        run = hits[b] == 0 ? run + 1 : 0;
-        if (run >= need) {
-            lc.margin = (double(b + 1) - 0.5 * double(need)) * bin;
-            return true;
+    if (!any_own)
+        return true; // the loop does not split anything: reported after the cut
+    // Neighbouring spokes too, as the rim runs straight between spokes.
+    auto widen = [n](const std::vector<double> &v, bool take_max) {
+        std::vector<double> out(v);
+        for (int k = 0; k < n; ++k)
+            for (int d = -2; d <= 2; ++d) {
+                const double x = v[size_t((k + d + n) % n)];
+                out[size_t(k)] = take_max ? std::max(out[size_t(k)], x) : std::min(out[size_t(k)], x);
+            }
+        return out;
+    };
+    own = widen(own, true);
+    // Other surfaces closer than the own section are inside the part (an inner shell): they are cut with it.
+    for (int k = 0; k < n; ++k)
+        if (other[size_t(k)] <= own[size_t(k)]) other[size_t(k)] = std::numeric_limits<double>::max();
+    other = widen(other, false);
+
+    double rmean = 0.;
+    for (double x : lc.radius) rmean += x;
+    rmean /= n;
+    const double bulge = std::max(3., 0.5 * rmean) + lc.margin; // the own section may reach this far past the loop
+    const double clear = std::max(0.25, lc.kerf);                // least room between the rim and a surface
+    for (int k = 0; k < n; ++k) {
+        const double sec = std::max(own[size_t(k)], lc.radius[size_t(k)]);
+        if (own[size_t(k)] > lc.radius[size_t(k)] + bulge) {
+            lc.error = lc.rim_error();
+            return false;
         }
+        double rim = sec + lc.margin;
+        if (other[size_t(k)] < rim + clear) {
+            if (other[size_t(k)] - sec < 2. * clear) {
+                lc.error = _u8L("The cap spanning the loop runs into another part of the model. Place the loop where the part "
+                                "is free all around it.");
+                return false;
+            }
+            rim = 0.5 * (sec + other[size_t(k)]);
+        }
+        lc.rim[size_t(k)] = rim;
     }
-    return false;
+    return true;
 }
 
 

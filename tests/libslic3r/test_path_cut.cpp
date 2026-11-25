@@ -357,18 +357,83 @@ TEST_CASE("A flat loop cap cuts along the mean plane of the loop", "[PathCut]")
         }
 }
 
-TEST_CASE("A loop whose cap runs into another part is reported instead of cutting halfway", "[PathCut]")
+TEST_CASE("A loop cap stops short of another part close to the loop", "[PathCut]")
 {
-    // Loop around one of two boxes standing side by side, with a cap margin reaching the other box.
+    // An arm (r = 5) with a body 1.5 mm beside it: the cap is fitted to the arm's section, whatever the
+    // requested margin, and the body is left whole.
+    indexed_triangle_set model = its_make_cylinder(5., 30.);
+    indexed_triangle_set body  = its_make_cube(20., 30., 30.);
+    its_translate(body, Vec3f(6.5f, -15.f, 0.f));
+    its_merge(model, body);
+    for (const bool flat : {true, false})
+        for (const double margin : {1., 5.}) {
+            CAPTURE(flat, margin);
+            PathCut::LoopCutter lc = PathCut::make_loop_cutter(ring(5., 8, [](double a) { return 15. + std::cos(a); }), 0.2, margin, no_snap, flat);
+            REQUIRE(lc.valid());
+            REQUIRE(PathCut::fit_loop_margin(model, lc));
+            const PathCut::CutResult res = PathCut::cut_with_slab(model, lc);
+            REQUIRE(res.error.empty());
+            const auto parts = its_split(res.mesh);
+            REQUIRE(parts.size() == 3);
+            require_closed_parts(parts);
+            CHECK(std::any_of(parts.begin(), parts.end(), [](const indexed_triangle_set &p) { return std::abs(its_volume(p) - 18000.) < 1.; }));
+        }
+}
+
+TEST_CASE("A loop cap that would run into another part is refused", "[PathCut]")
+{
+    // Loop around one of two boxes standing 0.3 mm apart: no room for the rim between them.
     indexed_triangle_set legs = its_make_cube(4., 4., 20.);
     indexed_triangle_set leg2 = its_make_cube(4., 4., 20.);
-    its_translate(leg2, Vec3f(6.f, 0.f, 0.f));
+    its_translate(leg2, Vec3f(4.3f, 0.f, 0.f));
     its_merge(legs, leg2);
     std::vector<PathCut::V3> loop = ring(2.9, 8, [](double) { return 10.; });
     for (auto &p : loop) p += PathCut::V3(2., 2., 0.);
-    PathCut::LoopCutter lc = PathCut::make_loop_cutter(loop, 0.2, 5., no_snap, true);
+    PathCut::LoopCutter lc = PathCut::make_loop_cutter(loop, 0.2, 1., no_snap, true);
     REQUIRE(lc.valid());
-    CHECK_FALSE(PathCut::cut_with_slab(legs, lc).error.empty());
+    CHECK_FALSE(PathCut::fit_loop_margin(legs, lc));
+    CHECK_FALSE(lc.error.empty());
+    // Without fitting, a rim through the other box is not cut halfway either.
+    PathCut::LoopCutter wide = PathCut::make_loop_cutter(loop, 0.2, 3., no_snap, true);
+    CHECK_FALSE(PathCut::cut_with_slab(legs, wide).error.empty());
+}
+
+TEST_CASE("A loop on one side of a part, around its edge, is refused", "[PathCut]")
+{
+    // Three points around the edge of a long box do not go around it: the cap would slice a long sliver off.
+    const indexed_triangle_set box = its_make_cube(10., 10., 100.);
+    for (const bool flat : {true, false}) {
+        CAPTURE(flat);
+        PathCut::LoopCutter lc = PathCut::make_loop_cutter({{7., 0., 52.}, {10., 3., 50.}, {8.5, 0., 47.}}, 0.2, 1., no_snap, flat);
+        REQUIRE(lc.valid());
+        CHECK_FALSE(PathCut::fit_loop_margin(box, lc));
+        CHECK_FALSE(lc.error.empty());
+    }
+}
+
+TEST_CASE("A loop is kept when its points are uneven or snap far away", "[PathCut]")
+{
+    const indexed_triangle_set cyl = its_make_cylinder(5., 30.);
+    // Two points almost on top of each other make the spline curl a little.
+    std::vector<PathCut::V3> loop;
+    for (const double a : {0.32, 0.34, 0.75, 0.83, 2.78, 2.88, 4.35, 4.91})
+        loop.emplace_back(5. * std::cos(a), 5. * std::sin(a), 15. + 3.5 * std::cos(a));
+    // A snap that sometimes lands on another part of the model, far from the loop.
+    int  calls = 0;
+    auto jumpy = [&calls](const PathCut::V3 &p) { return ++calls % 7 == 0 ? PathCut::V3(p + PathCut::V3(0., 20., 0.)) : p; };
+    for (const bool flat : {true, false}) {
+        CAPTURE(flat);
+        PathCut::LoopCutter lc = PathCut::make_loop_cutter(loop, 0.2, 1., jumpy, flat);
+        REQUIRE(lc.valid());
+        REQUIRE(PathCut::fit_loop_margin(cyl, lc));
+        const PathCut::CutResult res = PathCut::cut_with_slab(cyl, lc);
+        REQUIRE(res.error.empty());
+        bool joined = false;
+        const PathCut::Grouped g = PathCut::group_cut(res, lc, &joined);
+        CHECK_FALSE(joined);
+        CHECK(g.n_a == 1);
+        CHECK(g.n_b == 1);
+    }
 }
 
 TEST_CASE("A loop that folds back on itself is rejected", "[PathCut]")

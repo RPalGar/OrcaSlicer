@@ -4942,9 +4942,8 @@ void GLGizmoCut3D::Curve::start_cut()
                 const AABBMesh aabb(st->src);
                 auto           lc = std::make_unique<PathCut::LoopCutter>(PathCut::make_loop_cutter(st->pts, st->kerf, st->margin,
                     [&aabb](const PathCut::V3 &p) { int i; Vec3d c; aabb.squared_distance(p, i, c); return PathCut::V3(c); }, st->flat));
-                if (lc->valid() && !PathCut::fit_loop_margin(st->src, *lc))
-                    lc->error = _u8L("The cap spanning the loop runs into another part of the model. Place the loop where the part "
-                                     "is free all around it.");
+                if (lc->valid())
+                    PathCut::fit_loop_margin(st->src, *lc); // sets lc->error when it fails
                 cutter = std::move(lc);
             } else {
                 const BoundingBoxf3 bb = Slic3r::bounding_box(st->src);
