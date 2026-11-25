@@ -4359,7 +4359,11 @@ static const ColorRGBA CURVE_MOVED_COLOR  = {0.95f, 0.62f, 0.25f, 1.f};
 // kept to detect edits made meanwhile) and what came out.
 struct CurveCutJob
 {
-    indexed_triangle_set     src; // the model parts joined, instance rotation and scale baked in, relative to its offset
+    // Each model part is cut on its own and keeps its settings and filament in the pieces. Meshes have the
+    // instance rotation and scale baked in, relative to its offset.
+    struct Part { size_t volume_idx; indexed_triangle_set mesh; };
+    std::vector<Part>        parts;
+    indexed_triangle_set     src; // the model parts joined (to fit the loop to the model)
     std::vector<PathCut::V3> pts; // relative to the offset too
     Vec3d                    view_dir{Vec3d::UnitY()};
     float                    kerf{0.2f};
@@ -4369,9 +4373,8 @@ struct CurveCutJob
     // Volumes that are not cut (negative volumes, modifiers, support blockers / enforcers): each goes to the
     // pieces it is in, both if the cut runs through it. A negative volume only removes material of its own
     // object, so a hole kept whole in both pieces is the hole cut in two.
-    struct Extra { size_t volume_idx; indexed_triangle_set mesh; };
+    using Extra = Part;
     std::vector<Extra>       extras;
-    size_t                   parts{0};
     int                      obj_idx{-1};
     const ModelObject       *mo{nullptr};
     Vec3d                    offset{Vec3d::Zero()};
@@ -4379,7 +4382,9 @@ struct CurveCutJob
     struct VolumeState { size_t id; Transform3d matrix; std::shared_ptr<const TriangleMesh> mesh; };
     std::vector<VolumeState> volumes; // the meshes are held so their addresses cannot be reused
 
-    PathCut::Grouped           grouped;
+    PathCut::Grouped           grouped; // all parts
+    struct Piece { size_t volume_idx; indexed_triangle_set side[2]; }; // a part's share of side a / b
+    std::vector<Piece>         pieces;
     std::vector<unsigned char> extra_sides; // per extra: bit 0 in side_a, bit 1 in side_b
     std::string                error;       // translated
     // Set by the tool to drop the cut: the job worker is shared, and cancelling it would stop whatever job it
@@ -4886,18 +4891,6 @@ void GLGizmoCut3D::Curve::start_cut()
         return set_message(_u8L("The object was moved since the points were placed. Place them again."), true);
     }
 
-    // The parts are joined into one before cutting and the pieces get the settings of the first one: refuse
-    // when that would lose the settings or filament of another part.
-    const ModelVolume *first_part = nullptr;
-    for (const ModelVolume *v : mo->volumes)
-        if (v->is_model_part()) {
-            if (first_part == nullptr)
-                first_part = v;
-            else if (v->material_id() != first_part->material_id() || !(v->config.get() == first_part->config.get()))
-                return set_message(_u8L("The parts of this object have different settings or filaments, which the cut would not "
-                                        "keep: it joins the parts into one. Split the object into separate objects first."), true);
-        }
-
     // Millimetres as printed: the instance rotation and scale are baked into the meshes, the offset is kept.
     auto st         = std::make_shared<CurveCutJob>();
     st->obj_idx     = obj_idx;
@@ -4910,10 +4903,9 @@ void GLGizmoCut3D::Curve::start_cut()
         st->volumes.push_back({v->id().id, v->get_matrix(), v->get_mesh_shared_ptr()});
         indexed_triangle_set its = v->mesh().its;
         its_transform(its, inst_no_offset * v->get_matrix(), true);
-        if (v->is_model_part()) {
-            its_merge(st->src, its);
-            ++st->parts;
-        } else
+        if (v->is_model_part())
+            st->parts.push_back({i, std::move(its)});
+        else
             st->extras.push_back({i, std::move(its)});
     }
     for (const Vec3d &p : m_points)
@@ -4933,9 +4925,21 @@ void GLGizmoCut3D::Curve::start_cut()
             auto canceled = [&ctl, &st]() { return st->dropped || ctl.was_canceled(); };
             if (canceled())
                 return;
-            ctl.update_status(0, _u8L("Cutting along the path"));
-            BOOST_LOG_TRIVIAL(info) << "Cut along path: " << st->src.indices.size() << " triangles, kerf " << st->kerf;
-            PathCut::make_edge_manifold(st->src);
+            const std::string status = _u8L("Cutting along the path");
+            ctl.update_status(0, status);
+            // The progress notification stays until the job reports 100 %, also when the cut stops with a message.
+            struct Done
+            {
+                Job::Ctl          &ctl;
+                const std::string &status;
+                ~Done() { try { ctl.update_status(100, status); } catch (...) {} }
+            } done{ctl, status};
+            for (CurveCutJob::Part &p : st->parts) {
+                PathCut::make_edge_manifold(p.mesh);
+                its_merge(st->src, p.mesh);
+            }
+            BOOST_LOG_TRIVIAL(info) << "Cut along path: " << st->parts.size() << " parts, " << st->src.indices.size() << " triangles, kerf "
+                                    << st->kerf;
             std::unique_ptr<PathCut::Cutter> cutter;
             if (st->loop) {
                 // The smoothed loop is put back on the surface the points were picked on.
@@ -4953,21 +4957,60 @@ void GLGizmoCut3D::Curve::start_cut()
                 st->error = cutter->error;
                 return;
             }
-            const PathCut::CutResult res = PathCut::cut_with_slab(std::move(st->src), *cutter, 0.5, canceled);
-            if (canceled() || !(st->error = res.error).empty())
-                return;
-            bool joined = false;
-            st->grouped = PathCut::group_cut(res, *cutter, &joined);
+            // Each part on its own, so that every piece keeps the settings and filament of the part it comes from.
+            bool                             joined = false;
+            std::vector<CurveCutJob::Extra>  untouched;
+            PathCut::Grouped                &all = st->grouped;
+            for (CurveCutJob::Part &p : st->parts) {
+                PathCut::CutResult res = PathCut::cut_with_slab(std::move(p.mesh), *cutter, 0.5, canceled);
+                if (canceled())
+                    return;
+                if (!res.error.empty()) {
+                    st->error = res.error;
+                    return;
+                }
+                if (res.first_cap >= res.mesh.indices.size()) { // the cut does not reach this part
+                    untouched.push_back({p.volume_idx, std::move(res.mesh)});
+                    continue;
+                }
+                bool             j = false;
+                PathCut::Grouped g = PathCut::group_cut(res, *cutter, &j);
+                joined |= j;
+                its_merge(all.side_a, g.side_a);
+                its_merge(all.side_b, g.side_b);
+                all.n_a += g.n_a;
+                all.n_b += g.n_b;
+                st->pieces.push_back({p.volume_idx, {std::move(g.side_a), std::move(g.side_b)}});
+                ctl.update_status(int(90 * (&p - st->parts.data() + 1) / st->parts.size()), status);
+            }
+            // A part the cut does not reach goes to the side it is on, or with the piece it lies in (a pin in the
+            // detached foot), else with the rest.
+            const std::vector<unsigned char> in = extras_in_sides(untouched, all);
+            for (size_t k = 0; k < untouched.size(); ++k) {
+                const auto  &vs   = untouched[k].mesh.vertices;
+                const size_t step = std::max<size_t>(1, vs.size() / 4000);
+                long         vote = 0;
+                for (size_t v = 0; v < vs.size(); v += step) vote += cutter->side(vs[v].cast<double>());
+                const int s = vote > 0 || (vote == 0 && in[k] == 1) ? 0 : 1;
+                CurveCutJob::Piece piece{untouched[k].volume_idx, {}};
+                piece.side[s] = std::move(untouched[k].mesh);
+                st->pieces.push_back(std::move(piece));
+            }
+            // The merged sides above lack the untouched parts: add them for the preview and the checks below.
+            for (size_t k = st->pieces.size() - untouched.size(); k < st->pieces.size(); ++k) {
+                its_merge(all.side_a, st->pieces[k].side[0]);
+                its_merge(all.side_b, st->pieces[k].side[1]);
+            }
             if (joined)
                 st->error = st->loop ? _u8L("The cut does not separate the object: it is still connected past the loop. Place the loop "
                                             "around a part that is free all around.")
                                      : _u8L("The cut does not separate the object: it is still connected around the path. Make the path "
                                             "cross the object completely, or change the limits.");
-            else if (st->grouped.side_a.indices.empty() || st->grouped.side_b.indices.empty())
+            else if (all.side_a.indices.empty() || all.side_b.indices.empty())
                 st->error = st->loop ? _u8L("The loop did not split the object. Place the points all around the part to detach.")
                                      : _u8L("The path did not split the object. Make sure it crosses the object completely.");
             else if (!st->extras.empty())
-                st->extra_sides = extras_in_sides(st->extras, st->grouped);
+                st->extra_sides = extras_in_sides(st->extras, all);
         },
         [this, alive = std::weak_ptr<char>(m_alive), st](bool canceled, std::exception_ptr &eptr) {
             if (alive.expired() || m_running != st)
@@ -5023,12 +5066,11 @@ void GLGizmoCut3D::Curve::apply_cut()
         return set_message(_u8L("The object was changed while it was being cut. Cut it again."), true);
     }
     try {
-        Plater            *plater     = wxGetApp().plater();
-        ModelObject       *mo         = plater->model().objects[st->obj_idx];
-        const ModelVolume *first_part = *std::find_if(mo->volumes.begin(), mo->volumes.end(), [](const ModelVolume *v) { return v->is_model_part(); });
-        // The detached piece (the smaller one) first, then the rest.
-        std::pair<const indexed_triangle_set *, unsigned char> sides[2] = {{&st->grouped.side_a, 1}, {&st->grouped.side_b, 2}};
-        if (std::abs(its_volume(*sides[0].first)) > std::abs(its_volume(*sides[1].first)))
+        Plater      *plater = wxGetApp().plater();
+        ModelObject *mo     = plater->model().objects[st->obj_idx];
+        // The detached piece (the smaller one) first, then the rest. side: index into Piece::side; bit: in extra_sides.
+        struct Side { int side; unsigned char bit; } sides[2] = {{0, 1}, {1, 2}};
+        if (std::abs(its_volume(st->grouped.side_a)) > std::abs(its_volume(st->grouped.side_b)))
             std::swap(sides[0], sides[1]);
         // TRN %1%: the name of the object that was cut
         const std::string names[2] = {GUI::format(_u8L("%1% - piece"), mo->name), GUI::format(_u8L("%1% - rest"), mo->name)};
@@ -5041,12 +5083,18 @@ void GLGizmoCut3D::Curve::apply_cut()
             no->cut_connectors.clear();
             no->cut_id.invalidate();
             no->name        = names[i];
-            ModelVolume *nv = no->add_volume(TriangleMesh(*sides[i].first));
-            nv->name        = names[i];
-            nv->config.apply(first_part->config);
-            nv->set_material_id(first_part->material_id());
+            for (const CurveCutJob::Piece &piece : st->pieces) {
+                const indexed_triangle_set &mesh = piece.side[sides[i].side];
+                if (mesh.indices.empty())
+                    continue;
+                const ModelVolume *src = mo->volumes[piece.volume_idx];
+                ModelVolume       *nv  = no->add_volume(TriangleMesh(mesh));
+                nv->name               = st->parts.size() > 1 ? src->name : names[i];
+                nv->config.apply(src->config);
+                nv->set_material_id(src->material_id());
+            }
             for (size_t k = 0; k < st->extras.size(); ++k)
-                if (st->extra_sides[k] & sides[i].second) {
+                if (st->extra_sides[k] & sides[i].bit) {
                     const ModelVolume *src = mo->volumes[st->extras[k].volume_idx];
                     ModelVolume       *ev  = no->add_volume(TriangleMesh(st->extras[k].mesh), src->type());
                     ev->name               = src->name;
@@ -5063,10 +5111,6 @@ void GLGizmoCut3D::Curve::apply_cut()
         if (mo->is_cut()) // the other pieces of an earlier cut with connectors lose their link to this one
             wxGetApp().obj_list()->invalidate_cut_info_for_object(st->obj_idx);
         plater->apply_cut_object_to_model(size_t(st->obj_idx), tmp.objects);
-        if (st->parts > 1)
-            plater->get_notification_manager()->push_notification(NotificationType::CustomNotification,
-                NotificationManager::NotificationLevel::WarningNotificationLevel,
-                _u8L("Cut along path: the parts of the object were joined into one before cutting."));
     } catch (const std::exception &e) {
         BOOST_LOG_TRIVIAL(error) << "Cut along path: applying the cut failed: " << e.what();
         wxGetApp().plater()->get_notification_manager()->push_notification(NotificationType::CustomNotification,
