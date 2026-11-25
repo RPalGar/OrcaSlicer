@@ -322,6 +322,8 @@ private:
     std::shared_ptr<CurveCutJob> m_pending;
     GLModel m_piece_stay, m_piece_moved;
     Vec3d   m_piece_shift{Vec3d::Zero()}, m_piece_lift{Vec3d::Zero()};
+    GLModel m_bridge;                                 // where a piece the cut leaves connected still holds together
+    Vec3d   m_bridge_shift{Vec3d::Zero()};
     bool    m_object_hidden{false};
     std::shared_ptr<CurveCutJob> m_running;           // the cut on the job worker
     std::shared_ptr<char> m_alive{std::make_shared<char>()}; // the job's result is dropped once the tool is gone
@@ -4354,6 +4356,7 @@ static const ColorRGBA CURVE_PATH_COLOR   = {0.f, 0.588f, 0.533f, 1.f}; // Orca 
 static const ColorRGBA CURVE_POINT_COLOR  = {1.f, 0.55f, 0.f, 1.f};
 static const ColorRGBA CURVE_STAY_COLOR   = {0.55f, 0.72f, 0.70f, 1.f};
 static const ColorRGBA CURVE_MOVED_COLOR  = {0.95f, 0.62f, 0.25f, 1.f};
+static const ColorRGBA CURVE_BRIDGE_COLOR = {0.9f, 0.1f, 0.1f, 1.f};
 
 // A cut in flight: what it is computed from (copied on the UI thread, the job never touches the Model, and
 // kept to detect edits made meanwhile) and what came out.
@@ -4385,6 +4388,8 @@ struct CurveCutJob
     PathCut::Grouped           grouped; // all parts
     struct Piece { size_t volume_idx; indexed_triangle_set side[2]; }; // a part's share of side a / b
     std::vector<Piece>         pieces;
+    // When the cut leaves a piece connected around it (side b): where it still holds together.
+    std::vector<std::vector<PathCut::V3>> bridges;
     std::vector<unsigned char> extra_sides; // per extra: bit 0 in side_a, bit 1 in side_b
     std::string                error;       // translated
     // Set by the tool to drop the cut: the job worker is shared, and cancelling it would stop whatever job it
@@ -4514,6 +4519,7 @@ void GLGizmoCut3D::Curve::clear_pending()
     m_pending.reset();
     m_piece_stay.reset();
     m_piece_moved.reset();
+    m_bridge.reset();
     show_object(true);
 }
 
@@ -4846,6 +4852,15 @@ void GLGizmoCut3D::Curve::render()
             m_curve.render();
             shader->stop_using();
         }
+        if (shader != nullptr && previewing() && m_bridge.is_initialized()) {
+            shader->start_using();
+            shader->set_uniform("view_model_matrix", view * bias * Geometry::translation_transform(m_bridge_shift));
+            shader->set_uniform("projection_matrix", camera.get_projection_matrix());
+            shader->set_uniform("width", 0.6f);
+            m_bridge.set_color(ColorRGBA(CURVE_BRIDGE_COLOR.r(), CURVE_BRIDGE_COLOR.g(), CURVE_BRIDGE_COLOR.b(), alpha));
+            m_bridge.render();
+            shader->stop_using();
+        }
         if ((shader = wxGetApp().get_shader("gouraud_light")) == nullptr)
             continue;
         shader->start_using();
@@ -4975,7 +4990,11 @@ void GLGizmoCut3D::Curve::start_cut()
                 }
                 bool             j = false;
                 PathCut::Grouped g = PathCut::group_cut(res, *cutter, &j);
-                joined |= j;
+                if (j) {
+                    joined = true;
+                    for (std::vector<PathCut::V3> &line : PathCut::connections(res))
+                        st->bridges.push_back(std::move(line));
+                }
                 its_merge(all.side_a, g.side_a);
                 its_merge(all.side_b, g.side_b);
                 all.n_a += g.n_a;
@@ -5001,12 +5020,14 @@ void GLGizmoCut3D::Curve::start_cut()
                 its_merge(all.side_a, st->pieces[k].side[0]);
                 its_merge(all.side_b, st->pieces[k].side[1]);
             }
-            if (joined)
+            // A piece still connected around the cut is shown with where it holds together: the cut can be performed
+            // all the same, and a second cut across that line detaches it (an arm whose hand rests on the hip).
+            if (joined && st->bridges.empty())
                 st->error = st->loop ? _u8L("The cut does not separate the object: it is still connected past the loop. Place the loop "
                                             "around a part that is free all around.")
                                      : _u8L("The cut does not separate the object: it is still connected around the path. Make the path "
                                             "cross the object completely, or change the limits.");
-            else if (all.side_a.indices.empty() || all.side_b.indices.empty())
+            else if (!joined && (all.side_a.indices.empty() || all.side_b.indices.empty()))
                 st->error = st->loop ? _u8L("The loop did not split the object. Place the points all around the part to detach.")
                                      : _u8L("The path did not split the object. Make sure it crosses the object completely.");
             else if (!st->extras.empty())
@@ -5048,11 +5069,30 @@ void GLGizmoCut3D::Curve::cut_done(const std::shared_ptr<CurveCutJob> &st)
     const bool                  a_moves = std::abs(its_volume(st->grouped.side_a)) <= std::abs(its_volume(st->grouped.side_b));
     const indexed_triangle_set &moved   = a_moves ? st->grouped.side_a : st->grouped.side_b;
     const indexed_triangle_set &stay    = a_moves ? st->grouped.side_b : st->grouped.side_a;
-    m_piece_stay.init_from(stay);
-    m_piece_moved.init_from(moved);
+    if (!stay.indices.empty())
+        m_piece_stay.init_from(stay);
+    if (!moved.indices.empty()) // empty when the cut leaves the piece connected (see bridges)
+        m_piece_moved.init_from(moved);
     m_piece_shift = PathCut::preview_shift(moved, stay);
     m_piece_lift  = Vec3d(0., 0., PathCut::preview_lift(moved, stay, m_piece_shift));
     show_object(false);
+    if (!st->bridges.empty()) {
+        GLModel::Geometry g;
+        g.format = {GLModel::Geometry::EPrimitiveType::Lines, GLModel::Geometry::EVertexLayout::P3};
+        for (const std::vector<PathCut::V3> &line : st->bridges)
+            for (size_t i = 0; i + 1 < line.size(); ++i) {
+                g.add_vertex(Vec3f(line[i].cast<float>()));
+                g.add_vertex(Vec3f(line[i + 1].cast<float>()));
+                g.add_line(unsigned(g.vertices_count() - 2), unsigned(g.vertices_count() - 1));
+            }
+        m_bridge.init_from(std::move(g));
+        // The connected piece is on side b.
+        m_bridge_shift = m_pending->offset + m_piece_lift + (a_moves ? Vec3d::Zero() : m_piece_shift);
+        return set_message(st->loop ? _u8L("The piece is still connected past the loop, along the red line. Perform the cut, then cut "
+                                           "again across the red line to detach it.")
+                                    : _u8L("The piece is still connected around the path, along the red line. Perform the cut, then cut "
+                                           "again across the red line to detach it."), true);
+    }
     set_message(_u8L("Preview: the pieces are shown apart. Perform the cut if it is right, or edit it."), false);
 }
 
@@ -5072,10 +5112,14 @@ void GLGizmoCut3D::Curve::apply_cut()
         struct Side { int side; unsigned char bit; } sides[2] = {{0, 1}, {1, 2}};
         if (std::abs(its_volume(st->grouped.side_a)) > std::abs(its_volume(st->grouped.side_b)))
             std::swap(sides[0], sides[1]);
+        const bool        both     = !st->grouped.side_a.indices.empty() && !st->grouped.side_b.indices.empty();
         // TRN %1%: the name of the object that was cut
-        const std::string names[2] = {GUI::format(_u8L("%1% - piece"), mo->name), GUI::format(_u8L("%1% - rest"), mo->name)};
+        const std::string names[2] = {both ? GUI::format(_u8L("%1% - piece"), mo->name) : mo->name,
+                                      both ? GUI::format(_u8L("%1% - rest"), mo->name) : mo->name};
         Model tmp;
         for (int i = 0; i < 2; ++i) {
+            if ((sides[i].side == 0 ? st->grouped.side_a : st->grouped.side_b).indices.empty())
+                continue; // a cut that leaves the piece connected (see bridges) may leave nothing on the other side
             ModelObject *no = nullptr;
             mo->clone_for_cut(&no);
             tmp.objects.push_back(no); // deleted with tmp
@@ -5104,7 +5148,8 @@ void GLGizmoCut3D::Curve::apply_cut()
             no->invalidate_bounding_box();
             no->ensure_on_bed();
         }
-        place_piece(*tmp.objects[0], tmp.objects[1]->instance_bounding_box(0), mo);
+        if (tmp.objects.size() == 2)
+            place_piece(*tmp.objects[0], tmp.objects[1]->instance_bounding_box(0), mo);
 
         m_parent.reset_all_gizmos();
         Plater::TakeSnapshot snapshot(plater, _u8L("Cut along path"));

@@ -18,6 +18,7 @@
 #include <functional>
 #include <limits>
 #include <numeric>
+#include <queue>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -1663,6 +1664,57 @@ Grouped group_cut(const CutResult &cut, const Cutter &cutter, bool *joined)
         else               { its_merge(g.side_b, parts[i]); ++g.n_b; }
     }
     return g;
+}
+
+std::vector<std::vector<V3>> connections(const CutResult &cut)
+{
+    const indexed_triangle_set &its = cut.mesh;
+    const size_t                nv  = its.vertices.size();
+    if (cut.level.size() < nv)
+        return {};
+    std::vector<int> dsu(nv);
+    std::iota(dsu.begin(), dsu.end(), 0);
+    auto find = [&dsu](int x) { while (dsu[x] != x) x = dsu[x] = dsu[dsu[x]]; return x; };
+    for (const auto &t : its.indices) { dsu[find(t[0])] = find(t[1]); dsu[find(t[1])] = find(t[2]); }
+    // Over the surface only: across a cap the two sides of the cut are not connected.
+    std::vector<std::vector<std::pair<int, float>>> adj(nv);
+    for (size_t i = 0; i < cut.first_cap && i < its.indices.size(); ++i)
+        for (int e = 0; e < 3; ++e) {
+            const int a = its.indices[i][e], b = its.indices[i][(e + 1) % 3];
+            if (a < b) {
+                const float l = (its.vertices[size_t(a)] - its.vertices[size_t(b)]).norm();
+                adj[size_t(a)].emplace_back(b, l);
+                adj[size_t(b)].emplace_back(a, l);
+            }
+        }
+    // Shortest distance from the cut face of level +1 to every vertex.
+    std::vector<float> dist(nv, std::numeric_limits<float>::max());
+    std::vector<int>   prev(nv, -1);
+    using Item = std::pair<float, int>;
+    std::priority_queue<Item, std::vector<Item>, std::greater<Item>> open;
+    for (size_t v = 0; v < nv; ++v)
+        if (cut.level[v] > 0) { dist[v] = 0.f; open.emplace(0.f, int(v)); }
+    while (!open.empty()) {
+        const auto [d, v] = open.top();
+        open.pop();
+        if (d > dist[size_t(v)]) continue;
+        for (const auto &[w, l] : adj[size_t(v)])
+            if (d + l < dist[size_t(w)]) { dist[size_t(w)] = d + l; prev[size_t(w)] = v; open.emplace(d + l, w); }
+    }
+    // Per part, the nearest vertex of level -1 it reaches.
+    std::unordered_map<int, int> best;
+    for (size_t v = 0; v < nv; ++v)
+        if (cut.level[v] < 0 && dist[v] < std::numeric_limits<float>::max()) {
+            auto [it, ins] = best.emplace(find(int(v)), int(v));
+            if (!ins && dist[v] < dist[size_t(it->second)]) it->second = int(v);
+        }
+    std::vector<std::vector<V3>> out;
+    for (const auto &[root, end] : best) {
+        std::vector<V3> line;
+        for (int v = end; v >= 0; v = prev[size_t(v)]) line.push_back(its.vertices[size_t(v)].cast<double>());
+        out.push_back(std::move(line));
+    }
+    return out;
 }
 
 }} // namespace Slic3r::PathCut

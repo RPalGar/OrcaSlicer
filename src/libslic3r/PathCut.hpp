@@ -205,6 +205,10 @@ struct Grouped
 // `joined` is set.
 Grouped group_cut(const CutResult &cut, const Cutter &cutter, bool *joined = nullptr);
 
+// Where the parts a cut leaves connected around it (see group_cut) still hold together: per such part, the
+// shortest line over its surface from one cut face to the other. Cutting across it detaches the part.
+std::vector<std::vector<V3>> connections(const CutResult &cut);
+
 // Preview of a cut: how far the detached piece is drawn apart from the piece that stays, along the line
 // between their bounding box centres (straight up when they share a centre): 10 % of the detached piece's
 // size, between 6 and 30 mm. Zero when either piece is empty. Both meshes must have no unused vertices, as

@@ -49,7 +49,11 @@ Rules that shape the result:
   in sculpted and AI-generated meshes, would leave openings the caps cannot close.
 - `group_cut` assigns every resulting part to a side by the cut face it carries; a part the cut does not touch
   goes to the side it is on, or, next to a loop, with the piece it lies in. A part carrying both cut
-  faces is still connected around the cut; the cut is then reported as not separating the object.
+  faces is still connected around the cut (an arm whose hand rests on the hip): `connections` finds the
+  shortest line over its surface from one cut face to the other, the tool shows it, and the cut can be
+  performed so that a second cut across that line detaches the part.
+- Each part of a multi-part object is cut on its own and its pieces keep the part's settings and filament;
+  a part the cut does not reach goes to the side it is on.
 
 The caps are triangulated with earcut followed by Delaunay edge flips rather than with
 `Triangulation`: where the cut grazes the surface the rings of a cap can touch or cross themselves at

@@ -447,3 +447,28 @@ TEST_CASE("A loop that folds back on itself is rejected", "[PathCut]")
     CHECK_FALSE(lc.valid());
     CHECK_FALSE(lc.error.empty());
 }
+
+TEST_CASE("A loop around a ring leaves it connected, and the connection runs round the ring", "[PathCut]")
+{
+    // Torus of radius 20 with a tube of radius 4 around the Z axis; a loop around the tube at +X.
+    const indexed_triangle_set torus = its_make_torus(20., 4., PI / 30., PI / 12.);
+    std::vector<PathCut::V3>   loop;
+    for (int i = 0; i < 12; ++i) {
+        const double a = 2. * PI * i / 12.;
+        loop.emplace_back(20. + 4. * std::cos(a), 0., 4. * std::sin(a));
+    }
+    PathCut::LoopCutter lc = PathCut::make_loop_cutter(loop, 0.2, 1., no_snap, true);
+    REQUIRE(lc.valid());
+    REQUIRE(PathCut::fit_loop_margin(torus, lc));
+    const PathCut::CutResult res = PathCut::cut_with_slab(torus, lc);
+    REQUIRE(res.error.empty());
+    bool joined = false;
+    PathCut::group_cut(res, lc, &joined);
+    CHECK(joined);
+    const auto lines = PathCut::connections(res);
+    REQUIRE(lines.size() == 1);
+    // It starts and ends next to the cut and goes past the far side of the ring.
+    CHECK(std::abs(lines.front().front().y()) < 1.);
+    CHECK(std::abs(lines.front().back().y()) < 1.);
+    CHECK(std::any_of(lines.front().begin(), lines.front().end(), [](const PathCut::V3 &p) { return p.x() < -15.; }));
+}
