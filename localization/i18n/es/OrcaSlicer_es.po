@@ -38359,3 +38359,252 @@ msgstr ""
 # AI Translated
 #~ msgid "import SVG failed: could not parse imported svg data."
 #~ msgstr "error al importar SVG: no se pudieron analizar los datos SVG importados."
+
+# AI Translated  (laboratorio: solo para probar la beta de Cortar por ruta, no va al PR)
+msgid "The model has holes along the cut, so the cut faces cannot be closed. Repair the model first."
+msgstr "El modelo tiene agujeros a lo largo del corte, así que las caras de corte no se pueden cerrar. Repara el modelo primero."
+
+# AI Translated
+msgid "The cut ends inside the object. Increase or remove the limits, or start and end the path beyond the part."
+msgstr "El corte termina dentro del objeto. Aumenta o quita los límites, o empieza y termina la ruta fuera de la pieza."
+
+# AI Translated
+msgid "The path needs at least two points."
+msgstr "La ruta necesita al menos dos puntos."
+
+# AI Translated
+msgid "The path crosses itself seen from the view. Place the points in order along the cut line."
+msgstr "La ruta se cruza consigo misma vista desde la vista actual. Coloca los puntos en orden a lo largo de la línea de corte."
+
+# AI Translated
+msgid "The path must not end where it starts."
+msgstr "La ruta no puede terminar donde empieza."
+
+# AI Translated
+msgid "The loop does not go all the way around the part. Place the points around it, or widen the cap margin."
+msgstr "El lazo no rodea toda la pieza. Coloca los puntos alrededor de ella o amplía el margen de la tapa."
+
+# AI Translated
+msgid "The loop needs at least three points."
+msgstr "El lazo necesita al menos tres puntos."
+
+# AI Translated
+msgid "The loop encloses no area. Place the points around the part."
+msgstr "El lazo no encierra ninguna superficie. Coloca los puntos alrededor de la pieza."
+
+# AI Translated
+msgid "The loop folds back on itself seen from its mean plane. Place the points more evenly around the part."
+msgstr "El lazo se pliega sobre sí mismo visto desde su plano medio. Reparte los puntos de forma más uniforme alrededor de la pieza."
+
+# AI Translated
+msgid "The loop is too irregular. Place the points more evenly around the part."
+msgstr "El lazo es demasiado irregular. Reparte los puntos de forma más uniforme alrededor de la pieza."
+
+# AI Translated
+msgid "The cap spanning the loop runs into another part of the model. Place the loop where the part is free all around it."
+msgstr "La tapa que cierra el lazo choca con otra parte del modelo. Coloca el lazo donde la pieza esté libre a su alrededor."
+
+# AI Translated
+msgid "The mesh could not be refined enough along the cut. Repair or remesh the model, or cut it elsewhere."
+msgstr "No se ha podido refinar la malla lo suficiente a lo largo del corte. Repara o rehaz la malla del modelo, o córtalo en otro sitio."
+
+# AI Translated
+msgid "Select the object to cut and place the points on it again."
+msgstr "Selecciona el objeto que quieres cortar y vuelve a colocar los puntos sobre él."
+
+# AI Translated
+msgid "This object has several copies. Cutting it would remove the other copies: make them separate objects first, then cut one of them."
+msgstr "Este objeto tiene varias copias. Cortarlo eliminaría las demás copias: conviértelas primero en objetos separados y luego corta uno de ellos."
+
+# AI Translated
+msgid "The object was moved since the points were placed. Place them again."
+msgstr "El objeto se ha movido desde que se colocaron los puntos. Vuelve a colocarlos."
+
+# AI Translated
+msgid "Cutting, please wait..."
+msgstr "Cortando, espera..."
+
+# AI Translated
+msgid "Cutting along the path"
+msgstr "Cortando por la ruta"
+
+# AI Translated
+msgid "The cut does not separate the object: it is still connected past the loop. Place the loop around a part that is free all around."
+msgstr "El corte no separa el objeto: sigue conectado más allá del lazo. Coloca el lazo alrededor de una pieza que esté libre a su alrededor."
+
+# AI Translated
+msgid "The cut does not separate the object: it is still connected around the path. Make the path cross the object completely, or change the limits."
+msgstr "El corte no separa el objeto: sigue conectado alrededor de la ruta. Haz que la ruta atraviese el objeto por completo o cambia los límites."
+
+# AI Translated
+msgid "The loop did not split the object. Place the points all around the part to detach."
+msgstr "El lazo no ha dividido el objeto. Coloca los puntos alrededor de toda la pieza que quieres separar."
+
+# AI Translated
+msgid "The path did not split the object. Make sure it crosses the object completely."
+msgstr "La ruta no ha dividido el objeto. Asegúrate de que atraviesa el objeto por completo."
+
+# AI Translated
+msgid "The cut failed. Try a simpler path or a model with fewer triangles."
+msgstr "El corte ha fallado. Prueba con una ruta más sencilla o un modelo con menos triángulos."
+
+# AI Translated
+msgid "Cut cancelled."
+msgstr "Corte cancelado."
+
+# AI Translated
+msgid "The cut could not be started. Try again."
+msgstr "No se ha podido iniciar el corte. Inténtalo de nuevo."
+
+# AI Translated
+msgid "The object was changed while it was being cut. Cut it again."
+msgstr "El objeto ha cambiado mientras se cortaba. Vuelve a cortarlo."
+
+# AI Translated
+msgid "The piece is still connected past the loop, along the red line. Perform the cut, then cut again across the red line to detach it."
+msgstr "La pieza sigue conectada más allá del lazo, a lo largo de la línea roja. Realiza el corte y luego corta de nuevo atravesando la línea roja para separarla."
+
+# AI Translated
+msgid "The piece is still connected around the path, along the red line. Perform the cut, then cut again across the red line to detach it."
+msgstr "La pieza sigue conectada alrededor de la ruta, a lo largo de la línea roja. Realiza el corte y luego corta de nuevo atravesando la línea roja para separarla."
+
+# AI Translated
+msgid "Preview: the pieces are shown apart. Perform the cut if it is right, or edit it."
+msgstr "Previsualización: las piezas se muestran separadas. Realiza el corte si es correcto o edítalo."
+
+# AI Translated
+msgid "%1% - piece"
+msgstr "%1% - pieza"
+
+# AI Translated
+msgid "%1% - rest"
+msgstr "%1% - resto"
+
+# AI Translated
+msgid "Cut along path"
+msgstr "Cortar por ruta"
+
+# AI Translated
+msgid "The cut could not be applied."
+msgstr "No se ha podido aplicar el corte."
+
+# AI Translated
+msgid "The object was changed during the preview. Make the preview again."
+msgstr "El objeto ha cambiado durante la previsualización. Vuelve a previsualizar."
+
+# AI Translated
+msgid "From the view"
+msgstr "Desde la vista"
+
+# AI Translated
+msgid "Level with the bed"
+msgstr "Paralelo a la cama"
+
+# AI Translated
+msgid "Open path"
+msgstr "Ruta abierta"
+
+# AI Translated
+msgid "Closed loop"
+msgstr "Lazo cerrado"
+
+# AI Translated
+msgid "Clearance (mm)"
+msgstr "Holgura (mm)"
+
+# AI Translated
+msgid "Cut direction"
+msgstr "Dirección de corte"
+
+# AI Translated
+msgid "Turn (deg)"
+msgstr "Giro (°)"
+
+# AI Translated
+msgid "Tilt (deg)"
+msgstr "Inclinación (°)"
+
+# AI Translated
+msgid "Cap margin (mm)"
+msgstr "Margen de la tapa (mm)"
+
+# AI Translated
+msgid "In front (mm)"
+msgstr "Delante (mm)"
+
+# AI Translated
+msgid "Behind (mm)"
+msgstr "Detrás (mm)"
+
+# AI Translated
+msgid "Beginning (mm)"
+msgstr "Inicio (mm)"
+
+# AI Translated
+msgid "Ending (mm)"
+msgstr "Final (mm)"
+
+# AI Translated
+msgid "Points: %1%"
+msgstr "Puntos: %1%"
+
+# AI Translated
+msgid "Undo point"
+msgstr "Deshacer punto"
+
+# AI Translated
+msgid "Flat cut face"
+msgstr "Cara de corte plana"
+
+# AI Translated
+msgid "Take the cut direction from the current view"
+msgstr "Tomar la dirección de corte de la vista actual"
+
+# AI Translated
+msgid "Limits (enabled)"
+msgstr "Límites (activados)"
+
+# AI Translated
+msgid "Limits"
+msgstr "Límites"
+
+# AI Translated
+msgid "Add a point around the part to detach"
+msgstr "Añadir un punto alrededor de la pieza que quieres separar"
+
+# AI Translated
+msgid "Add a point along the line to cut"
+msgstr "Añadir un punto a lo largo de la línea de corte"
+
+# AI Translated
+msgid "Remove the last point"
+msgstr "Quitar el último punto"
+
+# AI Translated
+msgid "Edit cut"
+msgstr "Editar corte"
+
+# AI Translated
+msgid "Remove all the points"
+msgstr "Quitar todos los puntos"
+
+# AI Translated
+msgctxt "Cut along path"
+msgid "Preview"
+msgstr "Previsualizar"
+
+# AI Translated
+msgid "%1% s"
+msgstr "%1% s"
+
+# AI Translated
+msgid "The loop does not go around the part: the cut would reach far past it. Place the points all around the part to detach."
+msgstr "El lazo no rodea la pieza: el corte llegaría mucho más allá de él. Coloca los puntos alrededor de toda la pieza que quieres separar."
+
+# AI Translated
+msgid "The loop does not go around the part: the red line shows where the cut would reach. Place the points all around the part to detach."
+msgstr "El lazo no rodea la pieza: la línea roja muestra hasta dónde llegaría el corte. Coloca los puntos alrededor de toda la pieza que quieres separar."
+
+# AI Translated
+msgid "The cut would also go through another part of the model, shown in red. Place the loop where nothing else lies inside it."
+msgstr "El corte atravesaría también otra parte del modelo, marcada en rojo. Coloca el lazo donde no haya nada más dentro de él."
