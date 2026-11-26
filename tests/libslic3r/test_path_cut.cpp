@@ -2,6 +2,7 @@
 #include <catch2/matchers/catch_matchers.hpp>
 #include <catch2/matchers/catch_matchers_floating_point.hpp>
 
+#include <libslic3r/AABBMesh.hpp>
 #include <libslic3r/PathCut.hpp>
 #include <libslic3r/TriangleMesh.hpp>
 #include <libslic3r/libslic3r.h>
@@ -11,6 +12,7 @@
 #include <cstddef>
 #include <functional>
 #include <map>
+#include <string>
 #include <tuple>
 #include <utility>
 #include <vector>
@@ -471,4 +473,73 @@ TEST_CASE("A loop around a ring leaves it connected, and the connection runs rou
     CHECK(std::abs(lines.front().front().y()) < 1.);
     CHECK(std::abs(lines.front().back().y()) < 1.);
     CHECK(std::any_of(lines.front().begin(), lines.front().end(), [](const PathCut::V3 &p) { return p.x() < -15.; }));
+}
+
+namespace {
+
+// Cut with a loop snapped to the model as the tool does; returns the volumes of the two sides, or the error.
+std::string loop_cut(const indexed_triangle_set &model, const std::vector<PathCut::V3> &pts, bool flat, double &vol_a, double &vol_b)
+{
+    const AABBMesh      aabb(model);
+    PathCut::LoopCutter lc = PathCut::make_loop_cutter(pts, 0.2, 1.5, [&aabb](const PathCut::V3 &p) {
+        int i; Vec3d c; aabb.squared_distance(p, i, c); return PathCut::V3(c); }, flat);
+    if (lc.valid()) PathCut::fit_loop_margin(model, lc);
+    if (!lc.error.empty()) return lc.error;
+    const PathCut::CutResult res = PathCut::cut_with_slab(model, lc);
+    if (!res.error.empty()) return res.error;
+    const PathCut::Grouped g = PathCut::group_cut(res, lc);
+    vol_a = its_volume(g.side_a);
+    vol_b = its_volume(g.side_b);
+    return {};
+}
+
+} // namespace
+
+TEST_CASE("A loop around a thin wide section (a blade) cuts it", "[PathCut]")
+{
+    for (const double w : {40., 80.})
+        for (const double t : {1., 2., 4.})
+            for (const bool flat : {true, false}) {
+                CAPTURE(w, t, flat);
+                indexed_triangle_set blade = its_make_cube(w, t, 100.);
+                its_translate(blade, Vec3f(float(-w / 2), float(-t / 2), 0.f));
+                const std::vector<PathCut::V3> pts{{w / 2, 0, 50}, {w / 4, t / 2, 50}, {0, t / 2, 50}, {-w / 4, t / 2, 50},
+                                                   {-w / 2, 0, 50}, {-w / 4, -t / 2, 50}, {0, -t / 2, 50}, {w / 4, -t / 2, 50}};
+                double a = 0., b = 0.;
+                REQUIRE(loop_cut(blade, pts, flat, a, b).empty());
+                const double half = w * t * (100. - 0.2) / 2.;
+                CHECK_THAT(a, WithinAbs(half, 0.01 * half));
+                CHECK_THAT(b, WithinAbs(half, 0.01 * half));
+            }
+}
+
+TEST_CASE("A loop near the end of a bar cuts where the points are", "[PathCut]")
+{
+    // The spline between the points runs inside the bar, nearer its top face than its sides: snapped straight to
+    // the nearest surface it would move the cut towards the top.
+    for (const double side : {10., 40.})
+        for (const double below : {1., 3.})
+            for (const bool flat : {true, false}) {
+                CAPTURE(side, below, flat);
+                const indexed_triangle_set bar = its_make_cube(side, side, 100.);
+                const double z = 100. - below, h = side / 2.;
+                double       a = 0., b = 0.;
+                REQUIRE(loop_cut(bar, {{h, 0, z}, {side, h, z}, {h, side, z}, {0, h, z}}, flat, a, b).empty());
+                CHECK_THAT(std::min(a, b) / (side * side) + 0.1, WithinAbs(below, 0.05));
+            }
+}
+
+TEST_CASE("A loop over a pin added as a part cuts the pin with the part", "[PathCut]")
+{
+    // A pin overlapping the arm right where the loop goes round, sticking out 3 mm: the same part, not another one.
+    indexed_triangle_set model = its_make_cylinder(5., 40.);
+    indexed_triangle_set pin   = its_make_cube(4., 3., 4.);
+    its_translate(pin, Vec3f(4.f, -1.5f, 18.f));
+    its_merge(model, pin);
+    PathCut::LoopCutter lc = PathCut::make_loop_cutter(ring(5., 8, [](double) { return 20.; }), 0.2, 1.5, no_snap, true);
+    REQUIRE(lc.valid());
+    REQUIRE(PathCut::fit_loop_margin(model, lc));
+    const PathCut::CutResult res = PathCut::cut_with_slab(model, lc);
+    REQUIRE(res.error.empty());
+    CHECK(its_split(res.mesh).size() == 4); // the arm and the pin, each in two
 }

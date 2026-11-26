@@ -324,6 +324,12 @@ private:
     Vec3d   m_piece_shift{Vec3d::Zero()}, m_piece_lift{Vec3d::Zero()};
     GLModel m_bridge;                                 // where a piece the cut leaves connected still holds together
     Vec3d   m_bridge_shift{Vec3d::Zero()};
+    // After such a cut is performed, the same line on the object it left, to cut across: in world coordinates
+    // when it was cut, drawn moved with the object while it is there.
+    GLModel     m_hint;
+    ObjectID    m_hint_object;
+    Transform3d m_hint_inst{Transform3d::Identity()};
+    void        render_hint(const Camera &camera);
     bool    m_object_hidden{false};
     std::shared_ptr<CurveCutJob> m_running;           // the cut on the job worker
     std::shared_ptr<char> m_alive{std::make_shared<char>()}; // the job's result is dropped once the tool is gone
@@ -4413,14 +4419,15 @@ struct CurveCutJob
 // Which pieces each volume that is not cut is in: those with material at some point of its surface (a hole
 // is partly in the material it removes, a modifier in the part it changes). Bounding boxes are not enough:
 // the box of one piece easily overlaps a hole of the other, which would then float away with it.
-static std::vector<unsigned char> extras_in_sides(const std::vector<CurveCutJob::Extra> &extras, const PathCut::Grouped &g)
+// sides: trees of side a and side b, none for an empty side.
+static std::vector<unsigned char> extras_in_sides(const std::vector<CurveCutJob::Extra> &extras, const std::optional<AABBMesh> (&sides)[2])
 {
     std::vector<unsigned char> out(extras.size(), 0);
     const Vec3d                up = Vec3d(1e-4, 2e-4, 1.).normalized(); // off the axes, so the ray misses the edges
     unsigned char              bit = 1;
-    for (const indexed_triangle_set *side : {&g.side_a, &g.side_b}) {
-        if (!side->indices.empty()) {
-            const AABBMesh aabb(*side);
+    for (const std::optional<AABBMesh> &side : sides) {
+        if (side) {
+            const AABBMesh &aabb = *side;
             auto inside = [&](const Vec3d &p) { return aabb.query_ray_hits(p, up).size() % 2 == 1; };
             for (size_t k = 0; k < extras.size(); ++k) {
                 const indexed_triangle_set &m = extras[k].mesh;
@@ -4787,8 +4794,44 @@ void GLGizmoCut3D::Curve::rebuild_preview()
     m_wall.init_from(std::move(g));
 }
 
+// The line where the object left by the last cut still holds together, on that object as it is now.
+void GLGizmoCut3D::Curve::render_hint(const Camera &camera)
+{
+    if (!m_hint.is_initialized() || previewing())
+        return;
+    const ModelObject *obj = nullptr;
+    for (const ModelObject *o : wxGetApp().plater()->model().objects)
+        if (o->id() == m_hint_object) obj = o;
+    if (obj == nullptr || obj->instances.size() != 1) {
+        m_hint.reset();
+        return;
+    }
+    GLShaderProgram *shader = wxGetApp().get_shader("flat");
+    if (shader == nullptr)
+        return;
+    const Transform3d moved = obj->instances.front()->get_matrix() * m_hint_inst.inverse();
+    glsafe(::glEnable(GL_BLEND));
+    glsafe(::glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA));
+    shader->start_using();
+    shader->set_uniform("projection_matrix", camera.get_projection_matrix());
+    shader->set_uniform("width", 0.6f);
+    for (const bool hidden_pass : {true, false}) { // faint through the object, solid where it is in sight
+        if (hidden_pass)
+            glsafe(::glDisable(GL_DEPTH_TEST));
+        else
+            glsafe(::glEnable(GL_DEPTH_TEST));
+        shader->set_uniform("view_model_matrix", camera.get_view_matrix() * moved);
+        m_hint.set_color(ColorRGBA(CURVE_BRIDGE_COLOR.r(), CURVE_BRIDGE_COLOR.g(), CURVE_BRIDGE_COLOR.b(), hidden_pass ? 0.35f : 1.f));
+        m_hint.render();
+    }
+    shader->stop_using();
+    glsafe(::glEnable(GL_DEPTH_TEST));
+    glsafe(::glDisable(GL_BLEND));
+}
+
 void GLGizmoCut3D::Curve::render()
 {
+    render_hint(wxGetApp().plater()->get_camera());
     if (m_points.empty())
         return;
     if (m_preview_dirty)
@@ -4968,6 +5011,7 @@ void GLGizmoCut3D::Curve::start_cut()
                 const BoundingBoxf3 bb = Slic3r::bounding_box(st->src);
                 cutter = std::make_unique<PathCut::ViewCutter>(PathCut::make_view_cutter(st->pts, st->view_dir, bb.min, bb.max, st->kerf, st->limits));
             }
+            st->src = {}; // only needed to build the cutter
             if (!cutter->error.empty()) {
                 st->error = cutter->error;
                 return;
@@ -5004,13 +5048,38 @@ void GLGizmoCut3D::Curve::start_cut()
             }
             // A part the cut does not reach goes to the side it is on, or with the piece it lies in (a pin in the
             // detached foot), else with the rest.
-            const std::vector<unsigned char> in = extras_in_sides(untouched, all);
+            // Trees of the two sides, built only when something has to be placed against them.
+            std::optional<AABBMesh> trees[2];
+            auto build_trees = [&trees, &all]() {
+                for (int i = 0; i < 2; ++i) {
+                    const indexed_triangle_set &m = i == 0 ? all.side_a : all.side_b;
+                    trees[i].reset();
+                    if (!m.indices.empty()) trees[i].emplace(m);
+                }
+            };
+            if (!untouched.empty())
+                build_trees();
+            const std::vector<unsigned char> in = untouched.empty() ? std::vector<unsigned char>{} : extras_in_sides(untouched, trees);
             for (size_t k = 0; k < untouched.size(); ++k) {
                 const auto  &vs   = untouched[k].mesh.vertices;
-                const size_t step = std::max<size_t>(1, vs.size() / 4000);
+                const size_t step = std::max<size_t>(1, vs.size() / 2000);
                 long         vote = 0;
                 for (size_t v = 0; v < vs.size(); v += step) vote += cutter->side(vs[v].cast<double>());
-                const int s = vote > 0 || (vote == 0 && in[k] == 1) ? 0 : 1;
+                int s = vote > 0 ? 0 : 1;
+                if (vote == 0) {
+                    // Away from a loop cap the cutter cannot tell: with the piece it lies in (a pin in the detached foot),
+                    // else with the nearest one (a hat on the detached head).
+                    if (in[k] == 1 || in[k] == 2)
+                        s = in[k] == 1 ? 0 : 1;
+                    else {
+                        double d[2] = {std::numeric_limits<double>::max(), std::numeric_limits<double>::max()};
+                        for (int i = 0; i < 2; ++i)
+                            if (trees[i])
+                                for (size_t v = 0; v < vs.size(); v += step)
+                                    d[i] = std::min(d[i], trees[i]->squared_distance(vs[v].cast<double>()));
+                        s = d[0] < d[1] ? 0 : 1;
+                    }
+                }
                 CurveCutJob::Piece piece{untouched[k].volume_idx, {}};
                 piece.side[s] = std::move(untouched[k].mesh);
                 st->pieces.push_back(std::move(piece));
@@ -5030,8 +5099,10 @@ void GLGizmoCut3D::Curve::start_cut()
             else if (!joined && (all.side_a.indices.empty() || all.side_b.indices.empty()))
                 st->error = st->loop ? _u8L("The loop did not split the object. Place the points all around the part to detach.")
                                      : _u8L("The path did not split the object. Make sure it crosses the object completely.");
-            else if (!st->extras.empty())
-                st->extra_sides = extras_in_sides(st->extras, all);
+            else if (!st->extras.empty()) {
+                build_trees(); // with the untouched parts added since
+                st->extra_sides = extras_in_sides(st->extras, trees);
+            }
         },
         [this, alive = std::weak_ptr<char>(m_alive), st](bool canceled, std::exception_ptr &eptr) {
             if (alive.expired() || m_running != st)
@@ -5091,7 +5162,7 @@ void GLGizmoCut3D::Curve::cut_done(const std::shared_ptr<CurveCutJob> &st)
         return set_message(st->loop ? _u8L("The piece is still connected past the loop, along the red line. Perform the cut, then cut "
                                            "again across the red line to detach it.")
                                     : _u8L("The piece is still connected around the path, along the red line. Perform the cut, then cut "
-                                           "again across the red line to detach it."), true);
+                                           "again across the red line to detach it."), false);
     }
     set_message(_u8L("Preview: the pieces are shown apart. Perform the cut if it is right, or edit it."), false);
 }
@@ -5117,6 +5188,8 @@ void GLGizmoCut3D::Curve::apply_cut()
         const std::string names[2] = {both ? GUI::format(_u8L("%1% - piece"), mo->name) : mo->name,
                                       both ? GUI::format(_u8L("%1% - rest"), mo->name) : mo->name};
         Model tmp;
+        int   rest_with_bridges = -1; // index in tmp.objects of the object the bridges are on (side b)
+        m_hint.reset();
         for (int i = 0; i < 2; ++i) {
             if ((sides[i].side == 0 ? st->grouped.side_a : st->grouped.side_b).indices.empty())
                 continue; // a cut that leaves the piece connected (see bridges) may leave nothing on the other side
@@ -5147,6 +5220,8 @@ void GLGizmoCut3D::Curve::apply_cut()
             no->add_instance()->set_offset(st->offset);
             no->invalidate_bounding_box();
             no->ensure_on_bed();
+            if (sides[i].side == 1 && !st->bridges.empty())
+                rest_with_bridges = int(tmp.objects.size()) - 1;
         }
         if (tmp.objects.size() == 2)
             place_piece(*tmp.objects[0], tmp.objects[1]->instance_bounding_box(0), mo);
@@ -5156,6 +5231,22 @@ void GLGizmoCut3D::Curve::apply_cut()
         if (mo->is_cut()) // the other pieces of an earlier cut with connectors lose their link to this one
             wxGetApp().obj_list()->invalidate_cut_info_for_object(st->obj_idx);
         plater->apply_cut_object_to_model(size_t(st->obj_idx), tmp.objects);
+        if (rest_with_bridges >= 0) {
+            // The new objects are added at the end of the model, in order.
+            const ModelObjectPtrs &objects = plater->model().objects;
+            const ModelObject     *rest    = objects[objects.size() - tmp.objects.size() + size_t(rest_with_bridges)];
+            m_hint_inst                    = rest->instances.front()->get_matrix();
+            m_hint_object                  = rest->id();
+            GLModel::Geometry g;
+            g.format = {GLModel::Geometry::EPrimitiveType::Lines, GLModel::Geometry::EVertexLayout::P3};
+            for (const std::vector<PathCut::V3> &line : st->bridges)
+                for (size_t i = 0; i + 1 < line.size(); ++i) {
+                    g.add_vertex(Vec3f((m_hint_inst * line[i]).cast<float>()));
+                    g.add_vertex(Vec3f((m_hint_inst * line[i + 1]).cast<float>()));
+                    g.add_line(unsigned(g.vertices_count() - 2), unsigned(g.vertices_count() - 1));
+                }
+            m_hint.init_from(std::move(g));
+        }
     } catch (const std::exception &e) {
         BOOST_LOG_TRIVIAL(error) << "Cut along path: applying the cut failed: " << e.what();
         wxGetApp().plater()->get_notification_manager()->push_notification(NotificationType::CustomNotification,

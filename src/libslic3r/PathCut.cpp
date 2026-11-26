@@ -1004,8 +1004,9 @@ LoopCutter make_loop_cutter(const std::vector<V3> &loop_points, double kerf, dou
     std::vector<V3> dense = picked;
     for (V3 &p : dense) {
         const V3 s = snap(p);
+        // only the in-plane (radial) part of the snap is kept; the height stays the spline's.
         if ((s - p).norm() < 0.3 * rmean)
-            p = s;
+            p = lc.frame.to3d(lc.frame.to2d(s), lc.frame.height(p));
     }
     lc.loop = dense;
 
@@ -1057,6 +1058,8 @@ LoopCutter make_loop_cutter(const std::vector<V3> &loop_points, double kerf, dou
         return out;
     };
     lc.radius = smooth(r, 8);
+    // a few harmonics cannot follow a long thin section (a blade): never pull the loop inwards.
+    for (int k = 0; k < n; ++k) lc.radius[size_t(k)] = std::max(lc.radius[size_t(k)], r[size_t(k)]);
     lc.hloop  = smooth(h, 4);
     if (*std::min_element(lc.radius.begin(), lc.radius.end()) < 1e-3) {
         lc.error = _u8L("The loop is too irregular. Place the points more evenly around the part.");
@@ -1110,19 +1113,56 @@ bool fit_loop_margin(const indexed_triangle_set &its, LoopCutter &lc)
         if ((ca < 0.) != (cb < 0.) && (s.a + (s.b - s.a) * (ca / (ca - cb))).dot(ray) > 0.)
             ++crossings[find(key_id[s.ka])];
     }
-    // Per spoke: how far the own section reaches, and how near any other surface comes.
+    // A curve overlapping the section is still the same part (a pin added as a part, the overlapping shells of
+    // a sculpted mesh): a few of its points lie inside the section.
+    auto in_section = [&](const V2 &q) {
+        int c = 0;
+        for (const Seg &s : segs)
+            if (crossings[find(key_id[s.ka])] % 2 == 1 && (s.a.y() > q.y()) != (s.b.y() > q.y()) &&
+                q.x() < s.a.x() + (s.b.x() - s.a.x()) * (q.y() - s.a.y()) / (s.b.y() - s.a.y()))
+                ++c;
+        return c % 2 == 1;
+    };
+    std::unordered_map<size_t, std::vector<size_t>> foreign_segs;
+    for (size_t i = 0; i < segs.size(); ++i)
+        if (crossings[find(key_id[segs[i].ka])] % 2 == 0) foreign_segs[find(key_id[segs[i].ka])].push_back(i);
+    std::unordered_set<size_t> overlapping;
+    for (const auto &[comp, idx] : foreign_segs)
+        for (size_t j = 0; j < 16 && j < idx.size(); ++j) {
+            const Seg &sg = segs[idx[j * idx.size() / std::min<size_t>(16, idx.size())]];
+            if (in_section(0.5 * (sg.a + sg.b))) { overlapping.insert(comp); break; }
+        }
+    // Per spoke: how far the own section reaches, and how near any other surface comes. How far the section
+    // reaches past the loop is measured to the loop itself, which a long thin section (a blade) follows closely
+    // although its radius changes fast from spoke to spoke.
     std::vector<double> own(size_t(n), 0.), other(size_t(n), std::numeric_limits<double>::max());
-    bool any_own = false;
+    std::vector<V2>     loop2;
+    for (const V3 &x : lc.loop) loop2.push_back(lc.frame.to2d(x) - lc.center);
+    double excess  = 0.;
+    bool   any_own = false;
     for (const Seg &s : segs) {
-        const bool   is_own = crossings[find(key_id[s.ka])] % 2 == 1;
+        const size_t comp   = find(key_id[s.ka]);
+        const bool   is_own = crossings[comp] % 2 == 1 || overlapping.count(comp) > 0;
         const int    steps  = std::min(4000, int((s.b - s.a).norm() / 0.1) + 1);
         any_own |= is_own;
         for (int i = 0; i <= steps; ++i) {
             const V2     p  = s.a + (s.b - s.a) * (double(i) / steps);
             const size_t k  = size_t(spoke_of(p));
             const double rr = p.norm();
-            if (is_own) own[k] = std::max(own[k], rr);
-            else        other[k] = std::min(other[k], rr);
+            if (!is_own) {
+                other[k] = std::min(other[k], rr);
+                continue;
+            }
+            own[k] = std::max(own[k], rr);
+            if (rr > lc.radius[k]) {
+                double d = std::numeric_limits<double>::max();
+                for (size_t m = 0; m < loop2.size(); ++m) {
+                    double dm;
+                    closest_on_segment(p, loop2[m], loop2[(m + 1) % loop2.size()], dm);
+                    d = std::min(d, dm);
+                }
+                excess = std::max(excess, d);
+            }
         }
     }
     if (!any_own)
@@ -1146,14 +1186,16 @@ bool fit_loop_margin(const indexed_triangle_set &its, LoopCutter &lc)
     double rmean = 0.;
     for (double x : lc.radius) rmean += x;
     rmean /= n;
-    const double bulge = std::max(3., 0.5 * rmean) + lc.margin; // the own section may reach this far past the loop
-    const double clear = std::max(0.25, lc.kerf);                // least room between the rim and a surface
+    // The section may bulge past the loop where the picked points cut corners (ribs, folds, the corners of a
+    // box); reaching much farther means the loop does not go around the part (three points around an edge).
+    if (excess > std::max(3., rmean)) {
+        lc.error = _u8L("The loop does not go around the part: the cut would reach far past it. Place the points all around the "
+                        "part to detach.");
+        return false;
+    }
+    const double clear = std::max(0.25, lc.kerf); // least room between the rim and a surface
     for (int k = 0; k < n; ++k) {
         const double sec = std::max(own[size_t(k)], lc.radius[size_t(k)]);
-        if (own[size_t(k)] > lc.radius[size_t(k)] + bulge) {
-            lc.error = lc.rim_error();
-            return false;
-        }
         double rim = sec + lc.margin;
         if (other[size_t(k)] < rim + clear) {
             if (other[size_t(k)] - sec < 2. * clear) {

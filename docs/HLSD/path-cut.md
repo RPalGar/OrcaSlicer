@@ -37,14 +37,17 @@ Rules that shape the result:
 - The loop's cap is a height field over evenly spaced spokes from its centre (the outermost crossing of each
   spoke with the loop, so a loop snapped to a bumpy surface may wobble), smoothed so it needs few triangles.
   A loop that crosses itself seen from its mean plane is refused; small curls from points placed close
-  together are cut out. Snaps that move a point of the loop far (onto a nearby part, or across a thin one)
-  are not kept.
+  together are tolerated. The smoothing never pulls the loop inwards, so a long thin section (a blade) keeps
+  its tips. Snaps that move a point of the loop far (onto a nearby part, or across a thin one)
+  are not kept, and only their part along the mean plane is: snapped up or down onto a nearby face, the
+  loop would move the cut.
 - The cap only reaches its rim. `fit_loop_margin` finds where the surface crosses the cap: the curves going
-  around the centre are the section of the part the loop is on, the others belong to other parts. Per
-  spoke the rim is put the cap margin past that section, or halfway to another part when one is nearer, so
-  only the part the loop goes around is cut. A section reaching far past the loop means the loop does not go
-  around the part, and no room between the section and another part means the cap would run into it: both
-  are refused.
+  around the centre are the section of the part the loop is on, and so are curves overlapping it (a pin
+  added as a part, overlapping shells of a sculpted mesh); the others belong to other parts. Per spoke the
+  rim is put the cap margin past that section, or halfway to another part when one is nearer, so only the
+  part the loop goes around is cut. A section reaching farther past the loop than the loop's mean radius
+  (measured to the loop itself) means the loop does not go around the part, and no room between the section
+  and another part means the cap would run into it: both are refused.
 - `make_edge_manifold` runs first: zero-thickness sheets and edges shared by more than two faces, common
   in sculpted and AI-generated meshes, would leave openings the caps cannot close.
 - `group_cut` assigns every resulting part to a side by the cut face it carries; a part the cut does not touch
@@ -52,8 +55,9 @@ Rules that shape the result:
   faces is still connected around the cut (an arm whose hand rests on the hip): `connections` finds the
   shortest line over its surface from one cut face to the other, the tool shows it, and the cut can be
   performed so that a second cut across that line detaches the part.
-- Each part of a multi-part object is cut on its own and its pieces keep the part's settings and filament;
-  a part the cut does not reach goes to the side it is on.
+- Each part of a multi-part object is cut on its own and its pieces keep the part's settings and filament.
+  A part the cut does not reach goes to the side it is on or, away from a loop cap, with the piece it lies
+  in, else with the nearest one (a hat on the detached head).
 
 The caps are triangulated with earcut followed by Delaunay edge flips rather than with
 `Triangulation`: where the cut grazes the surface the rings of a cap can touch or cross themselves at
