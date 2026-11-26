@@ -1046,7 +1046,7 @@ LoopCutter make_loop_cutter(const std::vector<V3> &loop_points, double kerf, dou
     }
     // Low-pass the radius and height profiles (truncated Fourier series): the snapped loop is noisy, and a
     // smooth cap needs far fewer triangles and cuts more cleanly.
-    auto smooth = [n](const std::vector<double> &y, int harmonics) {
+    auto smooth = [](const std::vector<double> &y, int harmonics) {
         std::vector<double> out(size_t(n), 0.);
         for (int k = 0; k <= harmonics; ++k) {
             double ck = 0., sk = 0.;
@@ -1168,7 +1168,7 @@ bool fit_loop_margin(const indexed_triangle_set &its, LoopCutter &lc)
     if (!any_own)
         return true; // the loop does not split anything: reported after the cut
     // Neighbouring spokes too, as the rim runs straight between spokes.
-    auto widen = [n](const std::vector<double> &v, bool take_max) {
+    auto widen = [](const std::vector<double> &v, bool take_max) {
         std::vector<double> out(v);
         for (int k = 0; k < n; ++k)
             for (int d = -2; d <= 2; ++d) {
