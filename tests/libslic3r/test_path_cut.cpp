@@ -382,20 +382,39 @@ TEST_CASE("A loop cap stops short of another part close to the loop", "[PathCut]
         }
 }
 
-TEST_CASE("A loop cap that would run into another part is refused", "[PathCut]")
+TEST_CASE("A loop cap between two parts close together cuts one and leaves the other", "[PathCut]")
 {
-    // Loop around one of two boxes standing 0.3 mm apart: no room for the rim between them.
+    // Loop around one of two boxes: 0.3 mm apart the rim fits between them, 0.05 mm apart it does not.
+    for (const double gap : {0.3, 0.05}) {
+        CAPTURE(gap);
+        indexed_triangle_set legs = its_make_cube(4., 4., 20.);
+        indexed_triangle_set leg2 = its_make_cube(4., 4., 20.);
+        its_translate(leg2, Vec3f(float(4. + gap), 0.f, 0.f));
+        its_merge(legs, leg2);
+        std::vector<PathCut::V3> loop = ring(2.9, 8, [](double) { return 10.; });
+        for (auto &p : loop) p += PathCut::V3(2., 2., 0.);
+        PathCut::LoopCutter lc = PathCut::make_loop_cutter(loop, 0.2, 1., no_snap, true);
+        REQUIRE(lc.valid());
+        if (gap < 0.1) {
+            CHECK_FALSE(PathCut::fit_loop_margin(legs, lc));
+            CHECK_FALSE(lc.error.empty());
+            continue;
+        }
+        REQUIRE(PathCut::fit_loop_margin(legs, lc));
+        const PathCut::CutResult res = PathCut::cut_with_slab(legs, lc);
+        REQUIRE(res.error.empty());
+        const auto parts = its_split(res.mesh);
+        REQUIRE(parts.size() == 3);
+        require_closed_parts(parts);
+        CHECK(std::any_of(parts.begin(), parts.end(), [](const indexed_triangle_set &p) { return std::abs(its_volume(p) - 320.) < 0.1; }));
+    }
+    // Without fitting, a rim through the other box is not cut halfway.
     indexed_triangle_set legs = its_make_cube(4., 4., 20.);
     indexed_triangle_set leg2 = its_make_cube(4., 4., 20.);
     its_translate(leg2, Vec3f(4.3f, 0.f, 0.f));
     its_merge(legs, leg2);
     std::vector<PathCut::V3> loop = ring(2.9, 8, [](double) { return 10.; });
     for (auto &p : loop) p += PathCut::V3(2., 2., 0.);
-    PathCut::LoopCutter lc = PathCut::make_loop_cutter(loop, 0.2, 1., no_snap, true);
-    REQUIRE(lc.valid());
-    CHECK_FALSE(PathCut::fit_loop_margin(legs, lc));
-    CHECK_FALSE(lc.error.empty());
-    // Without fitting, a rim through the other box is not cut halfway either.
     PathCut::LoopCutter wide = PathCut::make_loop_cutter(loop, 0.2, 3., no_snap, true);
     CHECK_FALSE(PathCut::cut_with_slab(legs, wide).error.empty());
 }
@@ -542,4 +561,27 @@ TEST_CASE("A loop over a pin added as a part cuts the pin with the part", "[Path
     const PathCut::CutResult res = PathCut::cut_with_slab(model, lc);
     REQUIRE(res.error.empty());
     CHECK(its_split(res.mesh).size() == 4); // the arm and the pin, each in two
+}
+
+TEST_CASE("A loop just below a fist around a grip cuts the grip only", "[PathCut]")
+{
+    // A sword grip (r = 4) held by a fist: a ring around the grip, 0.5 mm away, reaching down past the height of
+    // the loop. The cap goes through the fist too, around the centre, but the loop is on the grip: only the
+    // grip is cut, the fist is left whole.
+    indexed_triangle_set model = its_make_cylinder(4., 60.);
+    indexed_triangle_set fist  = its_make_torus(8., 3.5, PI / 30., PI / 12.);
+    its_translate(fist, Vec3f(0.f, 0.f, 31.f));
+    its_merge(model, fist);
+    for (const bool flat : {true, false}) {
+        CAPTURE(flat);
+        PathCut::LoopCutter lc = PathCut::make_loop_cutter(ring(4., 10, [](double a) { return 29. + 0.3 * std::cos(a); }), 0.2, 1.5, no_snap, flat);
+        REQUIRE(lc.valid());
+        REQUIRE(PathCut::fit_loop_margin(model, lc));
+        const PathCut::CutResult res = PathCut::cut_with_slab(model, lc);
+        REQUIRE(res.error.empty());
+        const auto parts = its_split(res.mesh);
+        REQUIRE(parts.size() == 3); // the grip in two, the fist whole
+        require_closed_parts(parts);
+        CHECK(std::any_of(parts.begin(), parts.end(), [&fist](const indexed_triangle_set &p) { return std::abs(its_volume(p) - its_volume(fist)) < 1.; }));
+    }
 }

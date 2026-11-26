@@ -138,6 +138,8 @@ struct LoopCutter final : Cutter
     double              hmean{0.};
     double              margin{0.}; // requested reach past the loop
     std::vector<V3>     loop;       // the smoothed loop (for drawing it)
+    std::vector<V3>     stray;      // segments (pairs of points) of the section the loop does not go around, when
+                                    // fit_loop_margin() refuses it: shown to the user
     bool valid() const { return error.empty() && radius.size() == size_t(spokes); }
     bool limited() const override { return true; }
 
@@ -164,9 +166,11 @@ LoopCutter make_loop_cutter(const std::vector<V3> &loop_points, double kerf, dou
 
 // Fits the cap's rim to the model: the section of the part the loop goes around (where the surface crosses
 // the cap around its centre) often bulges a little past the smoothed loop (ribs, folds, fingers), and other
-// parts of the model may come close (a hand resting on a hip). Per spoke, the rim is put `margin` past that
-// section, or halfway to another part when that is nearer. Fails with `error` set when the section reaches
-// far past the loop (the loop does not go around the part) or another part leaves no room for the rim.
+// parts of the model may come close (a hand resting on a hip). The section is the curve around the cap's
+// centre that the loop follows; other curves around it (a fist around a grip) belong to other parts. Per
+// spoke, the rim is put `margin` past that section, or halfway to another part when that is nearer. Fails
+// with `error` set when the section reaches far past the loop (the loop does not go around the part; `stray`
+// then holds the section) or another part leaves no room for the rim.
 bool fit_loop_margin(const indexed_triangle_set &its, LoopCutter &lc);
 
 // First crossing of two non-adjacent segments of an open polyline, searching from the start: the segments

@@ -326,9 +326,12 @@ private:
     Vec3d   m_bridge_shift{Vec3d::Zero()};
     // After such a cut is performed, the same line on the object it left, to cut across: in world coordinates
     // when it was cut, drawn moved with the object while it is there.
+    // Also the section a refused loop would cut, until the next preview.
     GLModel     m_hint;
     ObjectID    m_hint_object;
     Transform3d m_hint_inst{Transform3d::Identity()};
+    bool        m_hint_stray{false};
+    void        set_hint(const ModelObject &obj, const std::vector<PathCut::V3> &segments, bool stray);
     void        render_hint(const Camera &camera);
     bool    m_object_hidden{false};
     std::shared_ptr<CurveCutJob> m_running;           // the cut on the job worker
@@ -4396,6 +4399,8 @@ struct CurveCutJob
     std::vector<Piece>         pieces;
     // When the cut leaves a piece connected around it (side b): where it still holds together.
     std::vector<std::vector<PathCut::V3>> bridges;
+    // When the loop does not go around the part: segments (pairs of points) of the section it would cut.
+    std::vector<PathCut::V3> stray;
     std::vector<unsigned char> extra_sides; // per extra: bit 0 in side_a, bit 1 in side_b
     std::string                error;       // translated
     // Set by the tool to drop the cut: the job worker is shared, and cancelling it would stop whatever job it
@@ -4517,6 +4522,8 @@ void GLGizmoCut3D::Curve::reset_path()
     m_points.clear();
     m_object        = nullptr;
     m_preview_dirty = true;
+    if (m_hint_stray)
+        m_hint.reset();
 }
 
 void GLGizmoCut3D::Curve::clear_pending()
@@ -4930,6 +4937,8 @@ void GLGizmoCut3D::Curve::start_cut()
     if (m_running)
         return;
     clear_pending();
+    if (m_hint_stray)
+        m_hint.reset();
     const Selection &selection = m_parent.get_selection();
     const int        obj_idx   = selection.get_object_idx();
     Plater          *plater    = wxGetApp().plater();
@@ -5004,8 +5013,8 @@ void GLGizmoCut3D::Curve::start_cut()
                 const AABBMesh aabb(st->src);
                 auto           lc = std::make_unique<PathCut::LoopCutter>(PathCut::make_loop_cutter(st->pts, st->kerf, st->margin,
                     [&aabb](const PathCut::V3 &p) { int i; Vec3d c; aabb.squared_distance(p, i, c); return PathCut::V3(c); }, st->flat));
-                if (lc->valid())
-                    PathCut::fit_loop_margin(st->src, *lc); // sets lc->error when it fails
+                if (lc->valid() && !PathCut::fit_loop_margin(st->src, *lc)) // sets lc->error
+                    st->stray = std::move(lc->stray);
                 cutter = std::move(lc);
             } else {
                 const BoundingBoxf3 bb = Slic3r::bounding_box(st->src);
@@ -5128,10 +5137,35 @@ void GLGizmoCut3D::Curve::start_cut()
 
 // The cut is computed: show the pieces apart, the smaller one (detached when the cut is performed) moved away
 // from the other along the line between their centres.
+// segments: pairs of points relative to the instance offset, with its rotation and scale baked in.
+void GLGizmoCut3D::Curve::set_hint(const ModelObject &obj, const std::vector<PathCut::V3> &segments, bool stray)
+{
+    m_hint_inst   = obj.instances.front()->get_matrix();
+    m_hint_object = obj.id();
+    m_hint_stray  = stray;
+    const Vec3d       offset = obj.instances.front()->get_offset();
+    GLModel::Geometry g;
+    g.format = {GLModel::Geometry::EPrimitiveType::Lines, GLModel::Geometry::EVertexLayout::P3};
+    for (size_t i = 0; i + 1 < segments.size(); i += 2) {
+        g.add_vertex(Vec3f((offset + segments[i]).cast<float>()));
+        g.add_vertex(Vec3f((offset + segments[i + 1]).cast<float>()));
+        g.add_line(unsigned(g.vertices_count() - 2), unsigned(g.vertices_count() - 1));
+    }
+    m_hint.reset();
+    m_hint.init_from(std::move(g));
+}
+
 void GLGizmoCut3D::Curve::cut_done(const std::shared_ptr<CurveCutJob> &st)
 {
-    if (!st->error.empty())
+    if (!st->error.empty()) {
+        Plater *plater = wxGetApp().plater();
+        if (!st->stray.empty() && st->object_unchanged()) {
+            set_hint(*plater->model().objects[st->obj_idx], st->stray, true);
+            return set_message(_u8L("The loop does not go around the part: the red line shows where the cut would reach. Place the "
+                                    "points all around the part to detach."), true);
+        }
         return set_message(st->error, true);
+    }
     if (!st->object_unchanged()) {
         reset_path();
         return set_message(_u8L("The object was changed while it was being cut. Cut it again."), true);
@@ -5232,20 +5266,14 @@ void GLGizmoCut3D::Curve::apply_cut()
             wxGetApp().obj_list()->invalidate_cut_info_for_object(st->obj_idx);
         plater->apply_cut_object_to_model(size_t(st->obj_idx), tmp.objects);
         if (rest_with_bridges >= 0) {
-            // The new objects are added at the end of the model, in order.
+            // The new objects are added at the end of the model, in order. The pieces have the instance
+            // offset of the object that was cut (moved onto the bed), and its rotation and scale baked in.
             const ModelObjectPtrs &objects = plater->model().objects;
             const ModelObject     *rest    = objects[objects.size() - tmp.objects.size() + size_t(rest_with_bridges)];
-            m_hint_inst                    = rest->instances.front()->get_matrix();
-            m_hint_object                  = rest->id();
-            GLModel::Geometry g;
-            g.format = {GLModel::Geometry::EPrimitiveType::Lines, GLModel::Geometry::EVertexLayout::P3};
+            std::vector<PathCut::V3> segments;
             for (const std::vector<PathCut::V3> &line : st->bridges)
-                for (size_t i = 0; i + 1 < line.size(); ++i) {
-                    g.add_vertex(Vec3f((m_hint_inst * line[i]).cast<float>()));
-                    g.add_vertex(Vec3f((m_hint_inst * line[i + 1]).cast<float>()));
-                    g.add_line(unsigned(g.vertices_count() - 2), unsigned(g.vertices_count() - 1));
-                }
-            m_hint.init_from(std::move(g));
+                for (size_t i = 0; i + 1 < line.size(); ++i) { segments.push_back(line[i]); segments.push_back(line[i + 1]); }
+            set_hint(*rest, segments, false);
         }
     } catch (const std::exception &e) {
         BOOST_LOG_TRIVIAL(error) << "Cut along path: applying the cut failed: " << e.what();
