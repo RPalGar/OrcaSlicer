@@ -41,15 +41,17 @@ Rules that shape the result:
   its tips. Snaps that move a point of the loop far (onto a nearby part, or across a thin one)
   are not kept, and only their part along the mean plane is: snapped up or down onto a nearby face, the
   loop would move the cut.
-- The loop is the cut: only what it encloses is cut, and the rest of the model is left whole. The cap only
-  reaches its rim, which `fit_loop_margin` places from where the surface crosses the cap: the curve around
-  the centre that the loop follows is the section of the part the loop is on, and so are curves overlapping
-  it (a pin added as a part, overlapping shells of a sculpted mesh); the others belong to other parts, also
-  when they go around the centre (a fist around a grip). The crossings with the two faces of the cut count
-  too, for surfaces lying almost along the cap (the underside of the fist just above the loop). Per spoke the
-  rim is put the cap margin past the section, or halfway to another part when one is nearer. A section
-  reaching farther past the loop than the loop's mean radius (measured to the loop itself) means the loop
-  does not go around the part: the tool then shows that section in red. No room between the section and
+- The loop is the cut: only what it encloses is cut, and the rest of the model is left whole. The clearance
+  is measured across the cap, so the gap between the pieces is the same where a curved cap slopes. The cap
+  only reaches its rim, which `fit_loop_margin` places from where the surface crosses the cap: the curve
+  around the centre that the loop follows is the section of the part the loop is on, and so are curves
+  overlapping it (a pin added as a part, overlapping shells of a sculpted mesh); the others belong to other
+  parts, also when they go around the centre (a fist around a grip). The crossings with the two faces of
+  the cut count too, for surfaces lying almost along the cap (the underside of the fist just above the
+  loop). Per spoke the rim is put half a millimetre past the section (not a setting: the loop is the cut),
+  or halfway to another part when one is nearer. When no curve around the centre runs along the loop, or
+  the section reaches farther past the loop than the loop's mean radius (measured to the loop itself), the
+  loop does not go around the part: the tool shows that section in red. No room between the section and
   another part means the cap would run into it: both are refused.
 - `make_edge_manifold` runs first: zero-thickness sheets and edges shared by more than two faces, common
   in sculpted and AI-generated meshes, would leave openings the caps cannot close.

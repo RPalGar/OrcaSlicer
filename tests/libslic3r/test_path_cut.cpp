@@ -585,3 +585,63 @@ TEST_CASE("A loop just below a fist around a grip cuts the grip only", "[PathCut
         CHECK(std::any_of(parts.begin(), parts.end(), [&fist](const indexed_triangle_set &p) { return std::abs(its_volume(p) - its_volume(fist)) < 1.; }));
     }
 }
+
+TEST_CASE("The clearance of a loop cut is the same where its cap slopes", "[PathCut]")
+{
+    // A saddle-shaped loop around a cylinder, curved cap: the gap between the pieces, measured across it,
+    // is the clearance everywhere, not thinner where the cap slopes.
+    const indexed_triangle_set cyl  = its_make_cylinder(5., 40., PI / 90.);
+    const double               kerf = 0.4;
+    for (const bool flat : {true, false}) {
+        CAPTURE(flat);
+        PathCut::LoopCutter lc = PathCut::make_loop_cutter(ring(5., 12, [](double a) { return 20. + 3. * std::cos(2. * a); }), kerf, 0.5, no_snap, flat);
+        REQUIRE(lc.valid());
+        REQUIRE(PathCut::fit_loop_margin(cyl, lc));
+        const PathCut::CutResult res = PathCut::cut_with_slab(cyl, lc);
+        REQUIRE(res.error.empty());
+        const PathCut::Grouped g = PathCut::group_cut(res, lc);
+        const AABBMesh         other(g.side_b);
+        double                 lo = 1e9, hi = 0.;
+        // Points of the cut face of side a, away from the rim: their distance to side b is the gap.
+        for (const auto &t : g.side_a.indices) {
+            PathCut::V3 p = PathCut::V3::Zero();
+            bool        on_face = true;
+            for (int k = 0; k < 3; ++k) {
+                const PathCut::V3 v = g.side_a.vertices[t[k]].cast<double>();
+                on_face &= std::abs(std::abs(lc.field(v)) - 0.5 * kerf) < 0.02;
+                p += v / 3.;
+            }
+            if (!on_face || (lc.frame.to2d(p) - lc.center).norm() > 4.) continue;
+            const double d = std::sqrt(other.squared_distance(p));
+            lo = std::min(lo, d);
+            hi = std::max(hi, d);
+        }
+        INFO("gap " << lo << " .. " << hi);
+        REQUIRE(hi > 0.);
+        CHECK(lo > 0.85 * kerf);
+        CHECK(hi < 1.15 * kerf);
+    }
+}
+
+TEST_CASE("A loop along one side of a thin part shows that part, not another one", "[PathCut]")
+{
+    // Points in an upright oval on the front of a thin post standing next to a block: the loop goes around
+    // nothing. The red section shown must be the post's, where the points are, not the block's.
+    indexed_triangle_set model = its_make_cube(2., 2., 30.);
+    indexed_triangle_set block = its_make_cube(20., 20., 10.);
+    its_translate(block, Vec3f(-25.f, -9.f, 0.f));
+    its_merge(model, block);
+    std::vector<PathCut::V3> loop;
+    for (int i = 0; i < 7; ++i) {
+        const double a = 2. * PI * i / 7.;
+        loop.emplace_back(1. + 0.9 * std::cos(a), 0., 8. + 4. * std::sin(a));
+    }
+    for (const bool flat : {true, false}) {
+        CAPTURE(flat);
+        PathCut::LoopCutter lc = PathCut::make_loop_cutter(loop, 0.2, 0.5, no_snap, flat);
+        REQUIRE(lc.valid());
+        CHECK_FALSE(PathCut::fit_loop_margin(model, lc));
+        REQUIRE_FALSE(lc.stray.empty());
+        CHECK(std::all_of(lc.stray.begin(), lc.stray.end(), [](const PathCut::V3 &p) { return p.x() > -1. && p.x() < 3.; }));
+    }
+}

@@ -909,6 +909,29 @@ double LoopCutter::cap_height(const V2 &q, double *outside) const
     return hmean * (1. - w) + at_angle(hloop, ang) * w;
 }
 
+double LoopCutter::slope_scale(const V2 &q) const
+{
+    if (radius.empty())
+        return 1.;
+    const double e  = 1e-3;
+    const double gx = (cap_height(q + V2(e, 0.)) - cap_height(q - V2(e, 0.))) / (2. * e);
+    const double gy = (cap_height(q + V2(0., e)) - cap_height(q - V2(0., e))) / (2. * e);
+    return std::sqrt(1. + gx * gx + gy * gy);
+}
+
+double LoopCutter::field(const V3 &p) const
+{
+    const V2 q = frame.to2d(p);
+    return (frame.height(p) - cap_height(q)) / slope_scale(q);
+}
+
+// On the cap moved by half the clearance across it, at a point of the mean plane: to first order the level
+// set of field() there.
+V3 LoopCutter::lift(const V2 &q, int level) const
+{
+    return frame.to3d(q, cap_height(q) + 0.5 * kerf * level * slope_scale(q));
+}
+
 int LoopCutter::side(const V3 &p) const
 {
     double       out = 0.;
@@ -1084,11 +1107,15 @@ bool fit_loop_margin(const indexed_triangle_set &its, LoopCutter &lc)
     std::vector<V2> probes; // a few points of the loop, to tell which curve it follows
     for (size_t i = 0; i < loop2.size(); i += std::max<size_t>(1, loop2.size() / 64)) probes.push_back(loop2[i]);
     std::vector<double>       h(its.vertices.size());
-    for (size_t i = 0; i < h.size(); ++i) h[i] = lc.frame.height(its.vertices[i].cast<double>()) - lc.cap_height(lc.frame.to2d(its.vertices[i].cast<double>()));
+    for (size_t i = 0; i < h.size(); ++i) h[i] = lc.field(its.vertices[i].cast<double>());
 
     // Per spoke: how far the section of the part the loop is on reaches, and how near any other surface comes.
     std::vector<double> own(size_t(n), 0.), other(size_t(n), std::numeric_limits<double>::max());
     std::vector<V3>     section; // segments of the section in the middle of the cap
+    bool                off_loop = false;
+    double              rmean    = 0.;
+    for (double x : lc.radius) rmean += x;
+    rmean /= n;
     double              excess  = 0.;
     bool                any_own = false;
 
@@ -1137,7 +1164,6 @@ bool fit_loop_margin(const indexed_triangle_set &its, LoopCutter &lc)
         }
         std::unordered_map<size_t, std::vector<double>> nearest; // distance from each probe of the loop
         for (size_t i = 0; i < segs.size(); ++i) {
-            if (crossings[comp[i]] % 2 == 0) continue;
             std::vector<double> &d = nearest.emplace(comp[i], std::vector<double>(probes.size(), std::numeric_limits<double>::max())).first->second;
             for (size_t j = 0; j < probes.size(); ++j) {
                 double dj;
@@ -1146,11 +1172,22 @@ bool fit_loop_margin(const indexed_triangle_set &its, LoopCutter &lc)
             }
         }
         std::unordered_set<size_t> is_own;
-        double                     best_d = std::numeric_limits<double>::max();
+        double                     best_d = std::numeric_limits<double>::max(), any_d = best_d;
+        size_t                     any    = size_t(-1);
         for (const auto &[c, d] : nearest) {
             double m = 0.;
             for (double x : d) m += x;
-            if (m < best_d) { best_d = m; is_own = {c}; }
+            m /= double(d.size());
+            if (m < any_d) { any_d = m; any = c; }
+            if (crossings[c] % 2 == 1 && m < best_d) { best_d = m; is_own = {c}; }
+        }
+        // The loop lies on the section: when no curve around the centre runs along it (points along one side
+        // of a thin part, not around it), the loop does not go around anything. The curve it is on is shown.
+        if (middle && any != size_t(-1) && (is_own.empty() || best_d > std::max(1., 0.3 * rmean))) {
+            off_loop = true;
+            for (size_t i = 0; i < segs.size(); ++i)
+                if (comp[i] == any) { section.push_back(segs[i].a3); section.push_back(segs[i].b3); }
+            return;
         }
         // A curve overlapping the section is still the same part (a pin added as a part, the overlapping
         // shells of a sculpted mesh): some of its points lie inside the section.
@@ -1209,6 +1246,12 @@ bool fit_loop_margin(const indexed_triangle_set &its, LoopCutter &lc)
     };
     const double face = 0.5 * lc.kerf + 0.02;
     analyse(0., true);
+    if (off_loop) {
+        lc.stray = std::move(section); // shown to the user
+        lc.error = _u8L("The loop does not go around the part: the cut would reach far past it. Place the points all around the "
+                        "part to detach.");
+        return false;
+    }
     if (!any_own)
         return true; // the loop does not split anything: reported after the cut
     analyse(face, false);
@@ -1230,9 +1273,6 @@ bool fit_loop_margin(const indexed_triangle_set &its, LoopCutter &lc)
         if (other[size_t(k)] <= own[size_t(k)]) other[size_t(k)] = std::numeric_limits<double>::max();
     other = widen(other, false);
 
-    double rmean = 0.;
-    for (double x : lc.radius) rmean += x;
-    rmean /= n;
     // The section may bulge past the loop where the picked points cut corners (ribs, folds, the corners of a
     // box); reaching much farther means the loop does not go around the part (three points around an edge).
     if (excess > std::max(3., rmean)) {

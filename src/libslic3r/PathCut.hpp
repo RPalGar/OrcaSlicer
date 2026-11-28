@@ -146,14 +146,17 @@ struct LoopCutter final : Cutter
     // Height of the cap above the mean plane at a point of the plane; `outside` is how far the point lies
     // outside the cap's rim, negative inside.
     double cap_height(const V2 &q, double *outside = nullptr) const;
-    // Height above the cap.
-    double field(const V3 &p) const override { return frame.height(p) - cap_height(frame.to2d(p)); }
+    // How much farther a point is above the cap than its distance to it, where the cap slopes: the clearance
+    // is measured across the cap, so that it is the same where the cap slopes as where it is level.
+    double slope_scale(const V2 &q) const;
+    // Distance above the cap, across it.
+    double field(const V3 &p) const override;
     double outside(const V3 &p) const override { double o; cap_height(frame.to2d(p), &o); return o; }
     // +1 / -1 next to the cap above / below it, 0 elsewhere.
     int    side(const V3 &p) const override;
     // The cap seen along its normal.
     V2     chart(const V3 &p) const override { return frame.to2d(p); }
-    V3     lift(const V2 &q, int level) const override { return frame.to3d(q, cap_height(q) + 0.5 * kerf * level); }
+    V3     lift(const V2 &q, int level) const override;
     std::string rim_error() const override;
 };
 

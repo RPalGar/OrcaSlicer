@@ -305,7 +305,9 @@ private:
     Shape              m_shape{Shape::Path};
     Sweep              m_sweep{Sweep::View};         // direction the path is swept along
     bool               m_flat{true};                 // Shape::Loop: flat cut face, else following the loop's heights
-    float              m_margin{1.5f};               // Shape::Loop: how far the cap reaches past the loop [mm]
+    // Shape::Loop: how far the cap reaches past the section of the part, to come out of it cleanly (less where
+    // another part is near, see PathCut::fit_loop_margin) [mm]. Not a setting: the loop is the cut.
+    static constexpr float LOOP_MARGIN = 0.5f;
     float              m_turn{0.f}, m_tilt{0.f};     // Sweep::Custom: around the vertical axis / below horizontal [deg]
     float              m_kerf{0.2f};                 // clearance between the pieces [mm]
     // Limits of the wall [mm]: in front of / behind the points along the sweep, past the first / last point
@@ -4738,7 +4740,7 @@ void GLGizmoCut3D::Curve::rebuild_preview()
     };
     if (m_shape == Shape::Loop) {
         // The loop as the cut follows it, and the cap spanning it out to the margin.
-        const PathCut::LoopCutter lc = PathCut::make_loop_cutter(pts, m_kerf, m_margin, [](const PathCut::V3 &p) { return p; }, m_flat);
+        const PathCut::LoopCutter lc = PathCut::make_loop_cutter(pts, m_kerf, LOOP_MARGIN, [](const PathCut::V3 &p) { return p; }, m_flat);
         if (!lc.valid()) {
             draw_line(pts, true);
             return;
@@ -4982,7 +4984,7 @@ void GLGizmoCut3D::Curve::start_cut()
     st->limits   = view_limits();
     st->loop     = m_shape == Shape::Loop;
     st->flat     = m_flat;
-    st->margin   = m_margin;
+    st->margin   = LOOP_MARGIN;
 
     m_running    = st;
     m_busy_since = std::chrono::steady_clock::now();
@@ -5007,6 +5009,16 @@ void GLGizmoCut3D::Curve::start_cut()
             }
             BOOST_LOG_TRIVIAL(info) << "Cut along path: " << st->parts.size() << " parts, " << st->src.indices.size() << " triangles, kerf "
                                     << st->kerf;
+            {
+                // The picked points, relative to the instance offset, to reproduce a cut from the log.
+                std::ostringstream pts;
+                pts << (st->loop ? "loop" : "path") << (st->flat ? " flat" : "") << ":";
+                for (const PathCut::V3 &p : st->pts) pts << ' ' << p.x() << ',' << p.y() << ',' << p.z();
+                pts << " | instance matrix:";
+                for (int r = 0; r < 3; ++r)
+                    for (int c = 0; c < 4; ++c) pts << ' ' << st->inst_matrix(r, c);
+                BOOST_LOG_TRIVIAL(info) << "Cut along path: " << pts.str();
+            }
             std::unique_ptr<PathCut::Cutter> cutter;
             if (st->loop) {
                 // The smoothed loop is put back on the surface the points were picked on.
@@ -5307,7 +5319,7 @@ void GLGizmoCut3D::Curve::render_input_window(float x, float y, float bottom_lim
     const std::vector<std::string> shapes{_u8L("Open path"), _u8L("Closed loop")};
     float label_w = 0.f;
     for (const std::string &l : {_u8L("Mode"), _u8L("Shape"), _u8L("Clearance (mm)"), _u8L("Cut direction"), _u8L("Turn (deg)"), _u8L("Tilt (deg)"),
-                                 _u8L("Cap margin (mm)"), _u8L("In front (mm)"), _u8L("Behind (mm)"), _u8L("Beginning (mm)"), _u8L("Ending (mm)")})
+                                 _u8L("In front (mm)"), _u8L("Behind (mm)"), _u8L("Beginning (mm)"), _u8L("Ending (mm)")})
         label_w = std::max(label_w, ImGui::CalcTextSize(l.c_str()).x);
     const float field_x = std::max(m_cut.m_label_width, ImGui::GetStyle().WindowPadding.x + ImGui::GetFrameHeight() * 1.5f + label_w);
     float       field_w = ImGui::CalcTextSize("000.00").x * 1.5f + 2.f * (ImGui::GetFrameHeight() + ImGui::GetStyle().ItemInnerSpacing.x);
@@ -5350,8 +5362,6 @@ void GLGizmoCut3D::Curve::render_input_window(float x, float y, float bottom_lim
     }
     float_row(_u8L("Clearance (mm)"), "##curve_kerf", m_kerf, 0.05f, 0.02f, 2.f, "%.2f");
     if (m_shape == Shape::Loop) {
-        // The cap reaches this far past the loop at least, further where the surface bulges past it.
-        float_row(_u8L("Cap margin (mm)"), "##curve_margin", m_margin, 0.5f, 0.5f, 30.f, "%.1f");
         if (imgui.bbl_checkbox(_L("Flat cut face"), m_flat))
             changed();
     } else {
