@@ -138,8 +138,9 @@ struct LoopCutter final : Cutter
     double              hmean{0.};
     double              margin{0.}; // requested reach past the loop
     std::vector<V3>     loop;       // the smoothed loop (for drawing it)
-    std::vector<V3>     stray;      // segments (pairs of points) of the section the loop does not go around, when
-                                    // fit_loop_margin() refuses it: shown to the user
+    std::vector<V3>     stray;      // when fit_loop_margin() refuses the loop, shown to the user: segments (pairs of
+                                    // points) of the section it does not go around, or of the other part in the way
+    bool                stray_in_the_way{false}; // stray is another part the cap would run into
     bool valid() const { return error.empty() && radius.size() == size_t(spokes); }
     bool limited() const override { return true; }
 

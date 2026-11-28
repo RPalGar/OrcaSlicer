@@ -4403,6 +4403,7 @@ struct CurveCutJob
     std::vector<std::vector<PathCut::V3>> bridges;
     // When the loop does not go around the part: segments (pairs of points) of the section it would cut.
     std::vector<PathCut::V3> stray;
+    bool                     stray_in_the_way{false}; // the stray segments are another part the cap would cut
     std::vector<unsigned char> extra_sides; // per extra: bit 0 in side_a, bit 1 in side_b
     std::string                error;       // translated
     // Set by the tool to drop the cut: the job worker is shared, and cancelling it would stop whatever job it
@@ -5025,8 +5026,10 @@ void GLGizmoCut3D::Curve::start_cut()
                 const AABBMesh aabb(st->src);
                 auto           lc = std::make_unique<PathCut::LoopCutter>(PathCut::make_loop_cutter(st->pts, st->kerf, st->margin,
                     [&aabb](const PathCut::V3 &p) { int i; Vec3d c; aabb.squared_distance(p, i, c); return PathCut::V3(c); }, st->flat));
-                if (lc->valid() && !PathCut::fit_loop_margin(st->src, *lc)) // sets lc->error
-                    st->stray = std::move(lc->stray);
+                if (lc->valid() && !PathCut::fit_loop_margin(st->src, *lc)) { // sets lc->error
+                    st->stray            = std::move(lc->stray);
+                    st->stray_in_the_way = lc->stray_in_the_way;
+                }
                 cutter = std::move(lc);
             } else {
                 const BoundingBoxf3 bb = Slic3r::bounding_box(st->src);
@@ -5173,8 +5176,10 @@ void GLGizmoCut3D::Curve::cut_done(const std::shared_ptr<CurveCutJob> &st)
         Plater *plater = wxGetApp().plater();
         if (!st->stray.empty() && st->object_unchanged()) {
             set_hint(*plater->model().objects[st->obj_idx], st->stray, true);
-            return set_message(_u8L("The loop does not go around the part: the red line shows where the cut would reach. Place the "
-                                    "points all around the part to detach."), true);
+            return set_message(st->stray_in_the_way ? _u8L("The cut would also go through another part of the model, shown in red. Place "
+                                                           "the loop where nothing else lies inside it.")
+                                                    : _u8L("The loop does not go around the part: the red line shows where the cut would "
+                                                           "reach. Place the points all around the part to detach."), true);
         }
         return set_message(st->error, true);
     }

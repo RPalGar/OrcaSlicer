@@ -645,3 +645,28 @@ TEST_CASE("A loop along one side of a thin part shows that part, not another one
         CHECK(std::all_of(lc.stray.begin(), lc.stray.end(), [](const PathCut::V3 &p) { return p.x() > -1. && p.x() < 3.; }));
     }
 }
+
+TEST_CASE("A loop around a bent section with another part in its hollow is refused", "[PathCut]")
+{
+    // A [-shaped section (three overlapping bars) with a separate post in its hollow, near the top bar: seen
+    // from the loop's centre the post lies in front of the section, so the cap would cut it. Refused, and the
+    // post is shown.
+    indexed_triangle_set model = its_make_cube(4., 20., 30.);
+    for (const float y : {0.f, 16.f}) {
+        indexed_triangle_set bar = its_make_cube(20., 4., 30.);
+        its_translate(bar, Vec3f(0.f, y, 0.f));
+        its_merge(model, bar);
+    }
+    indexed_triangle_set post = its_make_cylinder(1.5, 30.);
+    its_translate(post, Vec3f(12.f, 13.5f, 0.f));
+    its_merge(model, post);
+    const std::vector<PathCut::V3> loop{{0, 0, 15},  {10, 0, 15},  {20, 0, 15}, {20, 4, 15}, {12, 4, 15}, {4, 4, 15}, {4, 10, 15},
+                                        {4, 16, 15}, {12, 16, 15}, {20, 16, 15}, {20, 20, 15}, {10, 20, 15}, {0, 20, 15}, {0, 10, 15}};
+    PathCut::LoopCutter lc = PathCut::make_loop_cutter(loop, 0.2, 0.5, no_snap, true);
+    REQUIRE(lc.valid());
+    CHECK_FALSE(PathCut::fit_loop_margin(model, lc));
+    INFO(lc.error);
+    CHECK(lc.stray_in_the_way);
+    REQUIRE_FALSE(lc.stray.empty());
+    CHECK(std::all_of(lc.stray.begin(), lc.stray.end(), [](const PathCut::V3 &p) { return (p - PathCut::V3(12., 13.5, p.z())).norm() < 2.; }));
+}

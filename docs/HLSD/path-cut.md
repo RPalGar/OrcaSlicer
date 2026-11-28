@@ -52,7 +52,10 @@ Rules that shape the result:
   or halfway to another part when one is nearer. When no curve around the centre runs along the loop, or
   the section reaches farther past the loop than the loop's mean radius (measured to the loop itself), the
   loop does not go around the part: the tool shows that section in red. No room between the section and
-  another part means the cap would run into it: both are refused.
+  another part, or another part between the centre and the section (in the hollow of a bent section),
+  means the cap would run into it: refused, with that part shown in red. The spokes start from the loop's
+  centroid, or from the point farthest from the loop when the centroid lies outside or near it. A triangle
+  is cut when the cut through it lies inside the rim, whatever its corners beyond it.
 - `make_edge_manifold` runs first: zero-thickness sheets and edges shared by more than two faces, common
   in sculpted and AI-generated meshes, would leave openings the caps cannot close.
 - `group_cut` assigns every resulting part to a side by the cut face it carries; a part the cut does not touch

@@ -1018,6 +1018,37 @@ LoopCutter make_loop_cutter(const std::vector<V3> &loop_points, double kerf, dou
         cc += (a + b) * (a.x() * b.y() - b.x() * a.y());
     }
     lc.center = cc / (6. * area);
+    {
+        // The spokes start from the centre, which must lie well inside the loop: the centroid of a bent
+        // section (a torso with an arm against it) may lie outside it. Then the point farthest from the loop
+        // is taken instead.
+        auto inside_by = [&q](const V2 &x) {
+            bool   in = false;
+            double d  = std::numeric_limits<double>::max();
+            for (size_t i = 0, j = q.size() - 1; i < q.size(); j = i++) {
+                const V2 &a = q[i], &b = q[j];
+                if ((a.y() > x.y()) != (b.y() > x.y()) && x.x() < a.x() + (b.x() - a.x()) * (x.y() - a.y()) / (b.y() - a.y()))
+                    in = !in;
+                double di;
+                closest_on_segment(x, a, b, di);
+                d = std::min(d, di);
+            }
+            return in ? d : -d;
+        };
+        V2 lo = q.front(), hi = q.front();
+        for (const V2 &p : q) { lo = lo.cwiseMin(p); hi = hi.cwiseMax(p); }
+        V2     best   = lc.center;
+        double best_d = inside_by(best);
+        const double at_centroid = best_d;
+        for (int i = 0; i <= 40; ++i)
+            for (int j = 0; j <= 40; ++j) {
+                const V2     x(lo.x() + (hi.x() - lo.x()) * i / 40., lo.y() + (hi.y() - lo.y()) * j / 40.);
+                const double d = inside_by(x);
+                if (d > best_d) { best_d = d; best = x; }
+            }
+        if (at_centroid < 0.5 * best_d)
+            lc.center = best;
+    }
     double rmean = 0.;
     for (const V2 &p : q) rmean += (p - lc.center).norm();
     rmean /= double(q.size());
@@ -1113,6 +1144,10 @@ bool fit_loop_margin(const indexed_triangle_set &its, LoopCutter &lc)
     std::vector<double> own(size_t(n), 0.), other(size_t(n), std::numeric_limits<double>::max());
     std::vector<V3>     section; // segments of the section in the middle of the cap
     bool                off_loop = false;
+    // Samples of other surfaces: spoke, distance from the centre, and their segment (pairs of points).
+    struct Sample { size_t k; double rr; size_t seg; };
+    std::vector<Sample> foreign;
+    std::vector<V3>     foreign_seg;
     double              rmean    = 0.;
     for (double x : lc.radius) rmean += x;
     rmean /= n;
@@ -1172,7 +1207,7 @@ bool fit_loop_margin(const indexed_triangle_set &its, LoopCutter &lc)
             }
         }
         std::unordered_set<size_t> is_own;
-        double                     best_d = std::numeric_limits<double>::max(), any_d = best_d;
+        double                     best_d = std::numeric_limits<double>::max(), any_d = best_d; // mean distances
         size_t                     any    = size_t(-1);
         for (const auto &[c, d] : nearest) {
             double m = 0.;
@@ -1180,14 +1215,6 @@ bool fit_loop_margin(const indexed_triangle_set &its, LoopCutter &lc)
             m /= double(d.size());
             if (m < any_d) { any_d = m; any = c; }
             if (crossings[c] % 2 == 1 && m < best_d) { best_d = m; is_own = {c}; }
-        }
-        // The loop lies on the section: when no curve around the centre runs along it (points along one side
-        // of a thin part, not around it), the loop does not go around anything. The curve it is on is shown.
-        if (middle && any != size_t(-1) && (is_own.empty() || best_d > std::max(1., 0.3 * rmean))) {
-            off_loop = true;
-            for (size_t i = 0; i < segs.size(); ++i)
-                if (comp[i] == any) { section.push_back(segs[i].a3); section.push_back(segs[i].b3); }
-            return;
         }
         // A curve overlapping the section is still the same part (a pin added as a part, the overlapping
         // shells of a sculpted mesh): some of its points lie inside the section.
@@ -1207,13 +1234,41 @@ bool fit_loop_margin(const indexed_triangle_set &its, LoopCutter &lc)
                 if (!is_own.count(comp[i])) others[comp[i]].push_back(i);
             std::vector<size_t> overlapping;
             for (const auto &[c, idx] : others) {
-                const size_t m = std::min<size_t>(16, idx.size());
-                for (size_t j = 0; j < m; ++j) {
-                    const Seg &sg = segs[idx[j * idx.size() / m]];
-                    if (in_section(0.5 * (sg.a + sg.b))) { overlapping.push_back(c); break; }
+                // 32 points spread along the curve (its segments may be few and long, on a coarse mesh).
+                double len = 0.;
+                for (size_t i : idx) len += (segs[i].b - segs[i].a).norm();
+                const double step = len / 32. + 1e-12;
+                double       next = 0.5 * step, at = 0.;
+                bool         found = false;
+                for (size_t i : idx) {
+                    const Seg   &sg = segs[i];
+                    const double l  = (sg.b - sg.a).norm();
+                    for (; !found && next < at + l; next += step)
+                        found = in_section(sg.a + (sg.b - sg.a) * ((next - at) / l));
+                    at += l;
+                    if (found) break;
                 }
+                if (found) overlapping.push_back(c);
             }
             is_own.insert(overlapping.begin(), overlapping.end());
+        }
+        // The loop lies on the section: when it does not run along the section (points along one side of a
+        // thin part, not around it), the loop does not go around anything. The curve it is on is shown.
+        if (middle && any != size_t(-1)) {
+            double mean = 0.;
+            for (size_t j = 0; j < probes.size(); ++j) {
+                double d = std::numeric_limits<double>::max();
+                for (size_t c : is_own)
+                    if (auto it = nearest.find(c); it != nearest.end()) d = std::min(d, it->second[j]);
+                mean += d;
+            }
+            mean /= double(std::max<size_t>(1, probes.size()));
+            if (is_own.empty() || mean > std::max(1., 0.3 * rmean)) {
+                off_loop = true;
+                for (size_t i = 0; i < segs.size(); ++i)
+                    if (comp[i] == any) { section.push_back(segs[i].a3); section.push_back(segs[i].b3); }
+                return;
+            }
         }
         for (size_t i = 0; i < segs.size(); ++i) {
             const Seg  &s    = segs[i];
@@ -1221,12 +1276,13 @@ bool fit_loop_margin(const indexed_triangle_set &its, LoopCutter &lc)
             const int   steps = std::min(4000, int((s.b - s.a).norm() / 0.1) + 1);
             any_own |= mine;
             if (mine && middle) { section.push_back(s.a3); section.push_back(s.b3); }
+            if (!mine) { foreign_seg.push_back(s.a3); foreign_seg.push_back(s.b3); }
             for (int j = 0; j <= steps; ++j) {
                 const V2     p  = s.a + (s.b - s.a) * (double(j) / steps);
                 const size_t k  = size_t(spoke_of(p));
                 const double rr = p.norm();
                 if (!mine) {
-                    other[k] = std::min(other[k], rr);
+                    foreign.push_back({k, rr, foreign_seg.size() - 2});
                     continue;
                 }
                 own[k] = std::max(own[k], rr);
@@ -1267,10 +1323,27 @@ bool fit_loop_margin(const indexed_triangle_set &its, LoopCutter &lc)
             }
         return out;
     };
+    const std::vector<double> own_raw = own;
     own = widen(own, true);
-    // Other surfaces closer than the section are inside the part (an inner shell): they are cut with it.
-    for (int k = 0; k < n; ++k)
-        if (other[size_t(k)] <= own[size_t(k)]) other[size_t(k)] = std::numeric_limits<double>::max();
+    // Another part between the centre and the section (in a hollow of a bent section, such as an arm against
+    // a torso) would be cut through by the cap: refused, and shown. Parts inside the section were taken as
+    // the same part above (overlapping shells).
+    {
+        std::vector<V3> hit;
+        for (const Sample &sm : foreign) {
+            if (sm.rr < own_raw[sm.k] - 0.05) {
+                if (hit.empty() || hit[hit.size() - 2] != foreign_seg[sm.seg]) { hit.push_back(foreign_seg[sm.seg]); hit.push_back(foreign_seg[sm.seg + 1]); }
+            } else
+                other[sm.k] = std::min(other[sm.k], sm.rr);
+        }
+        if (!hit.empty()) {
+            lc.stray            = std::move(hit);
+            lc.stray_in_the_way = true;
+            lc.error = _u8L("The cap spanning the loop runs into another part of the model. Place the loop where the part "
+                            "is free all around it.");
+            return false;
+        }
+    }
     other = widen(other, false);
 
     // The section may bulge past the loop where the picked points cut corners (ribs, folds, the corners of a
@@ -1601,9 +1674,35 @@ CutResult cut_with_slab(indexed_triangle_set its, const Cutter &cutter, double r
     // Parts of the model the limited wall ends inside are not cut (see foreign_bands).
     std::vector<char> foreign;
     if (bounded && cutter.skips_parts_it_ends_in()) foreign = foreign_bands(its, f, out, hk);
+    // A triangle is cut when the cut through it lies inside the rim: where it crosses the faces of the slab,
+    // and its corners inside the slab. A corner beyond the rim does not matter when the triangle is crossed
+    // inside it (a large triangle of the surface just past the section of a loop).
     auto active_t = [&](size_t ti) {
         const auto &t = its.indices[ti];
-        return !bounded || (out[t[0]] < 0. && out[t[1]] < 0. && out[t[2]] < 0. && (foreign.empty() || !foreign[ti]));
+        if (!bounded)
+            return true;
+        if (!foreign.empty() && foreign[ti])
+            return false;
+        if (out[t[0]] < 0. && out[t[1]] < 0. && out[t[2]] < 0.)
+            return true;
+        if (cutter.skips_parts_it_ends_in()) // its bands are found by their corners (see foreign_bands)
+            return false;
+        bool touches = false;
+        for (int i = 0; i < 3; ++i) {
+            const int a = t[i], b = t[(i + 1) % 3];
+            if (std::abs(f[a]) < hk) {
+                if (out[a] >= 0.) return false;
+                touches = true;
+            }
+            for (const double lv : {hk, -hk}) {
+                const double fa = f[a] - lv, fb = f[b] - lv;
+                if ((fa < 0.) == (fb < 0.)) continue;
+                const V3 x = pos(a) + (pos(b) - pos(a)) * (fa / (fa - fb));
+                if (cutter.outside(x) >= 0.) return false;
+                touches = true;
+            }
+        }
+        return touches;
     };
     std::unordered_map<uint64_t, int> cross[2];
     auto crossing = [&](int a, int b, int level) {
